@@ -59,6 +59,12 @@ pub struct LoadBalancingConfig {
     pub strategy: String,
     #[serde(default = "default_cooldown")]
     pub initial_cooldown_secs: u64,
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_idle_timeout() -> u64 {
+    120
 }
 
 fn default_cooldown() -> u64 {
