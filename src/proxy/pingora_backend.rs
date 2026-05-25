@@ -8,7 +8,7 @@ use pingora_proxy::http_proxy_service;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::lookup_host;
 use tracing::{info, warn};
 use url::Url;
@@ -16,6 +16,33 @@ use url::Url;
 use crate::config::Config;
 use crate::load_balancer::LoadBalancer;
 use crate::load_balancer::key_info::Provider;
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
+fn timestamp() -> String {
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let total_secs = d.as_secs() as i64;
+    let days = total_secs / 86400;
+    let t = total_secs % 86400;
+    let (y, mo, day) = civil_from_days(days);
+    let h = t / 3600;
+    let m = t % 3600 / 60;
+    let s = t % 60;
+    format!("{y:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}.{:03}",
+        d.subsec_millis())
+}
 
 /// DNS cache entry with TTL
 struct DnsCacheEntry {
@@ -119,23 +146,7 @@ impl ProxyHttp for PingoraProxy {
 
         if self.dump_request {
             let req = session.req_header();
-            println!("[REQUEST] {} {:?} {:?}", req.method, req.uri, req.headers);
-
-            match session.read_body_or_idle(false).await {
-                Ok(Some(body)) => {
-                    if !body.is_empty() {
-                        if let Ok(body_str) = std::str::from_utf8(&body) {
-                            println!("[REQUEST BODY]\n{}", body_str);
-                        } else {
-                            println!("[REQUEST BODY] <binary {} bytes>", body.len());
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    println!("[REQUEST BODY] <read error: {:?}>", e);
-                }
-            }
+            println!("[{}] [REQUEST] {} {:?} {:?}", timestamp(), req.method, req.uri, req.headers);
         }
         Ok(false)
     }
@@ -240,6 +251,26 @@ impl ProxyHttp for PingoraProxy {
         Ok(Box::new(peer))
     }
 
+    async fn request_body_filter(
+        &self,
+        _session: &mut pingora_proxy::Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        if self.dump_request
+            && let Some(bytes) = body.as_deref()
+            && !bytes.is_empty()
+        {
+            if let Ok(body_str) = std::str::from_utf8(bytes) {
+                println!("[{}] [REQUEST BODY]\n{}", timestamp(), body_str);
+            } else {
+                println!("[{}] [REQUEST BODY] <binary {} bytes>", timestamp(), bytes.len());
+            }
+        }
+        Ok(())
+    }
+
     async fn upstream_request_filter(
         &self,
         _session: &mut pingora_proxy::Session,
@@ -294,7 +325,7 @@ impl ProxyHttp for PingoraProxy {
         _ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         if self.dump_response {
-            println!("[RESPONSE] {} {:?}", resp.status, resp.headers);
+            println!("[{}] [RESPONSE] {} {:?}", timestamp(), resp.status, resp.headers);
         }
         Ok(())
     }
@@ -310,9 +341,9 @@ impl ProxyHttp for PingoraProxy {
             && let Some(bytes) = body.as_deref()
         {
             if let Ok(body_str) = std::str::from_utf8(bytes) {
-                println!("[RESPONSE BODY]\n{}", body_str);
+                println!("[{}] [RESPONSE BODY]\n{}", timestamp(), body_str);
             } else {
-                println!("[RESPONSE BODY] <binary {} bytes>", bytes.len());
+                println!("[{}] [RESPONSE BODY] <binary {} bytes>", timestamp(), bytes.len());
             }
         }
         Ok(None)
