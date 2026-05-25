@@ -46,6 +46,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bytes",
  "clap",
  "dashmap",
  "http",

@@ -29,20 +29,23 @@ pub struct PingoraProxy {
     load_balancer: Arc<LoadBalancer>,
     initial_cooldown_secs: u64,
     dns_cache: Arc<RwLock<HashMap<String, DnsCacheEntry>>>,
-    dump_requests: bool,
+    dump_request: bool,
+    dump_response: bool,
 }
 
 impl PingoraProxy {
     pub fn new(
         load_balancer: LoadBalancer,
         initial_cooldown_secs: u64,
-        dump_requests: bool,
+        dump_request: bool,
+        dump_response: bool,
     ) -> Self {
         Self {
             load_balancer: Arc::new(load_balancer),
             initial_cooldown_secs,
             dns_cache: Arc::new(RwLock::new(HashMap::new())),
-            dump_requests,
+            dump_request,
+            dump_response,
         }
     }
 
@@ -62,8 +65,6 @@ pub struct PingoraProxyCtx {
     pub api_key: Option<String>,
     pub provider: Option<Provider>,
     pub upstream_host: Option<String>,
-    pub should_dump: bool,
-    pub request_body: Option<Vec<u8>>,
 }
 
 #[async_trait]
@@ -116,7 +117,7 @@ impl ProxyHttp for PingoraProxy {
             return Ok(true);
         }
 
-        if self.dump_requests {
+        if self.dump_request {
             let req = session.req_header();
             println!("[REQUEST] {} {:?} {:?}", req.method, req.uri, req.headers);
 
@@ -168,7 +169,6 @@ impl ProxyHttp for PingoraProxy {
         ctx.api_key = Some(key.key.clone());
         ctx.provider = Some(provider);
         ctx.upstream_host = Some(host.clone());
-        ctx.should_dump = self.dump_requests;
 
         let address = format!("{}:{}", host, port);
         let ip_addr = {
@@ -293,10 +293,29 @@ impl ProxyHttp for PingoraProxy {
         resp: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
-        if self.dump_requests {
+        if self.dump_response {
             println!("[RESPONSE] {} {:?}", resp.status, resp.headers);
         }
         Ok(())
+    }
+
+    fn upstream_response_body_filter(
+        &self,
+        _session: &mut pingora_proxy::Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<Option<std::time::Duration>> {
+        if self.dump_response
+            && let Some(bytes) = body.as_deref()
+        {
+            if let Ok(body_str) = std::str::from_utf8(bytes) {
+                println!("[RESPONSE BODY]\n{}", body_str);
+            } else {
+                println!("[RESPONSE BODY] <binary {} bytes>", bytes.len());
+            }
+        }
+        Ok(None)
     }
 
     fn error_while_proxy(
@@ -343,7 +362,7 @@ impl ProxyHttp for PingoraProxy {
     }
 }
 
-pub fn run_pingora_server(config: Config, dump_requests: bool) {
+pub fn run_pingora_server(config: Config, dump_request: bool, dump_response: bool) {
     let server_conf = config.server.to_pingora_conf();
 
     let mut server = Server::new_with_opt_and_conf(None, server_conf);
@@ -354,7 +373,8 @@ pub fn run_pingora_server(config: Config, dump_requests: bool) {
     let proxy = PingoraProxy::new(
         load_balancer,
         config.load_balancing.initial_cooldown_secs,
-        dump_requests,
+        dump_request,
+        dump_response,
     );
 
     let mut http_proxy = http_proxy_service(&server.configuration, proxy);
