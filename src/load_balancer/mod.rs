@@ -99,28 +99,39 @@ impl KeyPool {
             RotationStrategy::LatencyBased => self.select_round_robin(&candidates),
         };
 
+        key.try_consume_rate_limit();
         key.mark_used();
         Ok(key)
     }
 
     fn select_round_robin(&self, candidates: &[Arc<KeyInfo>]) -> Arc<KeyInfo> {
-        let idx = self
+        let len = candidates.len();
+        let start = self
             .current_index
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        candidates[idx % candidates.len()].clone()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+        for i in 0..len {
+            if candidates[(start + i) % len].is_available() {
+                return candidates[(start + i) % len].clone();
+            }
+        }
+        candidates[start % len].clone()
     }
 
     fn select_weighted_random(&self, candidates: &[Arc<KeyInfo>]) -> Arc<KeyInfo> {
-        let total_weight: u32 = candidates.iter().map(|k| k.weight).sum();
-        let mut rng = rand_u32() % total_weight;
+        for _ in 0..candidates.len() {
+            let total_weight: u32 = candidates.iter().map(|k| k.weight).sum();
+            let mut rng = rand_u32() % total_weight;
 
-        for key in candidates {
-            if rng < key.weight {
-                return key.clone();
+            for key in candidates {
+                if rng < key.weight {
+                    if key.is_available() {
+                        return key.clone();
+                    }
+                    break;
+                }
+                rng -= key.weight;
             }
-            rng -= key.weight;
         }
-
         candidates[0].clone()
     }
 

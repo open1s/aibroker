@@ -85,7 +85,7 @@ impl KeyInfo {
         if matches!(*cooldown, Some(instant) if instant > Instant::now()) {
             return false;
         }
-        self.check_rate_limit()
+        !self.is_rate_limited()
     }
 
     pub fn is_available_for_model(&self, model: &str) -> bool {
@@ -117,7 +117,7 @@ impl KeyInfo {
             .filter(|d| !d.is_zero())
     }
 
-    pub fn check_rate_limit(&self) -> bool {
+    pub fn try_consume_rate_limit(&self) -> bool {
         let Some(max_rpm) = self.max_rpm else {
             return true;
         };
@@ -190,13 +190,13 @@ mod tests {
     }
 
     #[test]
-    fn test_check_rate_limit_allows_requests_under_limit() {
+    fn test_try_consume_rate_limit_allows_requests_under_limit() {
         let key = KeyInfo::new("test".to_string(), "sk-xxx".to_string(), Provider::OpenAI)
             .with_max_rpm(Some(5));
 
         for i in 1..=5 {
             assert!(
-                key.check_rate_limit(),
+                key.try_consume_rate_limit(),
                 "Request {} should be allowed (limit is 5)",
                 i
             );
@@ -204,19 +204,19 @@ mod tests {
     }
 
     #[test]
-    fn test_check_rate_limit_blocks_requests_over_limit() {
+    fn test_try_consume_rate_limit_blocks_requests_over_limit() {
         let key = KeyInfo::new("test".to_string(), "sk-xxx".to_string(), Provider::OpenAI)
             .with_max_rpm(Some(3));
 
-        key.check_rate_limit();
-        key.check_rate_limit();
-        key.check_rate_limit();
+        key.try_consume_rate_limit();
+        key.try_consume_rate_limit();
+        key.try_consume_rate_limit();
 
         assert!(
-            !key.check_rate_limit(),
+            !key.try_consume_rate_limit(),
             "Request 4 should be blocked (limit is 3)"
         );
-        assert!(!key.check_rate_limit(), "Request 5 should also be blocked");
+        assert!(!key.try_consume_rate_limit(), "Request 5 should also be blocked");
     }
 
     #[test]
@@ -238,8 +238,8 @@ mod tests {
             "Calling is_rate_limited should not increment"
         );
 
-        let available = key.check_rate_limit();
-        let available2 = key.check_rate_limit();
+        let available = key.try_consume_rate_limit();
+        let available2 = key.try_consume_rate_limit();
         assert!(
             available && available2,
             "Should still have 2 requests available"
@@ -255,7 +255,7 @@ mod tests {
             "Key without max_rpm should not be rate limited"
         );
         assert!(
-            key.check_rate_limit(),
+            key.try_consume_rate_limit(),
             "check_rate_limit should always return true without max_rpm"
         );
     }
@@ -267,11 +267,11 @@ mod tests {
         let key2 = KeyInfo::new("key2".to_string(), "sk-xxx2".to_string(), Provider::OpenAI)
             .with_max_rpm(Some(5));
 
-        key1.check_rate_limit();
-        key1.check_rate_limit();
-        key2.check_rate_limit();
-        key2.check_rate_limit();
-        key2.check_rate_limit();
+        key1.try_consume_rate_limit();
+        key1.try_consume_rate_limit();
+        key2.try_consume_rate_limit();
+        key2.try_consume_rate_limit();
+        key2.try_consume_rate_limit();
 
         assert!(
             key1.is_rate_limited(),
@@ -282,9 +282,9 @@ mod tests {
             "key2 (limit 5) should not be rate limited after 3 requests"
         );
 
-        assert!(!key1.check_rate_limit(), "key1 should be blocked");
+        assert!(!key1.try_consume_rate_limit(), "key1 should be blocked");
         assert!(
-            key2.check_rate_limit(),
+            key2.try_consume_rate_limit(),
             "key2 should allow one more request"
         );
     }
@@ -296,8 +296,8 @@ mod tests {
         let key = KeyInfo::new("test".to_string(), "sk-xxx".to_string(), Provider::OpenAI)
             .with_max_rpm(Some(2));
 
-        key.check_rate_limit();
-        key.check_rate_limit();
+        key.try_consume_rate_limit();
+        key.try_consume_rate_limit();
         assert!(
             key.is_rate_limited(),
             "Should be rate limited after 2 requests"
@@ -322,7 +322,7 @@ mod tests {
             "Should not be rate limited after window expires"
         );
         assert!(
-            key_arc.check_rate_limit(),
+            key_arc.try_consume_rate_limit(),
             "check_rate_limit should allow request after window reset"
         );
     }
