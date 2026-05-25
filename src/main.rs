@@ -8,8 +8,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(name = "aibroker")]
 #[command(version = "1.0.0")]
 struct Args {
-    #[arg(long, help = "Dump request/response to stdout")]
-    dump: bool,
+    #[arg(long, help = "Dump request to stdout")]
+    dump_request: bool,
+
+    #[arg(long, help = "Dump response to stdout")]
+    dump_response: bool,
 
     #[arg(long, default_value = "config.toml", help = "Path to config file")]
     config: String,
@@ -26,8 +29,11 @@ fn main() {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    if args.dump {
-        eprintln!("[DUMP] Request/response logging enabled");
+    if args.dump_request {
+        eprintln!("[DUMP] Request logging enabled");
+    }
+    if args.dump_response {
+        eprintln!("[DUMP] Response logging enabled");
     }
 
     let config_path = if std::path::Path::new(&args.config).exists() {
@@ -55,7 +61,7 @@ fn main() {
         tracing::info!("Starting Pingora-based proxy server");
         let config_clone = config.clone();
         std::thread::spawn(move || {
-            run_pingora_server(config_clone, args.dump);
+            run_pingora_server(config_clone, args.dump_request, args.dump_response);
         });
         std::thread::sleep(std::time::Duration::from_secs(1));
         let rt = tokio::runtime::Runtime::new().unwrap();
