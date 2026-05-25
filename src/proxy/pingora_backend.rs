@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::ProxyHttp;
 use pingora::server::Server;
-use pingora::upstreams::peer::HttpPeer;
+use pingora::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::ErrorType;
 use pingora_proxy::http_proxy_service;
 use std::collections::HashMap;
@@ -55,6 +55,7 @@ const DNS_CACHE_TTL_SECS: u64 = 30;
 pub struct PingoraProxy {
     load_balancer: Arc<LoadBalancer>,
     initial_cooldown_secs: u64,
+    idle_timeout: Option<Duration>,
     dns_cache: Arc<RwLock<HashMap<String, DnsCacheEntry>>>,
     dump_request: bool,
     dump_response: bool,
@@ -64,12 +65,14 @@ impl PingoraProxy {
     pub fn new(
         load_balancer: LoadBalancer,
         initial_cooldown_secs: u64,
+        idle_timeout: Option<Duration>,
         dump_request: bool,
         dump_response: bool,
     ) -> Self {
         Self {
             load_balancer: Arc::new(load_balancer),
             initial_cooldown_secs,
+            idle_timeout,
             dns_cache: Arc::new(RwLock::new(HashMap::new())),
             dump_request,
             dump_response,
@@ -244,7 +247,11 @@ impl ProxyHttp for PingoraProxy {
             ip_addr
         };
 
-        let peer = HttpPeer::new(format!("{}:{}", ip_addr, port), tls, host.clone());
+        let mut peer = HttpPeer::new(format!("{}:{}", ip_addr, port), tls, host.clone());
+        if let Some(timeout) = self.idle_timeout
+            && let Some(opts) = peer.get_mut_peer_options() {
+                opts.idle_timeout = Some(timeout);
+            }
 
         info!("proxying to {}:{} (sni: {})", ip_addr, port, host);
 
@@ -365,21 +372,14 @@ impl ProxyHttp for PingoraProxy {
             session.req_header().uri
         );
 
-        let should_mark_failure = matches!(
-            etype,
-            ErrorType::ConnectionClosed | ErrorType::ConnectTimedout | ErrorType::ConnectRefused
-        );
-
+        let should_mark_failure = matches!(etype, ErrorType::ConnectRefused);
         if should_mark_failure
             && let (Some(key_id), Some(provider)) = (&ctx.key_id, &ctx.provider) {
                 let cooldown = Duration::from_secs(self.initial_cooldown_secs);
                 self.load_balancer.mark_failure(provider, key_id, cooldown);
             }
 
-        let should_retry = !matches!(
-            etype,
-            ErrorType::ConnectionClosed | ErrorType::ConnectRefused
-        );
+        let should_retry = !matches!(etype, ErrorType::ConnectRefused);
 
         // Must explicitly set retry decision - pingora panics if not set
         if should_retry {
@@ -401,9 +401,11 @@ pub fn run_pingora_server(config: Config, dump_request: bool, dump_response: boo
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let load_balancer = config.load_balancer();
+    let idle_timeout = Some(Duration::from_secs(config.load_balancing.idle_timeout_secs));
     let proxy = PingoraProxy::new(
         load_balancer,
         config.load_balancing.initial_cooldown_secs,
+        idle_timeout,
         dump_request,
         dump_response,
     );
