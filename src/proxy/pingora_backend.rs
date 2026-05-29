@@ -5,6 +5,7 @@ use pingora::server::Server;
 use pingora::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::ErrorType;
 use pingora_proxy::http_proxy_service;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -32,7 +33,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 fn timestamp() -> String {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let total_secs = d.as_secs() as i64;
     let days = total_secs / 86400;
     let t = total_secs % 86400;
@@ -40,8 +43,10 @@ fn timestamp() -> String {
     let h = t / 3600;
     let m = t % 3600 / 60;
     let s = t % 60;
-    format!("{y:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}.{:03}",
-        d.subsec_millis())
+    format!(
+        "{y:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}.{:03}",
+        d.subsec_millis()
+    )
 }
 
 /// DNS cache entry with TTL
@@ -149,7 +154,13 @@ impl ProxyHttp for PingoraProxy {
 
         if self.dump_request {
             let req = session.req_header();
-            println!("[{}] [REQUEST] {} {:?} {:?}", timestamp(), req.method, req.uri, req.headers);
+            println!(
+                "[{}] [REQUEST] {} {:?} {:?}",
+                timestamp(),
+                req.method,
+                req.uri,
+                req.headers
+            );
         }
         Ok(false)
     }
@@ -249,9 +260,10 @@ impl ProxyHttp for PingoraProxy {
 
         let mut peer = HttpPeer::new(format!("{}:{}", ip_addr, port), tls, host.clone());
         if let Some(timeout) = self.idle_timeout
-            && let Some(opts) = peer.get_mut_peer_options() {
-                opts.idle_timeout = Some(timeout);
-            }
+            && let Some(opts) = peer.get_mut_peer_options()
+        {
+            opts.idle_timeout = Some(timeout);
+        }
 
         info!("proxying to {}:{} (sni: {})", ip_addr, port, host);
 
@@ -269,10 +281,34 @@ impl ProxyHttp for PingoraProxy {
             && let Some(bytes) = body.as_deref()
             && !bytes.is_empty()
         {
+            const MAX_LOG_LEN: usize = 10_000;
+
             if let Ok(body_str) = std::str::from_utf8(bytes) {
-                println!("[{}] [REQUEST BODY]\n{}", timestamp(), body_str);
+                let pretty = match serde_json::from_str::<Value>(body_str) {
+                    Ok(v) => match serde_json::to_string_pretty(&v) {
+                        Ok(s) => s,
+                        Err(_) => body_str.to_string(),
+                    },
+                    Err(_) => body_str.to_string(),
+                };
+
+                let output = if pretty.len() > MAX_LOG_LEN {
+                    format!(
+                        "{}\n... (truncated, {} bytes total)",
+                        pretty.chars().take(MAX_LOG_LEN).collect::<String>(),
+                        pretty.len()
+                    )
+                } else {
+                    pretty
+                };
+
+                println!("[{}] [REQUEST BODY]\n{}", timestamp(), output);
             } else {
-                println!("[{}] [REQUEST BODY] <binary {} bytes>", timestamp(), bytes.len());
+                println!(
+                    "[{}] [REQUEST BODY] <binary {} bytes>",
+                    timestamp(),
+                    bytes.len()
+                );
             }
         }
         Ok(())
@@ -332,7 +368,12 @@ impl ProxyHttp for PingoraProxy {
         _ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         if self.dump_response {
-            println!("[{}] [RESPONSE] {} {:?}", timestamp(), resp.status, resp.headers);
+            println!(
+                "[{}] [RESPONSE] {} {:?}",
+                timestamp(),
+                resp.status,
+                resp.headers
+            );
         }
         Ok(())
     }
@@ -348,9 +389,31 @@ impl ProxyHttp for PingoraProxy {
             && let Some(bytes) = body.as_deref()
         {
             if let Ok(body_str) = std::str::from_utf8(bytes) {
-                println!("[{}] [RESPONSE BODY]\n{}", timestamp(), body_str);
+                const MAX_LOG_LEN: usize = 10_000;
+                let pretty = match serde_json::from_str::<Value>(body_str) {
+                    Ok(v) => {
+                        serde_json::to_string_pretty(&v).unwrap_or_else(|_| body_str.to_string())
+                    }
+                    Err(_) => body_str.to_string(),
+                };
+
+                let output = if pretty.len() > MAX_LOG_LEN {
+                    format!(
+                        "{}\n... (truncated, {} bytes total)",
+                        pretty.chars().take(MAX_LOG_LEN).collect::<String>(),
+                        pretty.len()
+                    )
+                } else {
+                    pretty
+                };
+
+                println!("[{}] [RESPONSE BODY]\n{}", timestamp(), output);
             } else {
-                println!("[{}] [RESPONSE BODY] <binary {} bytes>", timestamp(), bytes.len());
+                println!(
+                    "[{}] [RESPONSE BODY] <binary {} bytes>",
+                    timestamp(),
+                    bytes.len()
+                );
             }
         }
         Ok(None)
@@ -373,11 +436,11 @@ impl ProxyHttp for PingoraProxy {
         );
 
         let should_mark_failure = matches!(etype, ErrorType::ConnectRefused);
-        if should_mark_failure
-            && let (Some(key_id), Some(provider)) = (&ctx.key_id, &ctx.provider) {
-                let cooldown = Duration::from_secs(self.initial_cooldown_secs);
-                self.load_balancer.mark_failure(provider, key_id, cooldown);
-            }
+        if should_mark_failure && let (Some(key_id), Some(provider)) = (&ctx.key_id, &ctx.provider)
+        {
+            let cooldown = Duration::from_secs(self.initial_cooldown_secs);
+            self.load_balancer.mark_failure(provider, key_id, cooldown);
+        }
 
         let should_retry = !matches!(etype, ErrorType::ConnectRefused);
 
