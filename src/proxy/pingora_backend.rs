@@ -154,12 +154,18 @@ impl ProxyHttp for PingoraProxy {
 
         if self.dump_request {
             let req = session.req_header();
+            let headers_str = req
+                .headers
+                .iter()
+                .map(|(k, v)| format!("  {}: {}", k, v.to_str().unwrap_or("<binary>")))
+                .collect::<Vec<_>>()
+                .join("\n");
             println!(
-                "[{}] [REQUEST] {} {:?} {:?}",
+                "[{}] [REQUEST] {} {}\n{}",
                 timestamp(),
                 req.method,
                 req.uri,
-                req.headers
+                headers_str
             );
         }
         Ok(false)
@@ -281,10 +287,11 @@ impl ProxyHttp for PingoraProxy {
             && let Some(bytes) = body.as_deref()
             && !bytes.is_empty()
         {
-            const MAX_LOG_LEN: usize = 10_000;
+            const MAX_LOG_LEN: usize = 512;
 
             if let Ok(body_str) = std::str::from_utf8(bytes) {
-                let pretty = match serde_json::from_str::<Value>(body_str) {
+                let json_str = body_str.strip_prefix("data: ").unwrap_or(body_str);
+                let pretty = match serde_json::from_str::<Value>(json_str) {
                     Ok(v) => match serde_json::to_string_pretty(&v) {
                         Ok(s) => s,
                         Err(_) => body_str.to_string(),
@@ -302,7 +309,7 @@ impl ProxyHttp for PingoraProxy {
                     pretty
                 };
 
-                println!("[{}] [REQUEST BODY]\n{}", timestamp(), output);
+                println!("[{}] [REQUEST BODY]\n---\n{}\n---", timestamp(), output);
             } else {
                 println!(
                     "[{}] [REQUEST BODY] <binary {} bytes>",
@@ -368,11 +375,17 @@ impl ProxyHttp for PingoraProxy {
         _ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         if self.dump_response {
+            let headers_str = resp
+                .headers
+                .iter()
+                .map(|(k, v)| format!("  {}: {}", k, v.to_str().unwrap_or("<binary>")))
+                .collect::<Vec<_>>()
+                .join("\n");
             println!(
-                "[{}] [RESPONSE] {} {:?}",
+                "[{}] [RESPONSE] {}\n{}",
                 timestamp(),
                 resp.status,
-                resp.headers
+                headers_str
             );
         }
         Ok(())
@@ -389,8 +402,9 @@ impl ProxyHttp for PingoraProxy {
             && let Some(bytes) = body.as_deref()
         {
             if let Ok(body_str) = std::str::from_utf8(bytes) {
-                const MAX_LOG_LEN: usize = 10_000;
-                let pretty = match serde_json::from_str::<Value>(body_str) {
+                const MAX_LOG_LEN: usize = 512;
+                let json_str = body_str.strip_prefix("data: ").unwrap_or(body_str);
+                let pretty = match serde_json::from_str::<Value>(json_str) {
                     Ok(v) => {
                         serde_json::to_string_pretty(&v).unwrap_or_else(|_| body_str.to_string())
                     }
@@ -407,7 +421,7 @@ impl ProxyHttp for PingoraProxy {
                     pretty
                 };
 
-                println!("[{}] [RESPONSE BODY]\n{}", timestamp(), output);
+                println!("[{}] [RESPONSE BODY]\n---\n{}\n---", timestamp(), output);
             } else {
                 println!(
                     "[{}] [RESPONSE BODY] <binary {} bytes>",
@@ -442,14 +456,20 @@ impl ProxyHttp for PingoraProxy {
             self.load_balancer.mark_failure(provider, key_id, cooldown);
         }
 
-        let should_retry = !matches!(etype, ErrorType::ConnectRefused);
+        let should_retry = !matches!(
+            etype,
+            ErrorType::ConnectRefused | ErrorType::ConnectionClosed
+        );
+        let mark_as_upstream = matches!(etype, ErrorType::ConnectRefused);
 
         // Must explicitly set retry decision - pingora panics if not set
         if should_retry {
             e.set_retry(true);
         } else {
             e.set_retry(false);
-            e.as_up();
+            if mark_as_upstream {
+                e.as_up();
+            }
         }
 
         e
