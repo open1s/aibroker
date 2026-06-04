@@ -287,7 +287,7 @@ impl ProxyHttp for PingoraProxy {
             && let Some(bytes) = body.as_deref()
             && !bytes.is_empty()
         {
-            const MAX_LOG_LEN: usize = 512;
+            const MAX_LOG_LEN: usize = 151200;
 
             if let Ok(body_str) = std::str::from_utf8(bytes) {
                 let json_str = body_str.strip_prefix("data: ").unwrap_or(body_str);
@@ -402,7 +402,7 @@ impl ProxyHttp for PingoraProxy {
             && let Some(bytes) = body.as_deref()
         {
             if let Ok(body_str) = std::str::from_utf8(bytes) {
-                const MAX_LOG_LEN: usize = 512;
+                const MAX_LOG_LEN: usize = 151200;
                 let json_str = body_str.strip_prefix("data: ").unwrap_or(body_str);
                 let pretty = match serde_json::from_str::<Value>(json_str) {
                     Ok(v) => {
