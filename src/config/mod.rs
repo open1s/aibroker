@@ -86,19 +86,22 @@ impl ServerConfig {
         }
 
         if let Some(ref pid_file) = self.pid_file
-            && !pid_file.is_empty() {
-                conf.pid_file = pid_file.clone();
-            }
+            && !pid_file.is_empty()
+        {
+            conf.pid_file = pid_file.clone();
+        }
 
         if let Some(ref user) = self.user
-            && !user.is_empty() {
-                conf.user = Some(user.clone());
-            }
+            && !user.is_empty()
+        {
+            conf.user = Some(user.clone());
+        }
 
         if let Some(ref group) = self.group
-            && !group.is_empty() {
-                conf.group = Some(group.clone());
-            }
+            && !group.is_empty()
+        {
+            conf.group = Some(group.clone());
+        }
 
         conf
     }

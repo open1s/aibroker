@@ -1,7 +1,7 @@
-use clap::Parser;
 use aibroker::config::Config;
 use aibroker::proxy::pingora_backend::run_pingora_server;
 use aibroker::proxy::reqwest_backend::run_reqwest_server;
+use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -39,7 +39,10 @@ fn main() {
     let config_path = if std::path::Path::new(&args.config).exists() {
         args.config.clone()
     } else if let Ok(home) = std::env::var("HOME") {
-        let config_dir = std::path::Path::new(&home).join(".config").join("aibroker").join("config.toml");
+        let config_dir = std::path::Path::new(&home)
+            .join(".config")
+            .join("aibroker")
+            .join("config.toml");
         config_dir.to_string_lossy().to_string()
     } else {
         args.config.clone()
