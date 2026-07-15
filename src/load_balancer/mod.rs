@@ -108,7 +108,7 @@ impl KeyPool {
         let len = candidates.len();
         let start = self
             .current_index
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for i in 0..len {
             if candidates[(start + i) % len].is_available() {
                 return candidates[(start + i) % len].clone();
