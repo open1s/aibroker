@@ -38,12 +38,12 @@ fn main() {
 
     let config_path = if std::path::Path::new(&args.config).exists() {
         args.config.clone()
-    } else if let Ok(home) = std::env::var("HOME") {
-        let config_dir = std::path::Path::new(&home)
-            .join(".config")
+    } else if let Some(home) = dirs::home_dir() {
+        home.join(".config")
             .join("aibroker")
-            .join("config.toml");
-        config_dir.to_string_lossy().to_string()
+            .join("config.toml")
+            .to_string_lossy()
+            .to_string()
     } else {
         args.config.clone()
     };
