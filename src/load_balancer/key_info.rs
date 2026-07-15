@@ -216,7 +216,10 @@ mod tests {
             !key.try_consume_rate_limit(),
             "Request 4 should be blocked (limit is 3)"
         );
-        assert!(!key.try_consume_rate_limit(), "Request 5 should also be blocked");
+        assert!(
+            !key.try_consume_rate_limit(),
+            "Request 5 should also be blocked"
+        );
     }
 
     #[test]

@@ -87,9 +87,10 @@ impl ReqwestProxy {
 
         if let Some(url_str) = &key.base_url
             && let Ok(url) = url::Url::parse(url_str)
-                && let Some(host) = url.host_str() {
-                    upstream_req = upstream_req.header("Host", host);
-                }
+            && let Some(host) = url.host_str()
+        {
+            upstream_req = upstream_req.header("Host", host);
+        }
 
         let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
             .await
