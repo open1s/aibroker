@@ -1,0 +1,89 @@
+# Deterministic test config: a local mock upstream on 11798 lets us prove key
+# rotation, rate limiting, routing and the admin API without touching a real
+# provider. The broker listens on 11636 (admin 11636/admin, metrics /metrics).
+proxy_type = "pingora"
+
+[server]
+host = "127.0.0.1"
+port = 11636
+threads = 2
+daemon = false
+connect_timeout_ms = 2000
+idle_timeout_ms = 10000
+max_retries = 3
+
+[[providers]]
+name = "mock"
+base_url = "http://127.0.0.1:11798"
+default_models = ["mock-model", "always-429-model", "always-500-model"]
+# Enough headroom that the broker's own RPM accounting never masks the retry
+# paths under test; run_feature_tests.py exercises RPM exhaustion separately.
+max_rpm = 10
+max_concurrency = 4
+
+[[providers.api_keys]]
+id = "mock-key-1"
+key = "sk-mock-1"
+models = ["mock-model", "always-429-model", "always-500-model"]
+weight = 1
+
+[[providers.api_keys]]
+id = "mock-key-2"
+key = "sk-mock-2"
+models = ["mock-model", "always-429-model", "always-500-model"]
+weight = 1
+
+[[providers.api_keys]]
+id = "mock-key-3"
+key = "sk-mock-3"
+models = ["mock-model", "always-429-model", "always-500-model"]
+weight = 1
+
+[[routes]]
+model = "mock-model"
+providers = ["mock"]
+
+# Models used by the failure-path tests.
+[[routes]]
+model = "always-429-model"
+providers = ["mock"]
+
+[[routes]]
+model = "always-500-model"
+providers = ["mock"]
+
+# A model that no key serves: proves the "no key for model" 503 path.
+[[routes]]
+model = "unserved-model"
+providers = ["mock"]
+
+[load_balancing]
+strategy = "round_robin"
+fallback_strategies = ["least_busy"]
+initial_cooldown_secs = 2
+max_cooldown_secs = 20
+cooldown_multiplier = 3.0
+cooldown_jitter = 0.0
+# Fail fast instead of waiting, so the exhaustion test is quick.
+max_wait_for_key_secs = 0
+idle_timeout_secs = 60
+
+[health]
+enabled = true
+failure_threshold = 3
+unhealthy_threshold = 0.3
+slow_latency_ms = 1000
+
+[observability]
+metrics_enabled = true
+metrics_path = "/metrics"
+access_log = true
+usage_tracking = true
+usage_scan_limit_bytes = 65536
+
+[admin]
+enabled = true
+mode = "path"
+path = "/admin"
+token = "test-admin-token-11636"
+persist = false

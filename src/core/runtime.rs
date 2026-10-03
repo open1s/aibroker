@@ -345,6 +345,57 @@ mod tests {
     }
 
     #[test]
+    fn admin_reset_is_not_undone_by_a_rebuild() {
+        // Regression: `apply` snapshots state before rebuilding, and the
+        // snapshot used to carry cumulative counters, so resetting a key
+        // through the admin API was silently reverted by the very rebuild that
+        // applied the mutation.
+        let mut runtime = Runtime::new(
+            config(vec![provider(
+                "openai",
+                vec![ApiKeyConfig {
+                    max_rpm: Some(1),
+                    ..key("k1", &["gpt-4"])
+                }],
+            )]),
+            None,
+        )
+        .unwrap();
+
+        let empty = std::collections::HashSet::new();
+        assert!(runtime.broker().select(Some("gpt-4"), &empty, 0).is_ok());
+        let key = runtime
+            .broker()
+            .pool("openai")
+            .unwrap()
+            .key("k1")
+            .unwrap()
+            .clone();
+        assert_eq!(key.observed_rates().0, 1);
+
+        key.reset();
+        assert_eq!(key.observed_rates().0, 0, "reset clears the window");
+
+        // Any config change rebuilds the broker and transfers live state.
+        runtime
+            .apply(|cfg| {
+                cfg.observability.access_log = !cfg.observability.access_log;
+            })
+            .unwrap();
+
+        let key = runtime.broker().pool("openai").unwrap().key("k1").unwrap();
+        assert_eq!(
+            key.observed_rates().0,
+            0,
+            "a rebuild must not resurrect the rate-limit window we just cleared"
+        );
+        assert!(
+            runtime.broker().select(Some("gpt-4"), &empty, 0).is_ok(),
+            "the reset key must be usable again"
+        );
+    }
+
+    #[test]
     fn apply_rejects_an_invalid_candidate_without_mutating_state() {
         let mut runtime = Runtime::new(
             config(vec![provider("openai", vec![key("k1", &["gpt-4"])])]),

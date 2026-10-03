@@ -31,6 +31,10 @@ use crate::proxy::body::{
 };
 use crate::proxy::ctx::RequestContext;
 
+/// Upper bound on the pause before a retry, so a large upstream `Retry-After`
+/// cannot stall a client request behind the retry budget.
+const MAX_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
 /// Resolved settings the proxy consults on every request.
 #[derive(Debug, Clone)]
 pub struct ProxySettings {
@@ -293,8 +297,19 @@ impl ProxyService {
     }
 
     /// Whether a status code should trigger a retry on another key.
+    ///
+    /// Only *credential* problems justify burning another key. A 4xx that
+    /// describes the request itself -- a retired model (410), an unknown
+    /// deployment (404), a rejected body (400/422) -- fails identically on
+    /// every key, so those are returned to the caller untouched.
     fn is_retryable_status(status: u16) -> bool {
-        status == 429 || status == 408 || status == 409 || status >= 500
+        matches!(status, 408 | 409 | 425 | 429) || status >= 500
+    }
+
+    /// Whether a status is a *permanent* provider answer that no other key can
+    /// fix. Used to explain the decision in logs.
+    fn is_permanent_status(status: u16) -> bool {
+        matches!(status, 400 | 401 | 403 | 404 | 405 | 410 | 422)
     }
 
     /// Parse `Retry-After` from an upstream response.
@@ -621,6 +636,14 @@ impl ProxyHttp for ProxyService {
         // response is committed downstream.
         self.settle(ctx, outcome);
 
+        if Self::is_permanent_status(status) {
+            // Unreachable while `is_retryable_status` excludes these; kept as a
+            // guard so a future edit cannot start rotating keys on a
+            // request-level error.
+            warn!(status, "permanent upstream refusal, not rotating keys");
+            return Ok(());
+        }
+
         if ctx.attempts as usize >= self.settings.max_retries {
             warn!(
                 status,
@@ -632,8 +655,14 @@ impl ProxyHttp for ProxyService {
         }
 
         // Back off briefly so a rate-limited upstream is not hit again at once.
+        // The pause is capped: sleeping out a long `Retry-After` would make the
+        // client wait only to receive the same error once the budget is gone.
         let pause = retry_after.unwrap_or(Duration::from_millis(250));
-        let ceiling = self.settings.max_wait_for_key.max(Duration::from_secs(1));
+        let ceiling = self
+            .settings
+            .max_wait_for_key
+            .max(Duration::from_secs(1))
+            .min(MAX_RETRY_PAUSE);
         if pause <= ceiling {
             tokio::time::sleep(pause).await;
         }
@@ -1024,6 +1053,21 @@ mod tests {
         assert!(!ProxyService::is_retryable_status(401));
         assert!(!ProxyService::is_retryable_status(404));
         assert!(!ProxyService::is_retryable_status(200));
+        assert!(ProxyService::is_retryable_status(409));
+        // A retired model (observed live from NVIDIA as 410 Gone) must not
+        // consume the whole key pool before reaching the caller.
+        assert!(!ProxyService::is_retryable_status(410));
+        assert!(!ProxyService::is_retryable_status(422));
+    }
+
+    #[test]
+    fn permanent_statuses_are_recognised_for_the_log() {
+        for status in [400, 401, 403, 404, 405, 410, 422] {
+            assert!(ProxyService::is_permanent_status(status), "{status}");
+            assert!(!ProxyService::is_retryable_status(status), "{status}");
+        }
+        assert!(!ProxyService::is_permanent_status(429));
+        assert!(!ProxyService::is_permanent_status(500));
     }
 
     #[test]

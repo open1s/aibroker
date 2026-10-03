@@ -136,11 +136,12 @@ one that yields a usable key:
 
 | Upstream result | Broker behaviour |
 |-----------------|------------------|
-| `429` | Key is parked (honouring `Retry-After` when present) and the request is replayed on another key |
+| `429` | Key is parked (honouring `Retry-After` when present, capped at 5s) and the request is replayed on another key |
 | `5xx` | Key health drops and escalates its cooldown; request retried on another key |
+| `408`, `409`, `425` | Retried on another key |
 | Transport error **before** a response | Retried on another key |
 | Transport error **after** a response | Not retried — the upstream already answered; a late socket close is normal |
-| `4xx` other than 429 | Passed straight through, never replayed |
+| `4xx` describing the request (`400`, `401`, `403`, `404`, `405`, `410`, `422`) | Returned straight to the caller and **never** replayed: every key would fail identically. A retired model answering `410 Gone` costs exactly one attempt |
 | Every key unusable | `429` with `Retry-After`, or `503` when no key matches the model |
 
 ### Key state
@@ -201,6 +202,28 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 Token counts come from the response `usage` object when it is present
 (OpenAI, Anthropic, Gemini and Ollama field names are recognised), which also
 feeds TPM accounting and optional cost estimates.
+
+## Testing against a live broker
+
+`tests/manual/` holds a black-box test harness that drives a real broker
+process over HTTP:
+
+```bash
+cargo build --release --offline
+
+# 55 checks: rotation, retry budget, exhaustion, streaming, metrics, admin API
+python3 tests/manual/run_feature_tests.py --profile mock
+
+# 18 checks against a real provider configured in test-real-config.toml:
+# a genuine completion, token accounting, round-robin and 410 fail-fast
+python3 tests/manual/run_feature_tests.py --profile real
+```
+
+The mock profile starts `tests/manual/mock_upstream.py`, a scripted upstream
+that rate limits its first caller so the rotation path can be observed, and
+asserts on the credential each attempt used. The real profile needs live keys;
+it validates that a completion flows end to end and that a retired model is
+refused after a single attempt.
 
 ## Architecture
 

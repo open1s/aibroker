@@ -658,22 +658,17 @@ impl KeyState {
             latency_ms: self.latency_ms(),
             consecutive_failures: health.consecutive_failures,
             half_open_successes: health.half_open_successes,
-            selections: self.selections(),
-            successes: self.successes(),
-            failures: self.failures(),
-            rate_limit_hits: self.rate_limit_hits(),
-            tokens_in: self.tokens_in(),
-            tokens_out: self.tokens_out(),
-            peak_rpm: self.window_rpm_peak.load(Ordering::Relaxed),
-            peak_tpm: self.window_tpm_peak.load(Ordering::Relaxed),
         }
     }
 
     /// Apply a snapshot to a freshly constructed key.
     ///
-    /// Rate-limit windows are intentionally not carried over: their samples are
-    /// anchored to `Instant`s that cannot be replayed, so migration resets them
-    /// and the key may briefly allow up to one extra window of traffic.
+    /// Only *live* state is transferred: cooldown, health score, observed
+    /// latency and the failure streak. Cumulative counters and rate-limit
+    /// windows are deliberately left alone — their samples are anchored to
+    /// `Instant`s that cannot be replayed, and restoring counters would undo an
+    /// operator's `reset` (or any other admin action) by writing the
+    /// pre-rebuild values back over it.
     pub fn restore(&self, snapshot: &KeySnapshot) {
         // `enabled` is deliberately *not* restored: it is owned by the
         // configuration, so disabling a key through the admin API sticks even
@@ -698,19 +693,6 @@ impl KeyState {
             let micros = (latency * 1000.0).max(0.0).min(u64::MAX as f64) as u64;
             self.latency_us.store(micros, Ordering::Relaxed);
         }
-        self.selections
-            .store(snapshot.selections, Ordering::Relaxed);
-        self.successes.store(snapshot.successes, Ordering::Relaxed);
-        self.failures.store(snapshot.failures, Ordering::Relaxed);
-        self.rate_limit_hits
-            .store(snapshot.rate_limit_hits, Ordering::Relaxed);
-        self.tokens_in.store(snapshot.tokens_in, Ordering::Relaxed);
-        self.tokens_out
-            .store(snapshot.tokens_out, Ordering::Relaxed);
-        self.window_rpm_peak
-            .store(snapshot.peak_rpm, Ordering::Relaxed);
-        self.window_tpm_peak
-            .store(snapshot.peak_tpm, Ordering::Relaxed);
     }
 
     fn window_roll_over(&self) {
@@ -781,14 +763,6 @@ pub struct KeySnapshot {
     pub latency_ms: Option<f64>,
     pub consecutive_failures: u32,
     pub half_open_successes: u32,
-    pub selections: u64,
-    pub successes: u64,
-    pub failures: u64,
-    pub rate_limit_hits: u64,
-    pub tokens_in: u64,
-    pub tokens_out: u64,
-    pub peak_rpm: u64,
-    pub peak_tpm: u64,
 }
 
 /// RAII guard holding one in-flight slot on a key.

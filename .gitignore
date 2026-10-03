@@ -2,3 +2,9 @@
 .idea
 config.toml
 /.cargo-home
+
+# Local test configurations contain real API keys.
+/test-real-config.toml
+/test-mock-config.toml
+*.log
+/broker-*.log
