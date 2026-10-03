@@ -13,9 +13,10 @@ use crate::config::ProviderConfig;
 use crate::error::{LlmBrokerError, Result};
 
 /// Where a provider expects the credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AuthScheme {
     /// `Authorization: Bearer <key>`.
+    #[default]
     Bearer,
     /// `x-api-key: <key>`.
     XApiKey,
@@ -27,12 +28,6 @@ pub enum AuthScheme {
     Query(String),
     /// No credential is attached (local/self-hosted upstreams).
     None,
-}
-
-impl Default for AuthScheme {
-    fn default() -> Self {
-        AuthScheme::Bearer
-    }
 }
 
 impl AuthScheme {
@@ -127,9 +122,10 @@ impl AuthScheme {
             AuthScheme::Header(name) => {
                 // `insert_header` needs an owned name with a `'static`
                 // lifetime, so parse the configured header name.
-                if let (Ok(header), Ok(value)) =
-                    (HeaderName::from_bytes(name.as_bytes()), key.parse::<HeaderValue>())
-                {
+                if let (Ok(header), Ok(value)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    key.parse::<HeaderValue>(),
+                ) {
                     req.insert_header(header, value).ok();
                 }
             }
@@ -236,7 +232,8 @@ mod tests {
     #[test]
     fn apply_replaces_client_credentials_rather_than_appending() {
         let mut req = RequestHeader::build("POST", b"/v1/chat/completions", None).unwrap();
-        req.insert_header("authorization", "Bearer client-key").unwrap();
+        req.insert_header("authorization", "Bearer client-key")
+            .unwrap();
         req.insert_header("x-api-key", "client-key").unwrap();
 
         AuthScheme::Bearer.apply(&mut req, "broker-key");
@@ -263,7 +260,10 @@ mod tests {
 
         let mut req = RequestHeader::build("POST", b"/v1/models", None).unwrap();
         AuthScheme::Header("x-goog-api-key".into()).apply(&mut req, "goog");
-        assert_eq!(header_value(&req, "x-goog-api-key").as_deref(), Some("goog"));
+        assert_eq!(
+            header_value(&req, "x-goog-api-key").as_deref(),
+            Some("goog")
+        );
     }
 
     #[test]
@@ -288,7 +288,10 @@ mod tests {
     #[test]
     fn query_decoration_handles_empty_query() {
         let scheme = AuthScheme::Query("key".to_string());
-        assert_eq!(scheme.decorate_query(None, "abc").as_deref(), Some("key=abc"));
+        assert_eq!(
+            scheme.decorate_query(None, "abc").as_deref(),
+            Some("key=abc")
+        );
         assert_eq!(
             scheme.decorate_query(Some(""), "abc").as_deref(),
             Some("key=abc")
@@ -305,7 +308,9 @@ mod tests {
     #[test]
     fn non_query_schemes_pass_the_query_through_untouched() {
         assert_eq!(
-            AuthScheme::Bearer.decorate_query(Some("a=1"), "k").as_deref(),
+            AuthScheme::Bearer
+                .decorate_query(Some("a=1"), "k")
+                .as_deref(),
             Some("a=1")
         );
         assert_eq!(AuthScheme::Bearer.decorate_query(None, "k"), None);

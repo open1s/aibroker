@@ -250,7 +250,7 @@ fn weighted_pick(candidates: &[Candidate], tolerance: f64, use_effective: bool) 
 
     // Randomly relax the ordering so near-equal weights shuffle.
     if tolerance > 0.0 {
-        roll = roll * (1.0 + tolerance * (rand_unit() - 0.5) * 2.0);
+        roll *= 1.0 + tolerance * (rand_unit() - 0.5) * 2.0;
     }
 
     let mut cursor = 0.0;
@@ -304,9 +304,15 @@ mod tests {
     fn parse_accepts_legacy_and_new_names() {
         assert_eq!(Strategy::parse("round_robin"), Some(Strategy::RoundRobin));
         assert_eq!(Strategy::parse("Round-Robin"), Some(Strategy::RoundRobin));
-        assert_eq!(Strategy::parse("latency_based"), Some(Strategy::LeastLatency));
+        assert_eq!(
+            Strategy::parse("latency_based"),
+            Some(Strategy::LeastLatency)
+        );
         assert_eq!(Strategy::parse("least_used"), Some(Strategy::LeastBusy));
-        assert_eq!(Strategy::parse("usage-based-routing"), Some(Strategy::UsageBased));
+        assert_eq!(
+            Strategy::parse("usage-based-routing"),
+            Some(Strategy::UsageBased)
+        );
         assert_eq!(Strategy::parse("nope"), None);
     }
 
@@ -331,14 +337,27 @@ mod tests {
             candidate(1, 0, 1, Some(500.0)),
             candidate(2, 3, 1, Some(10.0)),
         ];
-        let picked = select(Strategy::LeastBusy, &candidates, &RotationCounter::new(), 0.0);
+        let picked = select(
+            Strategy::LeastBusy,
+            &candidates,
+            &RotationCounter::new(),
+            0.0,
+        );
         assert_eq!(picked, 1);
     }
 
     #[test]
     fn least_latency_ignores_keys_without_measurements_until_they_have_one() {
-        let candidates = vec![candidate(0, 0, 1, Some(120.0)), candidate(1, 0, 1, Some(45.0))];
-        let picked = select(Strategy::LeastLatency, &candidates, &RotationCounter::new(), 0.0);
+        let candidates = vec![
+            candidate(0, 0, 1, Some(120.0)),
+            candidate(1, 0, 1, Some(45.0)),
+        ];
+        let picked = select(
+            Strategy::LeastLatency,
+            &candidates,
+            &RotationCounter::new(),
+            0.0,
+        );
         assert_eq!(picked, 1);
 
         let unmeasured = vec![candidate(0, 0, 1, Some(120.0)), candidate(1, 0, 1, None)];
@@ -370,10 +389,18 @@ mod tests {
 
     #[test]
     fn fallback_always_prefers_the_first_candidate() {
-        let candidates = vec![candidate(0, 9, 1, Some(900.0)), candidate(1, 0, 1, Some(1.0))];
+        let candidates = vec![
+            candidate(0, 9, 1, Some(900.0)),
+            candidate(1, 0, 1, Some(1.0)),
+        ];
         for _ in 0..10 {
             assert_eq!(
-                select(Strategy::Fallback, &candidates, &RotationCounter::new(), 0.0),
+                select(
+                    Strategy::Fallback,
+                    &candidates,
+                    &RotationCounter::new(),
+                    0.0
+                ),
                 0
             );
         }
@@ -385,7 +412,12 @@ mod tests {
         // single candidate is returned unchanged.
         let candidates = vec![candidate(7, 0, 1, None)];
         assert_eq!(
-            select(Strategy::LeastBusy, &candidates, &RotationCounter::new(), 0.0),
+            select(
+                Strategy::LeastBusy,
+                &candidates,
+                &RotationCounter::new(),
+                0.0
+            ),
             7
         );
     }

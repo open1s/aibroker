@@ -32,6 +32,9 @@ pub struct RequestContext {
     pub attempt_started_at: Instant,
     /// Estimated tokens for the request, charged against TPM.
     pub estimated_tokens: u64,
+    /// Set once the request body has been inspected for the model, so the
+    /// peek in `upstream_peer` happens at most once per request.
+    pub body_inspected: bool,
     /// Upstream status of the attempt that produced the final response.
     pub upstream_status: Option<u16>,
     /// Whether the upstream response has been sent downstream already.
@@ -72,6 +75,7 @@ impl Default for RequestContext {
             started_at: now,
             attempt_started_at: now,
             estimated_tokens: 0,
+            body_inspected: false,
             upstream_status: None,
             response_started: false,
             usage: UsageAccumulator::new(true, 64 * 1024),
@@ -115,12 +119,14 @@ mod tests {
         assert_eq!(ctx.attempts, 0);
         assert!(ctx.token_usage().is_empty());
         assert!(!ctx.settled);
+        assert!(!ctx.body_inspected);
     }
 
     #[test]
     fn token_usage_reflects_the_accumulator() {
         let mut ctx = RequestContext::default();
-        ctx.usage.push(br#"{"usage":{"prompt_tokens":3,"completion_tokens":4}}"#);
+        ctx.usage
+            .push(br#"{"usage":{"prompt_tokens":3,"completion_tokens":4}}"#);
         assert_eq!(ctx.token_usage().input, 3);
         assert_eq!(ctx.token_usage().output, 4);
     }

@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::Uri as HttpUri;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::server::Server;
-use http::Uri as HttpUri;
 use pingora::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::ErrorType;
 use tokio::net::lookup_host;
@@ -179,11 +179,40 @@ impl ProxyService {
         true
     }
 
-    /// Resolve the model from the request body, then from the path.
+    /// Resolve the model from the request body, then the path.
     fn resolve_model(&self, body: &[u8], path: &str) -> Option<String> {
         extract_model(body).or_else(|| model_from_path(path))
     }
 
+    /// Resolve the model from information available before the request body is
+    /// streamed.
+    ///
+    /// pingora picks the upstream peer and writes the upstream request header
+    /// *before* it streams the body, and it offers no way to put a peeked body
+    /// back into the stream — a peek silently drops the payload. Routing
+    /// therefore uses the signals that do exist at that point:
+    ///
+    /// 1. the `x-llm-model` request header, for clients that can set it;
+    /// 2. the model embedded in the path (`/v1/models/<model>:generateContent`);
+    /// 3. otherwise `None`, in which case the broker walks the configured route
+    ///    order and tries every provider that could serve an unlisted model.
+    fn resolve_early_model(&self, session: &Session, ctx: &mut RequestContext) {
+        if ctx.model.is_some() {
+            return;
+        }
+        let header = session.req_header();
+        let from_header = header
+            .headers
+            .get("x-llm-model")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        ctx.model = from_header.or_else(|| model_from_path(header.uri.path()));
+    }
+
+    /// Record the outcome of an attempt exactly once.
+    /// Ask the broker for a key, skipping ids already tried on this request.
     fn select(
         &self,
         ctx: &RequestContext,
@@ -195,7 +224,6 @@ impl ProxyService {
             .select(model, &ctx.excluded, ctx.estimated_tokens)
     }
 
-    /// Record the outcome of an attempt exactly once.
     fn settle(&self, ctx: &mut RequestContext, outcome: Outcome) {
         if ctx.settled {
             return;
@@ -325,6 +353,11 @@ impl BodyBuffer {
         !self.overflowed
     }
 
+    /// Whether the body exceeded the scan limit.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -369,7 +402,6 @@ impl ProxyHttp for ProxyService {
         ctx.attempt_started_at = ctx.started_at;
         Ok(false)
     }
-
     async fn request_body_filter(
         &self,
         session: &mut Session,
@@ -380,21 +412,23 @@ impl ProxyHttp for ProxyService {
     where
         Self::CTX: Send + Sync,
     {
-        if let Some(chunk) = body.as_deref() {
+        // Record the model for logging, metrics and token estimation. It does
+        // not drive routing: the upstream was already chosen before this filter
+        // ran (see `resolve_early_model`).
+        if let Some(chunk) = body.as_deref()
+            && !chunk.is_empty()
+            && ctx.body.is_empty()
+        {
             ctx.body.push(chunk, self.settings.request_scan_limit);
-            if ctx.model.is_none() && !ctx.body.is_empty() {
-                let path = session.req_header().uri.path().to_string();
-                ctx.model = self.resolve_model(ctx.body.bytes(), &path);
+            if !ctx.body.is_empty() {
                 ctx.estimated_tokens = estimate_request_tokens(ctx.body.bytes());
+                if ctx.model.is_none() {
+                    let path = session.req_header().uri.path().to_string();
+                    ctx.model = self.resolve_model(ctx.body.bytes(), &path);
+                }
             }
         }
-
-        if end_of_stream && ctx.model.is_none() {
-            // No body (GET/HEAD): the path may still name the model.
-            let path = session.req_header().uri.path().to_string();
-            ctx.model = self.resolve_model(&[], &path);
-            ctx.estimated_tokens = 0;
-        }
+        let _ = end_of_stream;
         Ok(())
     }
 
@@ -406,6 +440,10 @@ impl ProxyHttp for ProxyService {
         // Handle a retry: whatever the previous attempt was, drop its guard
         // (already settled) so the key is not double-counted.
         ctx.guard = None;
+
+        // Resolve the model from the signals that exist before the body is
+        // streamed (see `resolve_early_model`).
+        self.resolve_early_model(session, ctx);
 
         let mut selection = self.select(ctx, ctx.model.as_deref());
         if let Err(error) = &selection
@@ -430,7 +468,11 @@ impl ProxyHttp for ProxyService {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                let status = if error.retry_after().is_some() { 429 } else { 503 };
+                let status = if error.retry_after().is_some() {
+                    429
+                } else {
+                    503
+                };
                 let mut header = ResponseHeader::build(status, None)?;
                 if let Some(wait) = error.retry_after() {
                     header.insert_header("Retry-After", wait.as_secs().max(1).to_string())?;
@@ -526,10 +568,9 @@ impl ProxyHttp for ProxyService {
         // upstream request header before the body streams, so a body rewrite
         // here would desynchronise `Content-Length`; routing on the requested
         // model (and letting the provider alias it) is the correct behaviour.
-        if let (Some(requested), Some(upstream)) = (
-            ctx.model.as_deref(),
-            ctx.upstream_model.as_deref(),
-        ) && requested != upstream
+        if let (Some(requested), Some(upstream)) =
+            (ctx.model.as_deref(), ctx.upstream_model.as_deref())
+            && requested != upstream
         {
             debug!("provider {provider} maps model `{requested}` to `{upstream}`");
         }
@@ -560,6 +601,9 @@ impl ProxyHttp for ProxyService {
     ) -> pingora::Result<()> {
         let status = resp.status.as_u16();
         ctx.upstream_status = Some(status);
+        // From here on the response belongs to this key; a later transport
+        // error must not cause a replay on another key.
+        ctx.response_started = true;
 
         if !Self::is_retryable_status(status) {
             return Ok(());
@@ -589,10 +633,7 @@ impl ProxyHttp for ProxyService {
 
         // Back off briefly so a rate-limited upstream is not hit again at once.
         let pause = retry_after.unwrap_or(Duration::from_millis(250));
-        let ceiling = self
-            .settings
-            .max_wait_for_key
-            .max(Duration::from_secs(1));
+        let ceiling = self.settings.max_wait_for_key.max(Duration::from_secs(1));
         if pause <= ceiling {
             tokio::time::sleep(pause).await;
         }
@@ -654,9 +695,22 @@ impl ProxyHttp for ProxyService {
         // A transport failure means this key's connection is unusable.
         self.settle(ctx, Outcome::Failure);
 
-        // Connect refused means the host is wrong; retrying another key for the
-        // same provider will fail the same way, so only retry on transient
-        // transport errors.
+        // A transport error after the upstream already answered is usually
+        // just the server closing the connection at the end of a response, so
+        // it must not justify a replay on its own. The exception is an error
+        // raised by `upstream_response_filter` (a 429 or a 5xx): that filter
+        // has already recorded the outcome and asked for a retry, and clearing
+        // the retry here would defeat key rotation entirely.
+        if ctx.response_started {
+            if error.retry() {
+                debug!("keeping the retry requested by the response filter");
+            }
+            return error;
+        }
+
+        // Connect refused means the host is wrong; another key for the same
+        // provider would fail identically, so only transient transport errors
+        // are retried.
         let transient = matches!(
             etype,
             ErrorType::ConnectionClosed
@@ -733,10 +787,7 @@ pub fn rewrite_model(body: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
 
 /// Split a URI into its path and query.
 fn split_uri(uri: &HttpUri) -> (String, Option<String>) {
-    (
-        uri.path().to_string(),
-        uri.query().map(|q| q.to_string()),
-    )
+    (uri.path().to_string(), uri.query().map(|q| q.to_string()))
 }
 
 /// Replace the request URI's path and query in place.
@@ -997,7 +1048,10 @@ mod tests {
     #[test]
     fn admin_routes_are_derived_from_the_mount_point() {
         let service = service();
-        assert_eq!(service.admin_route("/admin/keys/openai/k1"), "keys/openai/k1");
+        assert_eq!(
+            service.admin_route("/admin/keys/openai/k1"),
+            "keys/openai/k1"
+        );
         assert_eq!(service.admin_route("/admin"), "");
         assert_eq!(service.admin_route("/admin/status"), "status");
     }
@@ -1126,7 +1180,9 @@ mod tests {
     fn model_resolution_prefers_the_body_then_the_path() {
         let service = service();
         assert_eq!(
-            service.resolve_model(br#"{"model":"gpt-4o"}"#, "/v1/chat/completions").as_deref(),
+            service
+                .resolve_model(br#"{"model":"gpt-4o"}"#, "/v1/chat/completions")
+                .as_deref(),
             Some("gpt-4o")
         );
         assert_eq!(

@@ -17,9 +17,7 @@ pub enum Admit {
     /// Room for the request; the samples were recorded.
     Ok,
     /// The window is full. `retry_after` is the wait until capacity frees up.
-    Limited {
-        retry_after: Duration,
-    },
+    Limited { retry_after: Duration },
 }
 
 impl Admit {
@@ -165,19 +163,17 @@ impl RateLimiter {
             // for the very first request, otherwise a large single request can
             // never be admitted when the estimate exceeds the whole budget.
             let charge = estimated_tokens.min(max_tpm);
-            if !self
-                .tokens
-                .has_room(now, max_tpm, charge)
-                && self.tokens.total(now) > 0
-            {
-                retry_after = self.tokens.next_expiry(now).or(Some(WINDOW)).max(retry_after);
+            if !self.tokens.has_room(now, max_tpm, charge) && self.tokens.total(now) > 0 {
+                retry_after = self
+                    .tokens
+                    .next_expiry(now)
+                    .or(Some(WINDOW))
+                    .max(retry_after);
             }
         }
 
         if let Some(wait) = retry_after {
-            return Admit::Limited {
-                retry_after: wait,
-            };
+            return Admit::Limited { retry_after: wait };
         }
 
         self.requests.push(now, 1);

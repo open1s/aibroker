@@ -119,7 +119,8 @@ pub struct KeyState {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct HealthStats {    score: f64,
+struct HealthStats {
+    score: f64,
     latency_ms: Option<f64>,
     consecutive_failures: u32,
     half_open_probe_in_flight: bool,
@@ -381,7 +382,10 @@ impl KeyState {
     }
 
     /// Availability check with a reason, used for diagnostics and metrics.
-    pub fn availability(&self, estimated_tokens: u64) -> std::result::Result<(), UnavailableReason> {
+    pub fn availability(
+        &self,
+        estimated_tokens: u64,
+    ) -> std::result::Result<(), UnavailableReason> {
         if !self.is_enabled() {
             return Err(UnavailableReason::Disabled);
         }
@@ -416,7 +420,10 @@ impl KeyState {
 
     /// Like [`KeyState::availability`] but does not consume rate-limit budget.
     /// Used by metrics and by the "would this ever work" fast path.
-    pub fn probe_availability(&self, estimated_tokens: u64) -> std::result::Result<(), UnavailableReason> {
+    pub fn probe_availability(
+        &self,
+        estimated_tokens: u64,
+    ) -> std::result::Result<(), UnavailableReason> {
         if !self.is_enabled() {
             return Err(UnavailableReason::Disabled);
         }
@@ -508,7 +515,13 @@ impl KeyState {
     }
 
     /// Record a successful request and close the circuit when recovered.
-    pub fn record_success(&self, latency: Duration, tokens_in: u64, tokens_out: u64, tuning: &HealthTuning) {
+    pub fn record_success(
+        &self,
+        latency: Duration,
+        tokens_in: u64,
+        tokens_out: u64,
+        tuning: &HealthTuning,
+    ) {
         self.successes.fetch_add(1, Ordering::Relaxed);
         if tokens_in > 0 {
             self.tokens_in.fetch_add(tokens_in, Ordering::Relaxed);
@@ -568,7 +581,9 @@ impl KeyState {
         let score = health.score;
         drop(health);
 
-        let should_cool = !tuning.enabled || score < tuning.unhealthy_threshold || consecutive >= tuning.failure_threshold;
+        let should_cool = !tuning.enabled
+            || score < tuning.unhealthy_threshold
+            || consecutive >= tuning.failure_threshold;
 
         if should_cool {
             self.escalate_cooldown(policy);
@@ -683,13 +698,15 @@ impl KeyState {
             let micros = (latency * 1000.0).max(0.0).min(u64::MAX as f64) as u64;
             self.latency_us.store(micros, Ordering::Relaxed);
         }
-        self.selections.store(snapshot.selections, Ordering::Relaxed);
+        self.selections
+            .store(snapshot.selections, Ordering::Relaxed);
         self.successes.store(snapshot.successes, Ordering::Relaxed);
         self.failures.store(snapshot.failures, Ordering::Relaxed);
         self.rate_limit_hits
             .store(snapshot.rate_limit_hits, Ordering::Relaxed);
         self.tokens_in.store(snapshot.tokens_in, Ordering::Relaxed);
-        self.tokens_out.store(snapshot.tokens_out, Ordering::Relaxed);
+        self.tokens_out
+            .store(snapshot.tokens_out, Ordering::Relaxed);
         self.window_rpm_peak
             .store(snapshot.peak_rpm, Ordering::Relaxed);
         self.window_tpm_peak
@@ -706,8 +723,10 @@ impl KeyState {
         let (rpm, tpm) = self.observed_rates();
         bump_peak(&self.window_rpm_peak, rpm);
         bump_peak(&self.window_tpm_peak, tpm);
-        self.window_ends_at_ms
-            .store(now_ms + crate::core::ratelimit::WINDOW.as_millis() as i64, Ordering::Relaxed);
+        self.window_ends_at_ms.store(
+            now_ms + crate::core::ratelimit::WINDOW.as_millis() as i64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -888,7 +907,10 @@ mod tests {
         // Regression: the old code ignored the limiter result, so this third
         // check used to succeed and keep handing out the same key.
         assert!(!key.is_available(), "third request must be refused");
-        assert_eq!(key.availability(0).unwrap_err(), UnavailableReason::RateLimited);
+        assert_eq!(
+            key.availability(0).unwrap_err(),
+            UnavailableReason::RateLimited
+        );
     }
 
     #[test]
@@ -896,7 +918,10 @@ mod tests {
         let key = key_with(None, None);
         key.set_enabled(false);
         assert!(!key.is_available());
-        assert_eq!(key.availability(0).unwrap_err(), UnavailableReason::Disabled);
+        assert_eq!(
+            key.availability(0).unwrap_err(),
+            UnavailableReason::Disabled
+        );
     }
 
     #[test]
@@ -915,7 +940,10 @@ mod tests {
 
         key.escalate_cooldown(&policy);
         let second = key.cooldown_remaining().unwrap();
-        assert!(second > first, "second cooldown {second:?} must exceed {first:?}");
+        assert!(
+            second > first,
+            "second cooldown {second:?} must exceed {first:?}"
+        );
 
         for _ in 0..10 {
             key.escalate_cooldown(&policy);
@@ -957,7 +985,10 @@ mod tests {
         let baseline = key.health_score();
         key.record_failure(&policy, &tuning);
         key.record_failure(&policy, &tuning);
-        assert!(key.health_score() < baseline, "failures must lower the score");
+        assert!(
+            key.health_score() < baseline,
+            "failures must lower the score"
+        );
         assert!(key.health_score() < 0.7);
 
         // A success clears the failure streak and starts lifting the score.
@@ -993,7 +1024,10 @@ mod tests {
         guard.complete(
             Outcome::Success,
             Duration::from_millis(10),
-            TokenUsage { input: 1, output: 1 },
+            TokenUsage {
+                input: 1,
+                output: 1,
+            },
             &CooldownPolicy::default(),
             &HealthTuning::default(),
         );
@@ -1016,7 +1050,10 @@ mod tests {
         };
         let key = KeyState::from_config("openai", &cfg).unwrap();
         let guard = key.reserve();
-        assert_eq!(key.availability(0).unwrap_err(), UnavailableReason::Concurrency);
+        assert_eq!(
+            key.availability(0).unwrap_err(),
+            UnavailableReason::Concurrency
+        );
         drop(guard);
         assert!(key.is_available());
     }
@@ -1040,7 +1077,11 @@ mod tests {
             max_rpm: None,
             max_tpm: None,
             max_concurrency: None,
-            model_map: Some([("fast".to_string(), "gpt-4".to_string())].into_iter().collect()),
+            model_map: Some(
+                [("fast".to_string(), "gpt-4".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
         };
         let key = KeyState::from_config("openai", &cfg).unwrap();
         assert!(key.supports_model("gpt-4"));

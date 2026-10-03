@@ -5,10 +5,10 @@ edition = "2024"
 description = "Local LLM proxy with load balancing, retry-on-rate-limit and key management"
 
 [dependencies]
-# Pingora - async HTTP proxy framework (server, TLS and upstream pools)
+# Pingora - async HTTP proxy framework (server, TLS and upstream pools).
+# `pingora-error` is referenced directly for `ErrorType`; the proxy and core
+# crates arrive through the `proxy` feature.
 pingora = { version = "0.8.0", features = ["proxy", "rustls"] }
-pingora-proxy = "0.8.0"
-pingora-core = "0.8.0"
 pingora-error = "0.8.0"
 
 # Async runtime

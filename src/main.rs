@@ -44,6 +44,11 @@ fn main() {
     };
 
     if args.check {
+        // `--check` is also a startup preflight, so resolve `env:` secrets.
+        if let Err(error) = config.validate_secrets() {
+            eprintln!("failed to load config from `{}`: {error}", path.display());
+            std::process::exit(1);
+        }
         println!("configuration `{}` is valid", path.display());
         println!("providers: {}", config.providers.len());
         for provider in &config.providers {

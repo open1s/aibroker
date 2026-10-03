@@ -9,8 +9,11 @@ use std::collections::BTreeMap;
 
 use crate::core::key_state::TokenUsage;
 
-/// Largest request body we are willing to buffer while looking for `model`.
-pub const DEFAULT_REQUEST_SCAN_LIMIT: usize = 8 * 1024 * 1024;
+/// Largest request body we buffer while looking for `model`.
+///
+/// The peek stops as soon as the model is known, so this is an upper bound for
+/// pathological bodies rather than a typical allocation.
+pub const DEFAULT_REQUEST_SCAN_LIMIT: usize = 256 * 1024;
 
 /// Field names carrying the requested model, across provider dialects.
 const MODEL_KEYS: [&str; 3] = ["model", "model_id", "modelId"];
@@ -71,7 +74,7 @@ fn string_value_after(text: &str) -> Option<String> {
     let mut out = String::new();
     let mut started = false;
     let mut escaped = false;
-    while let Some((_, c)) = chars.next() {
+    for (_, c) in chars {
         if !started {
             if c.is_whitespace() {
                 continue;
@@ -190,9 +193,7 @@ impl UsageAccumulator {
         self.total_bytes = self.total_bytes.saturating_add(chunk.len());
         self.carry.extend_from_slice(chunk);
 
-        let parsed = std::str::from_utf8(&self.carry)
-            .ok()
-            .and_then(parse_usage);
+        let parsed = std::str::from_utf8(&self.carry).ok().and_then(parse_usage);
         if let Some(usage) = parsed {
             self.input = self.input.max(usage.input);
             self.output = self.output.max(usage.output);
@@ -383,7 +384,8 @@ mod tests {
 
     #[test]
     fn extract_model_is_not_confused_by_a_model_field_inside_messages() {
-        let body = br#"{"messages":[{"role":"user","content":"{\"model\":\"evil\"}"}],"model":"gpt-4o"}"#;
+        let body =
+            br#"{"messages":[{"role":"user","content":"{\"model\":\"evil\"}"}],"model":"gpt-4o"}"#;
         assert_eq!(extract_model(body).as_deref(), Some("gpt-4o"));
     }
 
@@ -408,7 +410,8 @@ mod tests {
 
     #[test]
     fn parse_usage_reads_openai_shape() {
-        let text = r#"{"id":"x","usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}"#;
+        let text =
+            r#"{"id":"x","usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}"#;
         let usage = parse_usage(text).expect("usage should parse");
         assert_eq!(usage.input, 12);
         assert_eq!(usage.output, 34);
@@ -433,8 +436,7 @@ mod tests {
 
     #[test]
     fn parse_usage_reads_gemini_metadata() {
-        let gemini =
-            r#"{"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":9,"totalTokenCount":14}}"#;
+        let gemini = r#"{"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":9,"totalTokenCount":14}}"#;
         let usage = parse_usage(gemini).expect("gemini metadata should parse");
         assert_eq!(usage.input, 5);
         assert_eq!(usage.output, 9);

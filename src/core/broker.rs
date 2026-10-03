@@ -196,11 +196,7 @@ impl Broker {
             pools.insert(provider.name.clone(), Arc::new(pool));
         }
 
-        let mut routes: Vec<CompiledRoute> = config
-            .routes
-            .iter()
-            .map(|route| compile_route(route))
-            .collect();
+        let mut routes: Vec<CompiledRoute> = config.routes.iter().map(compile_route).collect();
         // Most specific first.
         routes.sort_by_key(|route| route.rank);
 
@@ -566,7 +562,10 @@ mod tests {
         // `anthropic`'s key accepts every model, so it is tried before
         // `openai` for a model nothing explicitly claims.
         assert_eq!(
-            broker.select(Some("gpt-4"), &HashSet::new(), 0).unwrap().provider,
+            broker
+                .select(Some("gpt-4"), &HashSet::new(), 0)
+                .unwrap()
+                .provider,
             "anthropic"
         );
     }
@@ -583,7 +582,10 @@ mod tests {
             .unwrap_err();
         // No provider claims that model, which is a routing failure rather
         // than an exhausted pool — the distinction decides 503 vs 429.
-        assert!(matches!(error, RouteError::Unroutable { .. }), "got {error:?}");
+        assert!(
+            matches!(error, RouteError::Unroutable { .. }),
+            "got {error:?}"
+        );
         assert!(error.retry_after().is_none());
     }
 
@@ -596,7 +598,10 @@ mod tests {
         let exclude = HashSet::new();
         assert!(broker.select(Some("gpt-4"), &exclude, 0).is_ok());
         let error = broker.select(Some("gpt-4"), &exclude, 0).unwrap_err();
-        assert!(matches!(error, RouteError::Exhausted { .. }), "got {error:?}");
+        assert!(
+            matches!(error, RouteError::Exhausted { .. }),
+            "got {error:?}"
+        );
         assert!(error.retry_after().is_some());
     }
 
@@ -641,7 +646,9 @@ mod tests {
     fn no_keys_at_all_reports_no_keys() {
         let cfg = config(vec![provider("empty", vec![])], vec![]);
         let broker = Broker::from_config(&cfg).unwrap();
-        let error = broker.select(Some("gpt-4"), &HashSet::new(), 0).unwrap_err();
+        let error = broker
+            .select(Some("gpt-4"), &HashSet::new(), 0)
+            .unwrap_err();
         assert!(matches!(error, RouteError::NoKeys { .. }), "got {error:?}");
     }
 
@@ -662,7 +669,10 @@ mod tests {
     fn model_rewrite_flag_is_visible() {
         let mut rewrite_route = route("fast", &["a"]);
         rewrite_route.rewrite = true;
-        let cfg = config(vec![provider("a", vec![key("ka", &[])])], vec![rewrite_route]);
+        let cfg = config(
+            vec![provider("a", vec![key("ka", &[])])],
+            vec![rewrite_route],
+        );
         let broker = Broker::from_config(&cfg).unwrap();
         assert!(broker.rewrites_model(Some("fast")));
         assert!(!broker.rewrites_model(Some("other")));

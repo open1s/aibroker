@@ -1,0 +1,183 @@
+# LLM Broker — example configuration
+#
+#   cp config.example.toml config.toml
+#   cargo run -- --config config.toml --check
+#
+# Every section below is optional except `[[providers]]`. Existing 1.x configs
+# keep working: the only fields that were ever required are `server.host`,
+# `server.port` and one provider with one key.
+
+proxy_type = "pingora"
+
+[server]
+host = "0.0.0.0"
+port = 11436
+threads = 4
+daemon = false
+# Upstream connect timeout; 0 uses the pingora default.
+connect_timeout_ms = 5_000
+# Upstream keep-alive; falls back to load_balancing.idle_timeout_secs.
+idle_timeout_ms = 120_000
+# Total attempts per client request, including the first one. This is also the
+# budget for rotating onto another key after a 429/5xx.
+max_retries = 3
+
+# ---------------------------------------------------------------------------
+# Providers and their key pools
+# ---------------------------------------------------------------------------
+
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com"
+# auth = "bearer"          # bearer | x-api-key | api-key | query | <header name>
+# auth_query_param = "key" # used when auth = "query"
+# path_prefix = "/v1"      # prepended to every upstream path
+# Provider-wide fallbacks, applied to keys that do not set their own.
+max_rpm = 500
+max_tpm = 2_000_000
+max_concurrency = 64
+default_models = ["gpt-4o", "gpt-4o-mini"]
+
+[[providers.api_keys]]
+id = "openai-1"
+# `env:NAME` reads the secret from the environment instead of the file.
+key = "env:OPENAI_API_KEY_1"
+weight = 2
+max_rpm = 500
+
+[[providers.api_keys]]
+id = "openai-2"
+key = "env:OPENAI_API_KEY_2"
+weight = 1
+max_rpm = 500
+# Keep a key in the pool but out of rotation.
+# enabled = false
+
+[[providers]]
+name = "anthropic"
+base_url = "https://api.anthropic.com"
+# Anthropic expects `x-api-key`; this is the default for the provider.
+auth = "x-api-key"
+default_models = ["claude-3-5-sonnet-latest"]
+
+[[providers.api_keys]]
+id = "anthropic-1"
+key = "env:ANTHROPIC_API_KEY"
+
+[[providers]]
+name = "nvidia"
+base_url = "https://integrate.api.nvidia.com"
+default_models = ["minimaxai/minimax-m2.5"]
+
+[[providers.api_keys]]
+id = "nvidia-1"
+key = "env:NVIDIA_API_KEY_1"
+weight = 2
+max_rpm = 40
+
+[[providers.api_keys]]
+id = "nvidia-2"
+key = "env:NVIDIA_API_KEY_2"
+weight = 2
+max_rpm = 40
+
+# ---------------------------------------------------------------------------
+# Model routing
+# ---------------------------------------------------------------------------
+# Later, more specific rules win. `providers` is an ordered failover list: the
+# broker moves to the next provider when the previous pool is exhausted.
+
+[[routes]]
+model = "claude-*"
+providers = ["anthropic", "openai"]
+
+[[routes]]
+model = "gpt-*"
+providers = ["openai"]
+
+[[routes]]
+model = "minimax*"
+providers = ["nvidia"]
+
+# Catch-all. Omit it to refuse models that no rule and no provider claims.
+[[routes]]
+model = "*"
+providers = ["openai", "anthropic", "nvidia"]
+
+# ---------------------------------------------------------------------------
+# Load balancing
+# ---------------------------------------------------------------------------
+
+[load_balancing]
+# round_robin | weighted_random | least_busy | least_latency | usage_based |
+# power_of_two | fallback
+strategy = "usage_based"
+# Tried in order when the primary strategy cannot place a request.
+fallback_strategies = ["least_busy", "round_robin"]
+# How much a lighter key may still win a weighted roll (0.0 = strict weights).
+weighted_random_tolerance = 0.1
+
+# Cooldown ramp after a failure: initial * multiplier^level, capped, with
+# +/- jitter to avoid a thundering herd. The default is 1min -> 5min -> 25min.
+initial_cooldown_secs = 60
+cooldown_multiplier = 5.0
+max_cooldown_secs = 1_500
+cooldown_jitter = 0.2
+
+# When every key is exhausted, wait this long for the earliest key to recover
+# before answering 429. 0 fails fast.
+max_wait_for_key_secs = 15
+idle_timeout_secs = 120
+
+# ---------------------------------------------------------------------------
+# Key health (circuit breaker)
+# ---------------------------------------------------------------------------
+
+[health]
+enabled = true
+# EWMA weight for latency observations.
+latency_alpha = 0.2
+# Latency considered "slow" when scoring a key.
+slow_latency_ms = 5_000
+# Score below this opens the circuit for the key.
+unhealthy_threshold = 0.3
+# Consecutive failures that open the circuit immediately.
+failure_threshold = 3
+# Successes needed in the half-open state to close it again.
+recovery_threshold = 2
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+[observability]
+metrics_enabled = true
+metrics_path = "/metrics"
+# One structured log line per completed request.
+access_log = false
+# Read `usage` out of responses to account TPM and cost.
+usage_tracking = true
+usage_scan_limit_bytes = 65_536
+
+# Optional, for cost estimates in /metrics.
+# [[observability.model_pricing]]
+# model = "gpt-4o"
+# input_per_million = 2.5
+# output_per_million = 10.0
+
+# ---------------------------------------------------------------------------
+# Admin API
+# ---------------------------------------------------------------------------
+# The control plane can add, disable and delete credentials, so it refuses
+# every request when no token is configured unless `allow_insecure` is set.
+
+[admin]
+enabled = true
+mode = "path"              # separate | path | off
+host = "127.0.0.1"
+port = 11437               # used when mode = "separate"
+path = "/admin"            # used when mode = "path"
+token = "env:LLM_BROKER_ADMIN_TOKEN"
+# Write key changes back to this file.
+persist = true
+# allow_insecure = true    # only for a loopback-only, trusted machine

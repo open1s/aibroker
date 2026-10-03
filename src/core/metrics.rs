@@ -183,9 +183,7 @@ impl Registry {
         .flatten()
         {
             metric.requests.fetch_add(1, Ordering::Relaxed);
-            metric
-                .latency_us_sum
-                .fetch_add(micros, Ordering::Relaxed);
+            metric.latency_us_sum.fetch_add(micros, Ordering::Relaxed);
             bump_max(&metric.latency_us_max, micros);
             metric.observe_latency(millis);
             if (200..300).contains(&status) {
@@ -209,7 +207,8 @@ impl Registry {
 
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.tokens_in_total.fetch_add(tokens_in, Ordering::Relaxed);
-        self.tokens_out_total.fetch_add(tokens_out, Ordering::Relaxed);
+        self.tokens_out_total
+            .fetch_add(tokens_out, Ordering::Relaxed);
         self.cost_micros_total
             .fetch_add(cost_micros, Ordering::Relaxed);
         if (200..300).contains(&status) {
@@ -325,8 +324,11 @@ impl Registry {
             self.uptime_seconds()
         ));
 
-        let render_family =
-            |out: &mut String, name: &str, label: &str, help: &str, rows: &[(String, Arc<KeyMetrics>)]| {
+        let render_family = |out: &mut String,
+                             name: &str,
+                             label: &str,
+                             help: &str,
+                             rows: &[(String, Arc<KeyMetrics>)]| {
             if rows.is_empty() {
                 return;
             }
@@ -392,9 +394,7 @@ impl Registry {
                 ));
             }
 
-            out.push_str(
-                "# HELP llm_broker_key_latency_milliseconds Request latency per key.\n",
-            );
+            out.push_str("# HELP llm_broker_key_latency_milliseconds Request latency per key.\n");
             out.push_str("# TYPE llm_broker_key_latency_milliseconds histogram\n");
             for (key, metric) in &keys {
                 for (index, bound) in LATENCY_BUCKETS_MS.iter().enumerate() {
@@ -492,16 +492,7 @@ mod tests {
     #[test]
     fn histogram_buckets_place_values_in_the_first_fitting_bucket() {
         let registry = Registry::new();
-        registry.record_request(
-            "p",
-            "k",
-            None,
-            200,
-            Duration::from_millis(120),
-            0,
-            0,
-            0,
-        );
+        registry.record_request("p", "k", None, 200, Duration::from_millis(120), 0, 0, 0);
         let key = registry.key("p", "k");
         // 120ms only fits in buckets >= 250ms, and in exactly one of them.
         assert_eq!(key.latency_bucket(0), 0, "50ms bucket must be empty");
@@ -553,9 +544,17 @@ mod tests {
         let text = registry.render_prometheus();
         assert!(text.contains("llm_broker_requests_total 1"));
         assert!(text.contains("llm_broker_key_requests_total{provider_key=\"openai/k1\"} 1"));
-        assert!(text.contains("llm_broker_model_requests_total{provider_model=\"openai/gpt-4\"} 1"));
-        assert!(text.contains("llm_broker_key_tokens_total{provider_key=\"openai/k1\",direction=\"input\"} 5"));
-        assert!(text.contains("llm_broker_key_latency_milliseconds_count{provider_key=\"openai/k1\"} 1"));
+        assert!(
+            text.contains("llm_broker_model_requests_total{provider_model=\"openai/gpt-4\"} 1")
+        );
+        assert!(text.contains(
+            "llm_broker_key_tokens_total{provider_key=\"openai/k1\",direction=\"input\"} 5"
+        ));
+        assert!(
+            text.contains(
+                "llm_broker_key_latency_milliseconds_count{provider_key=\"openai/k1\"} 1"
+            )
+        );
         assert!(text.contains("# TYPE llm_broker_requests_total counter"));
     }
 

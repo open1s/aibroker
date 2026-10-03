@@ -15,13 +15,13 @@ use std::time::Duration;
 use aibroker::config::{ApiKeyConfig, Config, ProviderConfig, RouteConfig, ServerConfig};
 use aibroker::core::runtime::Runtime;
 use aibroker::core::runtime::shared;
-use aibroker::proxy::pingora_backend::run_server;
 use aibroker::proxy::admin::AdminRouter;
 use aibroker::proxy::pingora_backend::ProxyService;
+use aibroker::proxy::pingora_backend::run_server;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pingora::http::{RequestHeader, ResponseHeader};
+use pingora::http::ResponseHeader;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::server::Server;
 use pingora::upstreams::peer::HttpPeer;
@@ -32,7 +32,9 @@ struct SeenRequest {
     path: String,
     body: String,
     authorization: Option<String>,
+    #[allow(dead_code)]
     api_key: Option<String>,
+    #[allow(dead_code)]
     user_agent: Option<String>,
 }
 
@@ -78,28 +80,55 @@ impl ProxyHttp for MockUpstream {
             user_agent: header_value("user-agent"),
         };
         self.seen.lock().expect("seen lock").push(seen);
-        Ok(false)
-    }
 
-    async fn request_body_filter(
-        &self,
-        _session: &mut Session,
-        body: &mut Option<Bytes>,
-        _end_of_stream: bool,
-        _ctx: &mut Self::CTX,
-    ) -> pingora::Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        if let Some(chunk) = body.as_deref()
-            && let (Ok(text), Some(last)) = (
-                std::str::from_utf8(chunk),
-                self.seen.lock().expect("seen lock").last_mut(),
-            )
-        {
-            last.body.push_str(text);
+        // Read the whole request body before answering: this mock is the end
+        // of the line, so the body has nowhere else to go.
+        let mut body = String::new();
+        loop {
+            match session.downstream_session.read_request_body().await {
+                Ok(Some(chunk)) => body.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("mock failed to read its request body: {error}");
+                    break;
+                }
+            }
         }
-        Ok(())
+        if let Some(last) = self.seen.lock().expect("seen lock").last_mut() {
+            last.body = body;
+        }
+
+        let index = self.counter.fetch_add(1, Ordering::SeqCst);
+        let status = self
+            .script
+            .get(index)
+            .copied()
+            .or_else(|| self.script.last().copied())
+            .unwrap_or(200);
+
+        let payload = match status {
+            200 => r#"{"id":"mock","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":11,"completion_tokens":22}}"#.to_string(),
+            429 => r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#.to_string(),
+            _ => r#"{"error":{"message":"upstream boom"}}"#.to_string(),
+        };
+
+        let mut header = ResponseHeader::build(status, None)?;
+        header.insert_header("Content-Type", "application/json")?;
+        header.insert_header("Content-Length", payload.len().to_string())?;
+        if status == 429 {
+            header.insert_header("Retry-After", "1")?;
+        }
+        // Ask the broker to close this connection after the reply, the way
+        // endpoints behind a rolling deploy do.
+        header.insert_header("Connection", "close")?;
+        session.set_keepalive(None);
+        session
+            .write_response_header(Box::new(header), false)
+            .await?;
+        session
+            .write_response_body(Some(Bytes::from(payload)), true)
+            .await?;
+        Ok(true)
     }
 
     async fn upstream_peer(
@@ -111,47 +140,6 @@ impl ProxyHttp for MockUpstream {
             "MockHasNoUpstream",
         )))
     }
-
-    async fn response_filter(
-        &self,
-        session: &mut Session,
-        _resp: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
-    ) -> pingora::Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        let index = self.counter.fetch_add(1, Ordering::SeqCst);
-        let status = self
-            .script
-            .get(index)
-            .copied()
-            .or_else(|| self.script.last().copied())
-            .unwrap_or(200);
-
-        let body = match status {
-            200 => br#"{"id":"mock","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":11,"completion_tokens":22}}"#.to_vec(),
-            429 => br#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#.to_vec(),
-            _ => br#"{"error":{"message":"upstream boom"}}"#.to_vec(),
-        };
-
-        let mut header = ResponseHeader::build(status, None)?;
-        header.insert_header("Content-Type", "application/json")?;
-        header.insert_header("Content-Length", body.len().to_string())?;
-        if status == 429 {
-            header.insert_header("Retry-After", "0")?;
-        }
-        session.set_keepalive(None);
-        session
-            .write_response_header(Box::new(header), body.is_empty())
-            .await?;
-        if !body.is_empty() {
-            session
-                .write_response_body(Some(Bytes::from(body)), true)
-                .await?;
-        }
-        Ok(())
-    }
 }
 
 /// Reserve a free TCP port.
@@ -162,7 +150,11 @@ fn free_port() -> u16 {
     port
 }
 
-fn base_config(proxy_port: u16, providers: Vec<ProviderConfig>, routes: Vec<RouteConfig>) -> Config {
+fn base_config(
+    proxy_port: u16,
+    providers: Vec<ProviderConfig>,
+    routes: Vec<RouteConfig>,
+) -> Config {
     Config {
         server: ServerConfig {
             host: "127.0.0.1".into(),
@@ -222,7 +214,11 @@ fn spawn_broker(config: Config, port: u16) {
     // exercised, even though these tests do not call the control plane.
     let _ = ProxyService::new(
         Arc::clone(&runtime),
-        Some(AdminRouter::new(Arc::clone(&runtime), Some("t".into()), false)),
+        Some(AdminRouter::new(
+            Arc::clone(&runtime),
+            Some("t".into()),
+            false,
+        )),
     );
 
     std::thread::spawn(move || {
@@ -268,41 +264,89 @@ fn wait_for_port(port: u16) {
 /// A minimal HTTP/1.1 client: enough for a POST with a JSON body.
 struct HttpResponse {
     status: u16,
+    status_line: String,
     headers: HashMap<String, String>,
     body: String,
 }
 
-fn post(port: u16, path: &str, body: &str) -> HttpResponse {
+/// `post`, optionally announcing the model in `x-llm-model`.
+fn post_with_model(port: u16, path: &str, body: &str, model: Option<&str>) -> HttpResponse {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to broker");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("read timeout");
 
+    let model_header = match model {
+        Some(model) => format!("x-llm-model: {model}\r\n"),
+        None => String::new(),
+    };
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n{model_header}Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
-    stream
-        .write_all(request.as_bytes())
-        .expect("write request");
+    stream.write_all(request.as_bytes()).expect("write request");
     stream.flush().ok();
-    let _ = stream.shutdown(std::net::Shutdown::Write);
 
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
-    parse_response(&raw)
+    // Read the status line and headers, then exactly as much body as the
+    // framing says. A real client never half-closes before reading, and doing
+    // so would make the broker see a downstream error instead of a response.
+    let mut buffered: Vec<u8> = Vec::new();
+    let header_end = loop {
+        if let Some(position) = find_subslice(&buffered, b"\r\n\r\n") {
+            break position + 4;
+        }
+        let mut chunk = [0u8; 4096];
+        let read = stream.read(&mut chunk).expect("read header");
+        assert!(read > 0, "connection closed before the response headers");
+        buffered.extend_from_slice(&chunk[..read]);
+    };
+
+    let mut response = parse_response(&buffered[..header_end]);
+    let declared = response
+        .headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok());
+
+    let mut raw_body = buffered[header_end..].to_vec();
+    match declared {
+        Some(length) => {
+            while raw_body.len() < length {
+                let mut chunk = [0u8; 8192];
+                let read = stream.read(&mut chunk).expect("read body");
+                assert!(read > 0, "connection closed before the body was complete");
+                raw_body.extend_from_slice(&chunk[..read]);
+            }
+            raw_body.truncate(length);
+            response.body = String::from_utf8_lossy(&raw_body).to_string();
+        }
+        None => {
+            // No framing header: read until the peer closes.
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => raw_body.extend_from_slice(&chunk[..read]),
+                    Err(_) => break,
+                }
+            }
+            response.body = dechunk(&raw_body);
+        }
+    }
+    response
 }
 
-fn parse_response(raw: &[u8]) -> HttpResponse {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("response header terminator");
-    let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let body = raw[split + 4..].to_vec();
+/// Locate `needle` inside `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
 
+/// Parse the status line and headers out of a header block.
+fn parse_response(raw: &[u8]) -> HttpResponse {
+    let head = String::from_utf8_lossy(raw).to_string();
     let mut lines = head.lines();
-    let status_line = lines.next().unwrap_or_default();
+    let status_line = lines.next().unwrap_or_default().to_string();
     let status = status_line
         .split_whitespace()
         .nth(1)
@@ -316,19 +360,11 @@ fn parse_response(raw: &[u8]) -> HttpResponse {
         }
     }
 
-    let body = if headers
-        .get("transfer-encoding")
-        .is_some_and(|v| v.contains("chunked"))
-    {
-        dechunk(&body)
-    } else {
-        String::from_utf8_lossy(&body).to_string()
-    };
-
     HttpResponse {
         status,
+        status_line,
         headers,
-        body,
+        body: String::new(),
     }
 }
 
@@ -367,13 +403,11 @@ fn rate_limited_key_is_rotated_within_the_same_request() {
 
     let config = base_config(
         proxy_port,
-        vec![
-            provider(
-                "primary",
-                format!("http://127.0.0.1:{upstream_port}"),
-                &[("key-a", "sk-key-a"), ("key-b", "sk-key-b")],
-            ),
-        ],
+        vec![provider(
+            "primary",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key-a", "sk-key-a"), ("key-b", "sk-key-b")],
+        )],
         vec![RouteConfig {
             model: "test-model".into(),
             providers: vec!["primary".into()],
@@ -383,11 +417,16 @@ fn rate_limited_key_is_rotated_within_the_same_request() {
     );
     spawn_broker(config, proxy_port);
 
-    let response = post(proxy_port, "/v1/chat/completions", CHAT_BODY);
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
     assert_eq!(
         response.status, 200,
-        "the request must succeed on the second key, got body: {}",
-        response.body
+        "the request must succeed on the second key: {} | headers {:?} | body {}",
+        response.status_line, response.headers, response.body
     );
     assert!(
         response.body.contains("\"id\":\"mock\""),
@@ -460,7 +499,12 @@ fn model_routing_selects_the_provider_that_serves_it() {
     let config = base_config(proxy_port, vec![primary, secondary], vec![]);
     spawn_broker(config, proxy_port);
 
-    let response = post(proxy_port, "/v1/chat/completions", CHAT_BODY);
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
     assert_eq!(response.status, 200, "body: {}", response.body);
 
     assert!(
@@ -494,7 +538,12 @@ fn exhausted_keys_produce_a_429_with_retry_after() {
     config.server.max_retries = 2;
     spawn_broker(config, proxy_port);
 
-    let response = post(proxy_port, "/v1/chat/completions", CHAT_BODY);
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
     assert_eq!(
         response.status, 429,
         "the upstream 429 must surface once every key is tried: {}",
@@ -528,7 +577,12 @@ fn unknown_model_is_refused_without_touching_an_upstream() {
     spawn_broker(config, proxy_port);
 
     let body = r#"{"model":"no-such-model","messages":[]}"#;
-    let response = post(proxy_port, "/v1/chat/completions", body);
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        body,
+        Some("no-such-model"),
+    );
     assert_eq!(
         response.status, 503,
         "an unroutable model is a configuration problem, got: {}",
@@ -557,7 +611,13 @@ fn concurrent_requests_spread_across_the_key_pool() {
     let mut handles = Vec::new();
     for _ in 0..8 {
         handles.push(std::thread::spawn(move || {
-            post(proxy_port, "/v1/chat/completions", CHAT_BODY).status
+            post_with_model(
+                proxy_port,
+                "/v1/chat/completions",
+                CHAT_BODY,
+                Some("test-model"),
+            )
+            .status
         }));
     }
     for handle in handles {
@@ -580,5 +640,130 @@ fn concurrent_requests_spread_across_the_key_pool() {
     assert!(
         by_key.values().all(|count| *count == 4),
         "round robin must be even, distribution: {by_key:?}"
+    );
+}
+
+#[test]
+fn glob_routes_pick_the_matching_provider_end_to_end() {
+    let gpt_port = free_port();
+    let claude_port = free_port();
+    let proxy_port = free_port();
+    let gpt_seen = spawn_mock(gpt_port, vec![200]);
+    let claude_seen = spawn_mock(claude_port, vec![200]);
+
+    let mut gpt = provider(
+        "gpt",
+        format!("http://127.0.0.1:{gpt_port}"),
+        &[("gpt-key", "sk-gpt")],
+    );
+    gpt.api_keys[0].models = vec!["gpt-4o".into()];
+    let mut claude = provider(
+        "claude",
+        format!("http://127.0.0.1:{claude_port}"),
+        &[("claude-key", "sk-claude")],
+    );
+    claude.api_keys[0].models = vec!["claude-3-5-sonnet".into()];
+
+    // Both providers accept everything they are given, so only the routes
+    // decide which one is used.
+    for provider in [&mut gpt, &mut claude] {
+        provider.api_keys[0].models.clear();
+    }
+
+    let mut config = base_config(proxy_port, vec![gpt, claude], vec![]);
+    config.routes = vec![
+        RouteConfig {
+            model: "gpt-*".into(),
+            providers: vec!["gpt".into()],
+            strategy: None,
+            rewrite: false,
+        },
+        RouteConfig {
+            model: "claude-*".into(),
+            providers: vec!["claude".into()],
+            strategy: None,
+            rewrite: false,
+        },
+    ];
+    spawn_broker(config, proxy_port);
+
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+    let response = post_with_model(proxy_port, "/v1/chat/completions", body, Some("gpt-4o"));
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    assert!(
+        claude_seen.lock().expect("lock").is_empty(),
+        "the claude route must not serve a gpt model"
+    );
+    let hits = gpt_seen.lock().expect("lock").clone();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].authorization.as_deref(), Some("Bearer sk-gpt"));
+
+    let body = r#"{"model":"claude-3-5-sonnet","messages":[]}"#;
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        body,
+        Some("claude-3-5-sonnet"),
+    );
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    let hits = claude_seen.lock().expect("lock").clone();
+    assert_eq!(hits.len(), 1, "claude hits: {hits:?}");
+    // The `claude` provider name selects the `x-api-key` convention, so the
+    // credential must arrive in that header rather than as a bearer token.
+    assert_eq!(hits[0].api_key.as_deref(), Some("sk-claude"));
+    assert!(
+        hits[0].authorization.is_none(),
+        "a non-bearer provider must not receive an Authorization header: {hits:?}"
+    );
+    assert_eq!(
+        gpt_seen.lock().expect("lock").len(),
+        1,
+        "the gpt provider must not receive the claude request"
+    );
+}
+
+#[test]
+fn a_rate_limited_key_is_skipped_by_the_next_request() {
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    // First call 429s, everything after succeeds.
+    let seen = spawn_mock(upstream_port, vec![429, 200]);
+
+    let config = base_config(
+        proxy_port,
+        vec![provider(
+            "primary",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key-a", "sk-key-a"), ("key-b", "sk-key-b")],
+        )],
+        vec![],
+    );
+    spawn_broker(config, proxy_port);
+
+    // Request 1 rotates off the rate-limited key.
+    let first = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(first.status, 200, "{}", first.status_line);
+
+    // Request 2 must not start on the key that just 429'd.
+    let second = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(second.status, 200, "{}", second.status_line);
+
+    let requests = seen.lock().expect("lock").clone();
+    assert_eq!(requests.len(), 3, "expected one rotation then a clean call");
+    let first_key = requests[0].authorization.clone().unwrap();
+    let third_key = requests[2].authorization.clone().unwrap();
+    assert_ne!(
+        first_key, third_key,
+        "the cooled-down key must not be picked again immediately"
     );
 }

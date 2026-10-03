@@ -13,9 +13,7 @@ use parking_lot::RwLock;
 
 use crate::config::{Config, LoadedConfig};
 use crate::core::broker::Broker;
-use crate::core::key_state::{
-    CooldownPolicy, HealthTuning, KeySnapshot, KeyState,
-};
+use crate::core::key_state::{CooldownPolicy, HealthTuning, KeySnapshot, KeyState};
 use crate::core::metrics::Registry;
 use crate::core::strategy::Strategy;
 use crate::error::{LlmBrokerError, Result};
@@ -30,7 +28,11 @@ pub struct Runtime {
 
 impl Runtime {
     /// Build a runtime from an already validated config.
+    ///
+    /// Secret values are resolved here so a missing environment variable fails
+    /// loudly at startup rather than on the first proxied request.
     pub fn new(config: Config, config_path: Option<PathBuf>) -> Result<Self> {
+        config.validate_secrets()?;
         let broker = Broker::from_config(&config)?;
         Ok(Self {
             config,
@@ -89,6 +91,9 @@ impl Runtime {
         let mut candidate = self.config.clone();
         mutate(&mut candidate);
         candidate.validate()?;
+        // A key added through the admin API must already have its secret
+        // available; otherwise it would sit in the pool permanently unusable.
+        candidate.validate_secrets()?;
 
         let broker = Broker::from_config(&candidate)?;
         restore_state(&broker, &previous);
@@ -119,6 +124,7 @@ impl Runtime {
             LlmBrokerError::InvalidConfig("no config file path is known".to_string())
         })?;
         let LoadedConfig { config, .. } = LoadedConfig::load(&path)?;
+        config.validate_secrets()?;
         let previous = self.snapshot_state();
         let broker = Broker::from_config(&config)?;
         restore_state(&broker, &previous);
@@ -167,10 +173,7 @@ pub fn shared(runtime: Runtime) -> SharedRuntime {
 }
 
 /// Convenience accessor for tests and callers that only need one key.
-pub fn key_for_model(
-    runtime: &Runtime,
-    model: Option<&str>,
-) -> Option<Arc<KeyState>> {
+pub fn key_for_model(runtime: &Runtime, model: Option<&str>) -> Option<Arc<KeyState>> {
     let broker = runtime.broker();
     broker
         .select(model, &std::collections::HashSet::new(), 0)
@@ -240,8 +243,11 @@ mod tests {
 
     #[test]
     fn runtime_builds_a_broker_from_config() {
-        let runtime = Runtime::new(config(vec![provider("openai", vec![key("k1", &["gpt-4"])])]), None)
-            .unwrap();
+        let runtime = Runtime::new(
+            config(vec![provider("openai", vec![key("k1", &["gpt-4"])])]),
+            None,
+        )
+        .unwrap();
         assert_eq!(runtime.provider_names(), vec!["openai"]);
         assert!(key_for_model(&runtime, Some("gpt-4")).is_some());
     }

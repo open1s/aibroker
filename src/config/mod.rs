@@ -424,7 +424,12 @@ impl AdminConfig {
 // ---------------------------------------------------------------------------
 
 impl Config {
-    /// Load and validate a config file.
+    /// Load and structurally validate a config file.
+    ///
+    /// Secret *values* are not resolved here so that `--check` and
+    /// [`Config::to_toml`] work on a machine where the environment variables
+    /// are not exported. [`Config::validate_secrets`] performs that step at
+    /// startup and on reload.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(|e| {
@@ -488,7 +493,12 @@ impl Config {
                         key.id, provider.name
                     )));
                 }
-                resolve_secret(&key.key)?;
+                if key.key.starts_with("env:") && key.key.len() == 4 {
+                    return Err(LlmBrokerError::InvalidConfig(format!(
+                        "key `{}` in provider `{}` uses `env:` without a variable name",
+                        key.id, provider.name
+                    )));
+                }
             }
         }
 
@@ -521,7 +531,9 @@ impl Config {
             .chain(self.load_balancing.fallback_strategies.iter())
         {
             crate::core::strategy::Strategy::parse(strategy).ok_or_else(|| {
-                LlmBrokerError::InvalidConfig(format!("unknown load balancing strategy `{strategy}`"))
+                LlmBrokerError::InvalidConfig(format!(
+                    "unknown load balancing strategy `{strategy}`"
+                ))
             })?;
         }
 
@@ -540,7 +552,8 @@ impl Config {
             let has_token = self.admin.resolved_token()?.is_some();
             if !has_token && !self.admin.allow_insecure {
                 return Err(LlmBrokerError::InvalidConfig(
-                    "admin.enabled requires admin.token (or admin.allow_insecure = true)".to_string(),
+                    "admin.enabled requires admin.token (or admin.allow_insecure = true)"
+                        .to_string(),
                 ));
             }
         }
@@ -551,6 +564,28 @@ impl Config {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Resolve every `env:` secret reference, failing with the variable name
+    /// that is missing.
+    pub fn validate_secrets(&self) -> Result<()> {
+        for provider in &self.providers {
+            for key in &provider.api_keys {
+                if let Err(error) = resolve_secret(&key.key) {
+                    // Unwrap the inner message so the report reads as one
+                    // sentence rather than nesting "invalid configuration".
+                    let detail = match error {
+                        LlmBrokerError::InvalidConfig(message) => message,
+                        other => other.to_string(),
+                    };
+                    return Err(LlmBrokerError::InvalidConfig(format!(
+                        "provider `{}` key `{}`: {detail}",
+                        provider.name, key.id
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -592,7 +627,6 @@ impl Config {
             .unwrap_or(self.load_balancing.idle_timeout_secs.saturating_mul(1000));
         std::time::Duration::from_millis(ms)
     }
-
 }
 
 /// Config plus the path it came from, so the admin API can persist changes.

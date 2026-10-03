@@ -43,10 +43,7 @@ impl std::fmt::Display for SelectError {
                 reason,
                 attempted,
             } => {
-                write!(
-                    f,
-                    "all {attempted} key(s) unusable ({reason})"
-                )?;
+                write!(f, "all {attempted} key(s) unusable ({reason})")?;
                 if let Some(wait) = earliest_retry {
                     write!(f, ", next available in {:.1}s", wait.as_secs_f64())?;
                 }
@@ -85,9 +82,10 @@ impl KeyPool {
     ) -> crate::error::Result<Self> {
         let mut pool = Self {
             provider: provider.name.clone(),
-            base_url: provider.base_url.clone().unwrap_or_else(|| {
-                default_base_url(&provider.name).to_string()
-            }),
+            base_url: provider
+                .base_url
+                .clone()
+                .unwrap_or_else(|| default_base_url(&provider.name).to_string()),
             auth: crate::core::auth::AuthScheme::from_config(provider)?,
             path_prefix: provider.path_prefix.clone().unwrap_or_default(),
             keys: Vec::new(),
@@ -101,7 +99,8 @@ impl KeyPool {
 
         for key_config in &provider.api_keys {
             let effective = apply_provider_defaults(provider, key_config);
-            pool.keys.push(KeyState::from_config(&provider.name, &effective)?);
+            pool.keys
+                .push(KeyState::from_config(&provider.name, &effective)?);
         }
 
         Ok(pool)
@@ -227,7 +226,8 @@ impl KeyPool {
         // attempt under `round_robin` before we give up.
         let mut reasons: Vec<UnavailableReason> = Vec::new();
         for strategy in std::iter::once(self.strategy).chain(self.fallbacks.iter().copied()) {
-            if let Some(key) = self.try_strategy(strategy, &considered, estimated_tokens, &mut reasons)
+            if let Some(key) =
+                self.try_strategy(strategy, &considered, estimated_tokens, &mut reasons)
             {
                 return Ok(key);
             }
@@ -235,7 +235,10 @@ impl KeyPool {
 
         Err(SelectError::Exhausted {
             earliest_retry: self.earliest_available(),
-            reason: reasons.first().copied().unwrap_or(UnavailableReason::RateLimited),
+            reason: reasons
+                .first()
+                .copied()
+                .unwrap_or(UnavailableReason::RateLimited),
             attempted: considered.len(),
         })
     }
@@ -303,6 +306,7 @@ impl KeyPool {
                 KeyStatus {
                     id: key.id.clone(),
                     enabled: key.is_enabled(),
+                    weight: key.weight,
                     in_flight: key.in_flight(),
                     state: health.state.as_str(),
                     health_score: health.score,
@@ -333,6 +337,7 @@ impl KeyPool {
 pub struct KeyStatus {
     pub id: String,
     pub enabled: bool,
+    pub weight: u32,
     pub in_flight: u32,
     pub state: &'static str,
     pub health_score: f64,
@@ -398,30 +403,59 @@ pub fn default_base_url(provider: &str) -> &'static str {
 mod tests {
     use super::*;
 
-#[test]
-fn debug_pool_select() {
-    use crate::config::{ApiKeyConfig, ProviderConfig};
-    use crate::core::key_state::{CooldownPolicy, HealthTuning};
-    use crate::core::pool::KeyPool;
-    use crate::core::strategy::Strategy;
-    use std::collections::HashSet;
+    #[test]
+    fn debug_pool_select() {
+        use crate::config::{ApiKeyConfig, ProviderConfig};
+        use crate::core::key_state::{CooldownPolicy, HealthTuning};
+        use crate::core::pool::KeyPool;
+        use crate::core::strategy::Strategy;
+        use std::collections::HashSet;
 
-    let pc = ProviderConfig {
-        name: "openai".into(), base_url: None, path_prefix: None, auth: None,
-        auth_query_param: None, default_models: vec![], max_rpm: None, max_tpm: None,
-        max_concurrency: None,
-        api_keys: vec![ApiKeyConfig {
-            id: "a".into(), key: "sk-a".into(), enabled: true, models: vec![],
-            weight: 1, max_rpm: None, max_tpm: None, max_concurrency: None, model_map: None,
-        }],
-    };
-    let pool = KeyPool::from_config(&pc, Strategy::RoundRobin, vec![], 0.0,
-        CooldownPolicy::default(), HealthTuning::default()).unwrap();
-    let k = pool.key("a").unwrap();
-    eprintln!("enabled={} avail={:?} score={} inflight={} cooldown={:?}",
-        k.is_enabled(), k.availability(0), k.health_score(), k.in_flight(), k.cooldown_remaining());
-    eprintln!("select={:?}", pool.select(None, &HashSet::new(), 0).map(|k| k.id.clone()));
-}
+        let pc = ProviderConfig {
+            name: "openai".into(),
+            base_url: None,
+            path_prefix: None,
+            auth: None,
+            auth_query_param: None,
+            default_models: vec![],
+            max_rpm: None,
+            max_tpm: None,
+            max_concurrency: None,
+            api_keys: vec![ApiKeyConfig {
+                id: "a".into(),
+                key: "sk-a".into(),
+                enabled: true,
+                models: vec![],
+                weight: 1,
+                max_rpm: None,
+                max_tpm: None,
+                max_concurrency: None,
+                model_map: None,
+            }],
+        };
+        let pool = KeyPool::from_config(
+            &pc,
+            Strategy::RoundRobin,
+            vec![],
+            0.0,
+            CooldownPolicy::default(),
+            HealthTuning::default(),
+        )
+        .unwrap();
+        let k = pool.key("a").unwrap();
+        eprintln!(
+            "enabled={} avail={:?} score={} inflight={} cooldown={:?}",
+            k.is_enabled(),
+            k.availability(0),
+            k.health_score(),
+            k.in_flight(),
+            k.cooldown_remaining()
+        );
+        eprintln!(
+            "select={:?}",
+            pool.select(None, &HashSet::new(), 0).map(|k| k.id.clone())
+        );
+    }
 
     use crate::config::{ApiKeyConfig, ProviderConfig};
 
@@ -491,14 +525,22 @@ fn debug_pool_select() {
             Strategy::RoundRobin,
         );
         let empty = HashSet::new();
-        assert_eq!(pool.select(Some("claude-3"), &empty, 0).unwrap().id, "claude");
+        assert_eq!(
+            pool.select(Some("claude-3"), &empty, 0).unwrap().id,
+            "claude"
+        );
         assert_eq!(pool.select(Some("gpt-4"), &empty, 0).unwrap().id, "gpt");
     }
 
     #[test]
     fn unknown_model_reports_no_key_for_model() {
-        let pool = pool_of(vec![key_config("a", &["gpt-4"], None)], Strategy::RoundRobin);
-        let error = pool.select(Some("unknown"), &HashSet::new(), 0).unwrap_err();
+        let pool = pool_of(
+            vec![key_config("a", &["gpt-4"], None)],
+            Strategy::RoundRobin,
+        );
+        let error = pool
+            .select(Some("unknown"), &HashSet::new(), 0)
+            .unwrap_err();
         assert!(matches!(error, SelectError::NoKeyForModel { .. }));
         assert!(error.retry_after().is_none());
     }
@@ -596,7 +638,10 @@ fn debug_pool_select() {
 
     #[test]
     fn status_snapshot_reports_live_state() {
-        let pool = pool_of(vec![key_config("a", &["gpt-4"], Some(5))], Strategy::RoundRobin);
+        let pool = pool_of(
+            vec![key_config("a", &["gpt-4"], Some(5))],
+            Strategy::RoundRobin,
+        );
         let empty = HashSet::new();
         let key = pool.select(Some("gpt-4"), &empty, 0).unwrap();
         // Selecting charges the rate-limit window; `selections` counts
@@ -616,7 +661,10 @@ fn debug_pool_select() {
     #[test]
     fn default_base_urls_cover_known_providers() {
         assert_eq!(default_base_url("Anthropic"), "https://api.anthropic.com");
-        assert_eq!(default_base_url("NVIDIA"), "https://integrate.api.nvidia.com");
+        assert_eq!(
+            default_base_url("NVIDIA"),
+            "https://integrate.api.nvidia.com"
+        );
         assert_eq!(default_base_url("mystery"), "https://api.openai.com");
     }
 

@@ -178,11 +178,7 @@ pub struct AdminRouter {
 }
 
 impl AdminRouter {
-    pub fn new(
-        runtime: SharedRuntime,
-        token: Option<String>,
-        allow_insecure: bool,
-    ) -> Self {
+    pub fn new(runtime: SharedRuntime, token: Option<String>, allow_insecure: bool) -> Self {
         Self {
             runtime,
             token,
@@ -204,10 +200,7 @@ impl AdminRouter {
                         .metrics()
                         .rejected_admin_auth
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Err(AdminResponse::error(
-                        401,
-                        "invalid or missing admin token",
-                    ))
+                    Err(AdminResponse::error(401, "invalid or missing admin token"))
                 }
             }
             None if self.allow_insecure => Ok(()),
@@ -413,7 +406,9 @@ impl AdminRouter {
             return AdminResponse::from(error);
         }
         if runtime.broker().pools().values().any(|pool| {
-            pool.keys().iter().any(|key| key.id == key_id && pool.provider != provider_name)
+            pool.keys()
+                .iter()
+                .any(|key| key.id == key_id && pool.provider != provider_name)
         }) {
             return AdminResponse::error(
                 409,
@@ -528,10 +523,7 @@ impl AdminRouter {
                     .broker()
                     .pool(&provider)
                     .and_then(|pool| pool.status().into_iter().find(|s| s.id == id));
-                AdminResponse::json(
-                    200,
-                    &json!({"status": "updated", "key": status}),
-                )
+                AdminResponse::json(200, &json!({"status": "updated", "key": status}))
             }
             Err(error) => AdminResponse::from(error),
         }
@@ -803,9 +795,15 @@ mod tests {
     fn adding_a_key_updates_the_runtime() {
         let runtime = runtime();
         let router = router(Arc::clone(&runtime), Some("t"));
-        let body = br#"{"provider":"openai","id":"k3","key":"sk-k3","models":["gpt-4"],"max_rpm":7}"#;
+        let body =
+            br#"{"provider":"openai","id":"k3","key":"sk-k3","models":["gpt-4"],"max_rpm":7}"#;
         let response = router.handle(authed("POST", "keys", body, "t"));
-        assert_eq!(response.status, 201, "{}", String::from_utf8_lossy(&response.body));
+        assert_eq!(
+            response.status,
+            201,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
         assert_eq!(runtime.read().broker().pool("openai").unwrap().len(), 3);
     }
 
@@ -891,7 +889,12 @@ mod tests {
         let router = router(Arc::clone(&runtime), Some("t"));
         let body = br#"{"max_rpm":3,"weight":5}"#;
         let response = router.handle(authed("PATCH", "keys/openai/k1", body, "t"));
-        assert_eq!(response.status, 200, "{}", String::from_utf8_lossy(&response.body));
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
         let guard = runtime.read();
         let key = guard.broker().pool("openai").unwrap().key("k1").unwrap();
         assert_eq!(key.max_rpm(), Some(3));
@@ -901,7 +904,12 @@ mod tests {
     #[test]
     fn patching_a_missing_key_returns_404() {
         let router = router(runtime(), Some("t"));
-        let response = router.handle(authed("PATCH", "keys/openai/missing", br#"{"weight":2}"#, "t"));
+        let response = router.handle(authed(
+            "PATCH",
+            "keys/openai/missing",
+            br#"{"weight":2}"#,
+            "t",
+        ));
         assert_eq!(response.status, 404);
     }
 
@@ -909,7 +917,12 @@ mod tests {
     fn strategy_can_be_changed_at_runtime() {
         let runtime = runtime();
         let router = router(Arc::clone(&runtime), Some("t"));
-        let response = router.handle(authed("PUT", "config/strategy", br#"{"strategy":"least_busy"}"#, "t"));
+        let response = router.handle(authed(
+            "PUT",
+            "config/strategy",
+            br#"{"strategy":"least_busy"}"#,
+            "t",
+        ));
         assert_eq!(response.status, 200);
         assert_eq!(runtime.read().strategy().as_str(), "least_busy");
     }
@@ -918,7 +931,12 @@ mod tests {
     fn an_unknown_strategy_is_refused() {
         let runtime = runtime();
         let router = router(Arc::clone(&runtime), Some("t"));
-        let response = router.handle(authed("PUT", "config/strategy", br#"{"strategy":"nope"}"#, "t"));
+        let response = router.handle(authed(
+            "PUT",
+            "config/strategy",
+            br#"{"strategy":"nope"}"#,
+            "t",
+        ));
         assert_eq!(response.status, 400);
         assert_eq!(runtime.read().strategy().as_str(), "round_robin");
     }
