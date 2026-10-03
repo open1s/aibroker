@@ -1,196 +1,611 @@
-use serde::Deserialize;
-use std::path::Path;
+//! Configuration schema, loading, validation and key mutation.
+//!
+//! The schema is a strict superset of the original broker config: existing
+//! `config.toml` files keep working, every new section has a default, and new
+//! keys can be added or toggled at runtime through the admin API and written
+//! back to disk.
 
-use crate::load_balancer::LoadBalancer;
-use crate::load_balancer::key_info::{KeyInfo, Provider, RotationStrategy};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+use crate::error::{LlmBrokerError, Result};
+
+pub const DEFAULT_PROXY_PORT: u16 = 11436;
+pub const DEFAULT_ADMIN_PORT: u16 = 11437;
+
+/// Root configuration document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
+
+    /// Kept for backwards compatibility; the proxy implementation is now always
+    /// the pingora backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_type: Option<String>,
+
+    #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+
+    /// Explicit model -> provider routing. Models without a route fall back to
+    /// "any provider that has a key for the model".
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
+
+    /// Route used when a request carries no recognisable model.
+    #[serde(default)]
+    pub default_route: Option<String>,
+
     #[serde(default)]
     pub load_balancing: LoadBalancingConfig,
+
+    #[serde(default)]
+    pub health: HealthConfig,
+
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Downstream listener settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_host")]
     pub host: String,
+    #[serde(default = "default_proxy_port")]
     pub port: u16,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<usize>,
     #[serde(default)]
     pub daemon: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_file: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Upstream connect timeout in milliseconds (0 = pingora default).
+    #[serde(default)]
+    pub connect_timeout_ms: u64,
+    /// Upstream idle timeout in milliseconds. `None` falls back to
+    /// `load_balancing.idle_timeout_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// A provider endpoint plus its key pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Key appended verbatim to the path (edge cases only; prefer
+    /// `base_url`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    /// `bearer` (default) | `x-api-key` | `api-key` | `query` | custom header name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    /// When the auth style is `query`, the query parameter carrying the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_query_param: Option<String>,
+    /// Provider-wide default models, used when a key does not list any.
+    #[serde(default)]
+    pub default_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tpm: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    #[serde(default)]
     pub api_keys: Vec<ApiKeyConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// A single credential in a provider pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyConfig {
     pub id: String,
+    /// The secret itself. `env:NAME` reads the value from the environment.
     pub key: String,
+    /// Whether this key may serve requests.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default = "default_weight")]
     pub weight: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tpm: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    /// Optional per-key model alias map (`client model` -> `upstream model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_map: Option<std::collections::HashMap<String, String>>,
 }
 
+/// Explicit model routing rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteConfig {
+    /// Model name, glob pattern (`claude-*`), or `*` for catch-all.
+    pub model: String,
+    /// One or more provider names, tried in order.
+    pub providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    /// When true, the model is rewritten to the upstream provider's canonical
+    /// name before the request is forwarded.
+    #[serde(default)]
+    pub rewrite: bool,
+}
+
+/// Provider-wide model pricing used for `/metrics` cost accounting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub model: String,
+    #[serde(default)]
+    pub input_per_million: f64,
+    #[serde(default)]
+    pub output_per_million: f64,
+}
+
+/// Load balancing and failover behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadBalancingConfig {
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
+    #[serde(default = "default_weighted_random_tolerance")]
+    pub weighted_random_tolerance: f64,
+    #[serde(default = "default_initial_cooldown")]
+    pub initial_cooldown_secs: u64,
+    #[serde(default = "default_max_cooldown")]
+    pub max_cooldown_secs: u64,
+    #[serde(default = "default_cooldown_multiplier")]
+    pub cooldown_multiplier: f64,
+    /// Jitter ratio applied to cooldowns to avoid thundering herds (0.0-1.0).
+    #[serde(default = "default_cooldown_jitter")]
+    pub cooldown_jitter: f64,
+    /// Wait this long for the earliest key to leave cooldown before giving up
+    /// when every key is exhausted (0 = fail fast).
+    #[serde(default = "default_max_wait")]
+    pub max_wait_for_key_secs: u64,
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+    /// Strategies queried in order when the primary strategy cannot place the
+    /// request (e.g. every key is at its rate limit).
+    #[serde(default)]
+    pub fallback_strategies: Vec<String>,
+}
+
+/// Health scoring and circuit breaker behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// EWMA weight for latency observations (0.0-1.0, higher = more reactive).
+    #[serde(default = "default_latency_alpha")]
+    pub latency_alpha: f64,
+    /// Latency (ms) considered "slow" when scoring key health.
+    #[serde(default = "default_slow_latency_ms")]
+    pub slow_latency_ms: u64,
+    /// `health_score` below this opens the circuit.
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: f64,
+    /// Consecutive failures that immediately open the circuit.
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Successes in half-open state required to close the circuit again.
+    #[serde(default = "default_recovery_threshold")]
+    pub recovery_threshold: u32,
+}
+
+/// Metrics and logging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    #[serde(default = "default_true")]
+    pub metrics_enabled: bool,
+    /// Path serving Prometheus text format.
+    #[serde(default = "default_metrics_path")]
+    pub metrics_path: String,
+    /// Log one structured line per completed request.
+    #[serde(default)]
+    pub access_log: bool,
+    /// Inspect response bodies for `usage` objects to track TPM and cost.
+    #[serde(default = "default_true")]
+    pub usage_tracking: bool,
+    /// Cap on bytes buffered per response while scanning for usage.
+    #[serde(default = "default_usage_scan_limit")]
+    pub usage_scan_limit_bytes: usize,
+    #[serde(default)]
+    pub model_pricing: Vec<ModelPricing>,
+}
+
+/// Admin API surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_admin_port")]
+    pub port: u16,
+    /// Separate listener or a path prefix on the proxy port.
+    #[serde(default)]
+    pub mode: AdminMode,
+    /// Path prefix used when `mode = "path"`.
+    #[serde(default = "default_admin_path")]
+    pub path: String,
+    /// Bearer token. `env:NAME` reads the value from the environment. When
+    /// empty the admin API is refuse-all unless `allow_insecure` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Explicitly allow an unauthenticated admin API (loopback only).
+    #[serde(default)]
+    pub allow_insecure: bool,
+    /// Write key changes back to the config file.
+    #[serde(default = "default_true")]
+    pub persist: bool,
+}
+
+/// How the admin API is exposed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminMode {
+    /// Own listener on `admin.host:admin.port`.
+    #[default]
+    Separate,
+    /// Served under `admin.path` on the proxy listener.
+    Path,
+    Off,
+}
+
+// ---------------------------------------------------------------------------
+// Defaults
+// ---------------------------------------------------------------------------
+
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_proxy_port() -> u16 {
+    DEFAULT_PROXY_PORT
+}
+fn default_admin_port() -> u16 {
+    DEFAULT_ADMIN_PORT
+}
+fn default_max_retries() -> usize {
+    3
+}
+fn default_true() -> bool {
+    true
+}
 fn default_weight() -> u32 {
     1
 }
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct LoadBalancingConfig {
-    #[serde(default)]
-    pub strategy: String,
-    #[serde(default = "default_cooldown")]
-    pub initial_cooldown_secs: u64,
-    #[serde(default = "default_idle_timeout")]
-    pub idle_timeout_secs: u64,
+fn default_strategy() -> String {
+    "round_robin".to_string()
 }
-
+fn default_weighted_random_tolerance() -> f64 {
+    0.1
+}
+fn default_initial_cooldown() -> u64 {
+    60
+}
+fn default_max_cooldown() -> u64 {
+    1500
+}
+fn default_cooldown_multiplier() -> f64 {
+    5.0
+}
+fn default_cooldown_jitter() -> f64 {
+    0.2
+}
+fn default_max_wait() -> u64 {
+    15
+}
 fn default_idle_timeout() -> u64 {
     120
 }
-
-fn default_cooldown() -> u64 {
-    60
+fn default_latency_alpha() -> f64 {
+    0.2
+}
+fn default_slow_latency_ms() -> u64 {
+    5_000
+}
+fn default_unhealthy_threshold() -> f64 {
+    0.3
+}
+fn default_failure_threshold() -> u32 {
+    3
+}
+fn default_recovery_threshold() -> u32 {
+    2
+}
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+fn default_usage_scan_limit() -> usize {
+    64 * 1024
+}
+fn default_admin_path() -> String {
+    "/admin".to_string()
 }
 
-impl ServerConfig {
-    pub fn to_pingora_conf(&self) -> pingora::server::configuration::ServerConf {
-        use pingora::server::configuration::ServerConf;
-
-        let mut conf = ServerConf::default();
-
-        if let Some(threads) = self.threads {
-            conf.threads = threads;
+impl Default for LoadBalancingConfig {
+    fn default() -> Self {
+        Self {
+            strategy: default_strategy(),
+            weighted_random_tolerance: default_weighted_random_tolerance(),
+            initial_cooldown_secs: default_initial_cooldown(),
+            max_cooldown_secs: default_max_cooldown(),
+            cooldown_multiplier: default_cooldown_multiplier(),
+            cooldown_jitter: default_cooldown_jitter(),
+            max_wait_for_key_secs: default_max_wait(),
+            idle_timeout_secs: default_idle_timeout(),
+            fallback_strategies: Vec::new(),
         }
-
-        if self.daemon {
-            conf.daemon = self.daemon;
-        }
-
-        if let Some(ref pid_file) = self.pid_file
-            && !pid_file.is_empty()
-        {
-            conf.pid_file = pid_file.clone();
-        }
-
-        if let Some(ref user) = self.user
-            && !user.is_empty()
-        {
-            conf.user = Some(user.clone());
-        }
-
-        if let Some(ref group) = self.group
-            && !group.is_empty()
-        {
-            conf.group = Some(group.clone());
-        }
-
-        conf
     }
 }
 
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            latency_alpha: default_latency_alpha(),
+            slow_latency_ms: default_slow_latency_ms(),
+            unhealthy_threshold: default_unhealthy_threshold(),
+            failure_threshold: default_failure_threshold(),
+            recovery_threshold: default_recovery_threshold(),
+        }
+    }
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            metrics_enabled: true,
+            metrics_path: default_metrics_path(),
+            access_log: false,
+            usage_tracking: true,
+            usage_scan_limit_bytes: default_usage_scan_limit(),
+            model_pricing: Vec::new(),
+        }
+    }
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_host(),
+            port: default_admin_port(),
+            mode: AdminMode::default(),
+            path: default_admin_path(),
+            token: None,
+            allow_insecure: false,
+            persist: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Secret resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve `env:NAME` references against the process environment.
+pub fn resolve_secret(value: &str) -> Result<String> {
+    let Some(name) = value.strip_prefix("env:") else {
+        return Ok(value.to_string());
+    };
+    std::env::var(name).map_err(|_| {
+        LlmBrokerError::InvalidConfig(format!(
+            "secret `env:{name}` is set in the config but the environment variable is missing"
+        ))
+    })
+}
+
+impl AdminConfig {
+    /// Effective bearer token, if any.
+    pub fn resolved_token(&self) -> Result<Option<String>> {
+        match self.token.as_deref() {
+            None | Some("") => Ok(None),
+            Some(value) => resolve_secret(value).map(Some),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
 impl Config {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    /// Load and validate a config file.
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            LlmBrokerError::InvalidConfig(format!("cannot read {}: {e}", path.display()))
+        })?;
+        let config: Config = toml::from_str(&content).map_err(|e| {
+            LlmBrokerError::InvalidConfig(format!("cannot parse {}: {e}", path.display()))
+        })?;
+        config.validate()?;
         Ok(config)
     }
 
-    pub fn load_balancer(&self) -> LoadBalancer {
-        let strategy = match self.load_balancing.strategy.to_lowercase().as_str() {
-            "weighted_random" => RotationStrategy::WeightedRandom,
-            "least_used" => RotationStrategy::LeastUsed,
-            "latency_based" => RotationStrategy::LatencyBased,
-            _ => RotationStrategy::RoundRobin,
-        };
+    /// Serialize the current document, used for admin-driven persistence.
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string_pretty(self)
+            .map_err(|e| LlmBrokerError::InvalidConfig(format!("cannot serialize config: {e}")))
+    }
 
-        let mut lb = LoadBalancer::new().with_strategy(strategy);
+    /// Write the current document back to `path` atomically.
+    pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let body = self.to_toml()?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, body).map_err(|e| {
+            LlmBrokerError::InvalidConfig(format!("cannot write {}: {e}", tmp.display()))
+        })?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            LlmBrokerError::InvalidConfig(format!("cannot replace {}: {e}", path.display()))
+        })?;
+        Ok(())
+    }
 
-        for provider_config in &self.providers {
-            let provider = match provider_config.name.to_lowercase().as_str() {
-                "openai" => Provider::OpenAI,
-                "anthropic" => Provider::Anthropic,
-                "azure" => Provider::Azure,
-                "vertex" => Provider::Vertex,
-                "deepseek" => Provider::DeepSeek,
-                "minimax" => Provider::MiniMax,
-                "openrouter" => Provider::OpenRouter,
-                "glm" => Provider::GLM,
-                "nvidia" => Provider::NVIDIA,
-                _ => Provider::Other,
-            };
+    /// Reject documents that would misbehave at runtime.
+    pub fn validate(&self) -> Result<()> {
+        if self.providers.is_empty() {
+            return Err(LlmBrokerError::InvalidConfig(
+                "at least one [[providers]] entry is required".to_string(),
+            ));
+        }
 
-            let pool = lb.get_or_create_pool(provider.clone());
+        let mut provider_names = HashSet::new();
+        for provider in &self.providers {
+            if !provider_names.insert(provider.name.clone()) {
+                return Err(LlmBrokerError::InvalidConfig(format!(
+                    "duplicate provider name `{}`",
+                    provider.name
+                )));
+            }
 
-            for key_config in &provider_config.api_keys {
-                let mut key = KeyInfo::new(
-                    key_config.id.clone(),
-                    key_config.key.clone(),
-                    provider.clone(),
-                )
-                .with_weight(key_config.weight)
-                .with_base_url(provider_config.base_url.clone())
-                .with_max_rpm(key_config.max_rpm);
-
-                if !key_config.models.is_empty() {
-                    key = key.with_models(key_config.models.clone());
+            let mut key_ids = HashSet::new();
+            for key in &provider.api_keys {
+                if !key_ids.insert(key.id.clone()) {
+                    return Err(LlmBrokerError::InvalidConfig(format!(
+                        "duplicate key id `{}` in provider `{}`",
+                        key.id, provider.name
+                    )));
                 }
-
-                pool.add_key(key);
+                if key.key.trim().is_empty() {
+                    return Err(LlmBrokerError::InvalidConfig(format!(
+                        "key `{}` in provider `{}` has an empty secret",
+                        key.id, provider.name
+                    )));
+                }
+                resolve_secret(&key.key)?;
             }
         }
 
-        lb
+        for route in &self.routes {
+            if route.providers.is_empty() {
+                return Err(LlmBrokerError::InvalidConfig(format!(
+                    "route `{}` lists no providers",
+                    route.model
+                )));
+            }
+            for name in &route.providers {
+                if !provider_names.contains(name) {
+                    return Err(LlmBrokerError::InvalidConfig(format!(
+                        "route `{}` references unknown provider `{}`",
+                        route.model, name
+                    )));
+                }
+            }
+        }
+
+        if let Some(default_route) = &self.default_route
+            && !provider_names.contains(default_route)
+        {
+            return Err(LlmBrokerError::InvalidConfig(format!(
+                "default_route references unknown provider `{default_route}`"
+            )));
+        }
+
+        for strategy in std::iter::once(&self.load_balancing.strategy)
+            .chain(self.load_balancing.fallback_strategies.iter())
+        {
+            crate::core::strategy::Strategy::parse(strategy).ok_or_else(|| {
+                LlmBrokerError::InvalidConfig(format!("unknown load balancing strategy `{strategy}`"))
+            })?;
+        }
+
+        if self.load_balancing.cooldown_multiplier < 1.0 {
+            return Err(LlmBrokerError::InvalidConfig(
+                "load_balancing.cooldown_multiplier must be >= 1.0".to_string(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.load_balancing.cooldown_jitter) {
+            return Err(LlmBrokerError::InvalidConfig(
+                "load_balancing.cooldown_jitter must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+
+        if self.admin.enabled && self.admin.mode != AdminMode::Off {
+            let has_token = self.admin.resolved_token()?.is_some();
+            if !has_token && !self.admin.allow_insecure {
+                return Err(LlmBrokerError::InvalidConfig(
+                    "admin.enabled requires admin.token (or admin.allow_insecure = true)".to_string(),
+                ));
+            }
+        }
+
+        if self.observability.metrics_enabled && !self.observability.metrics_path.starts_with('/') {
+            return Err(LlmBrokerError::InvalidConfig(
+                "observability.metrics_path must start with `/`".to_string(),
+            ));
+        }
+
+        Ok(())
     }
+
+    /// All models known to the config, used by `/admin/models`.
+    pub fn known_models(&self) -> Vec<String> {
+        let mut models = Vec::new();
+        for provider in &self.providers {
+            for model in &provider.default_models {
+                if !models.contains(model) {
+                    models.push(model.clone());
+                }
+            }
+            for key in &provider.api_keys {
+                for model in &key.models {
+                    if !models.contains(model) {
+                        models.push(model.clone());
+                    }
+                }
+            }
+        }
+        models
+    }
+
+    /// Resolve the provider entry by name.
+    pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|p| p.name == name)
+    }
+
+    /// Resolve the provider entry by name, mutably.
+    pub fn provider_mut(&mut self, name: &str) -> Option<&mut ProviderConfig> {
+        self.providers.iter_mut().find(|p| p.name == name)
+    }
+
+    /// Effective idle timeout for upstream connections.
+    pub fn idle_timeout(&self) -> std::time::Duration {
+        let ms = self
+            .server
+            .idle_timeout_ms
+            .unwrap_or(self.load_balancing.idle_timeout_secs.saturating_mul(1000));
+        std::time::Duration::from_millis(ms)
+    }
+
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Config plus the path it came from, so the admin API can persist changes.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub path: PathBuf,
+}
 
-    #[test]
-    fn test_parse_config() {
-        let config_str = r#"
-[server]
-host = "0.0.0.0"
-port = 8080
-
-[[providers]]
-name = "openai"
-
-[[providers.api_keys]]
-id = "key1"
-key = "sk-test123"
-models = ["gpt-4", "gpt-3.5-turbo"]
-weight = 2
-
-[load_balancing]
-strategy = "round_robin"
-initial_cooldown_secs = 60
-"#;
-
-        let config: Config = toml::from_str(config_str).unwrap();
-        assert_eq!(config.server.port, 8080);
-        assert_eq!(config.providers.len(), 1);
-        assert_eq!(config.providers[0].api_keys.len(), 1);
+impl LoadedConfig {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let config = Config::from_file(&path)?;
+        Ok(Self { config, path })
     }
 }

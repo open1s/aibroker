@@ -1,81 +1,98 @@
+//! Entry point for the LLM broker.
+
+use std::path::PathBuf;
+
 use aibroker::config::Config;
-use aibroker::proxy::pingora_backend::run_pingora_server;
-use aibroker::proxy::reqwest_backend::run_reqwest_server;
+use aibroker::core::runtime::{Runtime, shared};
+use aibroker::proxy::pingora_backend::run_server;
 use clap::Parser;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(name = "aibroker")]
-#[command(version = "1.0.0")]
+#[command(about = "Local LLM proxy with load balancing and key management")]
+#[command(version)]
 struct Args {
-    #[arg(long, help = "Dump request to stdout")]
-    dump_request: bool,
-
-    #[arg(long, help = "Dump response to stdout")]
-    dump_response: bool,
-
-    #[arg(long, default_value = "config.toml", help = "Path to config file")]
+    /// Path to the configuration file.
+    #[arg(long, default_value = "config.toml")]
     config: String,
 
-    #[arg(long, help = "Proxy type: pingora or reqwest")]
-    proxy: Option<String>,
+    /// Validate the configuration and exit.
+    #[arg(long)]
+    check: bool,
+
+    /// Print the effective configuration (including secrets) and exit.
+    #[arg(long)]
+    dump_config: bool,
 }
 
 fn main() {
     let args = Args::parse();
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    if args.dump_request {
-        eprintln!("[DUMP] Request logging enabled");
-    }
-    if args.dump_response {
-        eprintln!("[DUMP] Response logging enabled");
-    }
-
-    let config_path = if std::path::Path::new(&args.config).exists() {
-        args.config.clone()
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".config")
-            .join("aibroker")
-            .join("config.toml")
-            .to_string_lossy()
-            .to_string()
-    } else {
-        args.config.clone()
-    };
-
-    let config = match Config::from_file(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to load config from '{}': {}", config_path, e);
+    let path = resolve_config_path(&args.config);
+    let config = match Config::from_file(&path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("failed to load config from `{}`: {error}", path.display());
             std::process::exit(1);
         }
     };
 
-    let proxy_type = args
-        .proxy
-        .unwrap_or(config.proxy_type.clone().unwrap_or("pingora".to_string()));
+    if args.check {
+        println!("configuration `{}` is valid", path.display());
+        println!("providers: {}", config.providers.len());
+        for provider in &config.providers {
+            println!(
+                "  - {} ({} keys, endpoint {})",
+                provider.name,
+                provider.api_keys.len(),
+                provider.base_url.as_deref().unwrap_or("<default>")
+            );
+        }
+        return;
+    }
 
-    if proxy_type == "pingora" {
-        tracing::info!("Starting Pingora-based proxy server");
-        let config_clone = config.clone();
-        std::thread::spawn(move || {
-            run_pingora_server(config_clone, args.dump_request, args.dump_response);
-        });
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            tokio::signal::ctrl_c().await.ok();
-        });
-    } else {
-        tracing::info!("Starting Reqwest-based proxy server");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        if let Err(e) = rt.block_on(run_reqwest_server(config)) {
-            eprintln!("Reqwest server error: {}", e);
+    if args.dump_config {
+        match config.to_toml() {
+            Ok(toml) => println!("{toml}"),
+            Err(error) => {
+                eprintln!("failed to serialize config: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let runtime = match Runtime::new(config.clone(), Some(path.clone())) {
+        Ok(runtime) => shared(runtime),
+        Err(error) => {
+            eprintln!("failed to build the broker runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = run_server(config, runtime) {
+        eprintln!("server error: {error}");
+        std::process::exit(1);
+    }
+}
+
+/// Use the given path, falling back to the user config directory.
+fn resolve_config_path(requested: &str) -> PathBuf {
+    let candidate = PathBuf::from(requested);
+    if candidate.exists() {
+        return candidate;
+    }
+    if let Some(home) = dirs::home_dir() {
+        let fallback = home.join(".config").join("aibroker").join("config.toml");
+        if fallback.exists() {
+            return fallback;
         }
     }
+    candidate
 }

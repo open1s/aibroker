@@ -1,4 +1,9 @@
-pub mod pingora_backend;
-pub mod reqwest_backend;
+//! HTTP surface: body inspection helpers, the admin API and the pingora proxy.
 
-pub use reqwest_backend::create_reqwest_router;
+pub mod admin;
+pub mod body;
+pub mod control;
+pub mod ctx;
+pub mod pingora_backend;
+
+pub use pingora_backend::{ProxyService, ProxySettings, build_server_conf, run_server};

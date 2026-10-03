@@ -1,351 +1,552 @@
+//! Pingora-based proxy: routing, failover, admin API and metrics.
+//!
+//! The forwarding path is deliberately thin — every scheduling decision lives
+//! in [`crate::core`]. What this module adds is the retry loop: when an
+//! upstream answers 429/5xx (or the connection breaks) the request is
+//! re-dispatched onto a *different* key, excluding every key already tried.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
+use bytes::Bytes;
 use pingora::http::{RequestHeader, ResponseHeader};
-use pingora::proxy::ProxyHttp;
+use pingora::proxy::{ProxyHttp, Session};
 use pingora::server::Server;
+use http::Uri as HttpUri;
 use pingora::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::ErrorType;
-use pingora_proxy::http_proxy_service;
-use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::RwLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::lookup_host;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::config::Config;
-use crate::load_balancer::LoadBalancer;
-use crate::load_balancer::key_info::Provider;
+use crate::config::{AdminMode, Config};
+use crate::core::key_state::{Outcome, TokenUsage};
+use crate::core::metrics::estimate_cost_micros;
+use crate::core::runtime::{Runtime, SharedRuntime, shared};
+use crate::core::strategy::parse_retry_after;
+use crate::proxy::admin::{AdminCredentials, AdminRequest, AdminResponse, AdminRouter};
+use crate::proxy::body::{
+    DEFAULT_REQUEST_SCAN_LIMIT, estimate_request_tokens, extract_model, model_from_path,
+};
+use crate::proxy::ctx::RequestContext;
 
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u32, d as u32)
+/// Resolved settings the proxy consults on every request.
+#[derive(Debug, Clone)]
+pub struct ProxySettings {
+    pub idle_timeout: Duration,
+    pub connect_timeout: Option<Duration>,
+    pub metrics_path: String,
+    pub metrics_enabled: bool,
+    pub access_log: bool,
+    pub usage_tracking: bool,
+    pub usage_scan_limit: usize,
+    pub admin_path: String,
+    pub admin_enabled: bool,
+    pub admin_mode: AdminMode,
+    pub max_wait_for_key: Duration,
+    pub max_retries: usize,
+    pub request_scan_limit: usize,
 }
 
-fn timestamp() -> String {
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let total_secs = d.as_secs() as i64;
-    let days = total_secs / 86400;
-    let t = total_secs % 86400;
-    let (y, mo, day) = civil_from_days(days);
-    let h = t / 3600;
-    let m = t % 3600 / 60;
-    let s = t % 60;
-    format!(
-        "{y:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}.{:03}",
-        d.subsec_millis()
-    )
-}
-
-/// DNS cache entry with TTL
-struct DnsCacheEntry {
-    ip: String,
-    expires_at: Instant,
-}
-
-const DNS_CACHE_TTL_SECS: u64 = 30;
-
-pub struct PingoraProxy {
-    load_balancer: Arc<LoadBalancer>,
-    initial_cooldown_secs: u64,
-    idle_timeout: Option<Duration>,
-    dns_cache: Arc<RwLock<HashMap<String, DnsCacheEntry>>>,
-    dump_request: bool,
-    dump_response: bool,
-}
-
-impl PingoraProxy {
-    pub fn new(
-        load_balancer: LoadBalancer,
-        initial_cooldown_secs: u64,
-        idle_timeout: Option<Duration>,
-        dump_request: bool,
-        dump_response: bool,
-    ) -> Self {
+impl ProxySettings {
+    pub fn from_config(config: &Config) -> Self {
         Self {
-            load_balancer: Arc::new(load_balancer),
-            initial_cooldown_secs,
-            idle_timeout,
-            dns_cache: Arc::new(RwLock::new(HashMap::new())),
-            dump_request,
-            dump_response,
+            idle_timeout: config.idle_timeout(),
+            connect_timeout: (config.server.connect_timeout_ms > 0)
+                .then(|| Duration::from_millis(config.server.connect_timeout_ms)),
+            metrics_path: config.observability.metrics_path.clone(),
+            metrics_enabled: config.observability.metrics_enabled,
+            access_log: config.observability.access_log,
+            usage_tracking: config.observability.usage_tracking,
+            usage_scan_limit: config.observability.usage_scan_limit_bytes,
+            admin_path: config.admin.path.trim_end_matches('/').to_string(),
+            admin_enabled: config.admin.enabled && config.admin.mode != AdminMode::Off,
+            admin_mode: config.admin.mode,
+            max_wait_for_key: Duration::from_secs(config.load_balancing.max_wait_for_key_secs),
+            max_retries: config.server.max_retries.max(1),
+            request_scan_limit: DEFAULT_REQUEST_SCAN_LIMIT,
         }
-    }
-
-    fn select_any_key(&self) -> Option<(Arc<crate::load_balancer::key_info::KeyInfo>, Provider)> {
-        for (provider, pool) in self.load_balancer.pools() {
-            if let Ok(key) = pool.select_key(None) {
-                return Some((key, provider.clone()));
-            }
-        }
-        None
     }
 }
 
-#[derive(Default)]
-pub struct PingoraProxyCtx {
-    pub key_id: Option<String>,
-    pub api_key: Option<String>,
-    pub provider: Option<Provider>,
-    pub upstream_host: Option<String>,
+/// Shared proxy state.
+pub struct ProxyService {
+    runtime: SharedRuntime,
+    settings: ProxySettings,
+    admin: Option<AdminRouter>,
+    /// Serialises control-plane requests so concurrent writers cannot interleave.
+    admin_lock: tokio::sync::Mutex<()>,
+}
+
+impl ProxyService {
+    pub fn new(runtime: SharedRuntime, admin: Option<AdminRouter>) -> Self {
+        let settings = ProxySettings::from_config(runtime.read().config());
+        Self {
+            runtime,
+            settings,
+            admin,
+            admin_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn settings(&self) -> &ProxySettings {
+        &self.settings
+    }
+
+    pub fn runtime(&self) -> &SharedRuntime {
+        &self.runtime
+    }
+
+    /// Whether a path is handled by the control plane on this listener.
+    pub fn is_admin_path(&self, path: &str) -> bool {
+        self.settings.admin_enabled
+            && self.settings.admin_mode == AdminMode::Path
+            && (path == self.settings.admin_path
+                || path.starts_with(&format!("{}/", self.settings.admin_path)))
+    }
+
+    pub fn is_metrics_path(&self, path: &str) -> bool {
+        self.settings.metrics_enabled && path == self.settings.metrics_path
+    }
+
+    /// Translate a proxied path into a control-plane route path.
+    fn admin_route(&self, path: &str) -> String {
+        let trimmed = path.strip_prefix(&self.settings.admin_path).unwrap_or(path);
+        trimmed.trim_start_matches('/').to_string()
+    }
+
+    /// The secret of the key currently selected for a request.
+    fn secret_of(&self, provider: &str, key_id: &str) -> Option<String> {
+        let runtime = self.runtime.read();
+        runtime
+            .broker()
+            .pool(provider)
+            .and_then(|pool| pool.key(key_id))
+            .map(|key| key.secret.clone())
+    }
+
+    async fn handle_admin(&self, session: &mut Session, path: &str) -> pingora::Result<()> {
+        let _serialised = self.admin_lock.lock().await;
+
+        let body = match session.downstream_session.read_request_body().await {
+            Ok(body) => body.map(|b| b.to_vec()).unwrap_or_default(),
+            Err(error) => {
+                warn!("failed to read admin request body: {error}");
+                Vec::new()
+            }
+        };
+
+        let credentials = {
+            let headers = &session.req_header().headers;
+            let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+            let admin_token = headers.get("x-admin-token").and_then(|v| v.to_str().ok());
+            AdminCredentials::from_headers(authorization, admin_token)
+        };
+
+        let request = AdminRequest {
+            method: session.req_header().method.as_str().to_string(),
+            path: self.admin_route(path),
+            query: session.req_header().uri.query().map(|q| q.to_string()),
+            body,
+            credentials,
+        };
+
+        let response = match &self.admin {
+            Some(router) => router.handle(request),
+            None => AdminResponse::error(404, "admin API is not enabled"),
+        };
+        write_response(session, response).await
+    }
+
+    async fn handle_metrics(&self, session: &mut Session) -> pingora::Result<()> {
+        let body = self.runtime.read().metrics().render_prometheus();
+        write_response(
+            session,
+            AdminResponse::text(200, "text/plain; version=0.0.4; charset=utf-8", body),
+        )
+        .await
+    }
+
+    /// Wait for capacity when every key is rate limited but one frees up soon.
+    async fn wait_for_key(&self, wait: Duration) -> bool {
+        let cap = self.settings.max_wait_for_key;
+        if cap.is_zero() || wait.is_zero() || wait > cap {
+            return false;
+        }
+        debug!("all keys busy, waiting {wait:?} for capacity");
+        tokio::time::sleep(wait).await;
+        true
+    }
+
+    /// Resolve the model from the request body, then from the path.
+    fn resolve_model(&self, body: &[u8], path: &str) -> Option<String> {
+        extract_model(body).or_else(|| model_from_path(path))
+    }
+
+    fn select(
+        &self,
+        ctx: &RequestContext,
+        model: Option<&str>,
+    ) -> Result<crate::core::broker::SelectedKey, crate::core::broker::RouteError> {
+        let runtime = self.runtime.read();
+        runtime
+            .broker()
+            .select(model, &ctx.excluded, ctx.estimated_tokens)
+    }
+
+    /// Record the outcome of an attempt exactly once.
+    fn settle(&self, ctx: &mut RequestContext, outcome: Outcome) {
+        if ctx.settled {
+            return;
+        }
+        ctx.settled = true;
+
+        let Some(guard) = ctx.guard.take() else {
+            return;
+        };
+
+        let (policy, tuning, registry, pricing, model, provider, key_id) = {
+            let runtime = self.runtime.read();
+            (
+                runtime.cooldown_policy(),
+                runtime.health_tuning(),
+                Arc::clone(runtime.metrics()),
+                runtime.config().observability.model_pricing.clone(),
+                ctx.model.clone(),
+                ctx.provider.clone().unwrap_or_default(),
+                ctx.key.as_ref().map(|k| k.id.clone()).unwrap_or_default(),
+            )
+        };
+
+        let attempt_latency = ctx.attempt_started_at.elapsed();
+        // Prefer real usage; fall back to the reservation so an unparsed
+        // response still charges the token window.
+        let usage = if ctx.usage.saw_usage() {
+            ctx.token_usage()
+        } else {
+            TokenUsage::default()
+        };
+        let total_latency = ctx.started_at.elapsed();
+        let status = ctx.upstream_status.unwrap_or(0);
+
+        guard.complete(outcome, attempt_latency, usage, &policy, &tuning);
+
+        let cost = estimate_cost_micros(
+            &pricing,
+            model.as_deref().unwrap_or_default(),
+            usage.input,
+            usage.output,
+        );
+        registry.record_request(
+            &provider,
+            &key_id,
+            model.as_deref(),
+            status,
+            total_latency,
+            usage.input,
+            usage.output,
+            cost,
+        );
+
+        if self.settings.access_log {
+            info!(
+                provider = %provider,
+                key = %key_id,
+                model = model.as_deref().unwrap_or("-"),
+                status,
+                attempts = ctx.attempts,
+                latency_ms = total_latency.as_millis() as u64,
+                tokens_in = usage.input,
+                tokens_out = usage.output,
+                "request completed"
+            );
+        }
+    }
+
+    /// Whether a status code should trigger a retry on another key.
+    fn is_retryable_status(status: u16) -> bool {
+        status == 429 || status == 408 || status == 409 || status >= 500
+    }
+
+    /// Parse `Retry-After` from an upstream response.
+    fn retry_after(resp: &ResponseHeader) -> Option<Duration> {
+        resp.headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after)
+    }
+}
+
+/// Write a control-plane response through a pingora session.
+async fn write_response(session: &mut Session, response: AdminResponse) -> pingora::Result<()> {
+    let mut header = ResponseHeader::build(response.status, None)?;
+    header.insert_header("Content-Type", response.content_type)?;
+    header.insert_header("Content-Length", response.body.len().to_string())?;
+    header.insert_header("Cache-Control", "no-store")?;
+    session.set_keepalive(None);
+    session
+        .write_response_header(Box::new(header), response.body.is_empty())
+        .await?;
+    if !response.body.is_empty() {
+        session
+            .write_response_body(Some(Bytes::from(response.body)), true)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Growable buffer of the request body, bounded by the scan limit.
+#[derive(Debug, Default)]
+pub struct BodyBuffer {
+    bytes: Vec<u8>,
+    /// Set once the body exceeded the limit; the model is then unknown.
+    overflowed: bool,
+}
+
+impl BodyBuffer {
+    fn push(&mut self, chunk: &[u8], limit: usize) {
+        if self.overflowed {
+            return;
+        }
+        if self.bytes.len() + chunk.len() > limit {
+            self.overflowed = true;
+            self.bytes.clear();
+            return;
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn is_complete(&self) -> bool {
+        !self.overflowed
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
 }
 
 #[async_trait]
-impl ProxyHttp for PingoraProxy {
-    type CTX = PingoraProxyCtx;
+impl ProxyHttp for ProxyService {
+    type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {
-        PingoraProxyCtx::default()
+        let mut ctx = RequestContext::default();
+        ctx.configure_usage_scan(self.settings.usage_tracking, self.settings.usage_scan_limit);
+        ctx
     }
 
     async fn request_filter(
         &self,
-        session: &mut pingora_proxy::Session,
-        _ctx: &mut Self::CTX,
-    ) -> pingora::Result<bool> {
-        let all_keys_rate_limited = self
-            .load_balancer
-            .pools()
-            .values()
-            .all(|pool| pool.all_keys_rate_limited());
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let path = session.req_header().uri.path().to_string();
 
-        if all_keys_rate_limited {
-            let (key_id, max_rpm) = self
-                .load_balancer
-                .pools()
-                .values()
-                .find(|pool| !pool.keys().is_empty())
-                .and_then(|pool| {
-                    pool.keys()
-                        .first()
-                        .map(|k| (k.id.clone(), k.max_rpm.unwrap_or(0)))
-                })
-                .unwrap_or_else(|| ("unknown".to_string(), 0));
-
-            let mut header = ResponseHeader::build(429, None).unwrap();
-            header
-                .insert_header("X-RateLimit-Limit", max_rpm.to_string())
-                .ok();
-            header.insert_header("X-RateLimit-Remaining", "0").ok();
-            header.insert_header("Retry-After", "60").ok();
-            header.insert_header("X-RateLimit-Key", &key_id).ok();
-            session.set_keepalive(None);
-            session
-                .write_response_header(Box::new(header), true)
-                .await?;
-            warn!(
-                "All API keys rate-limited (key: {}, limit: {} rpm)",
-                key_id, max_rpm
-            );
+        // The control plane and metrics are served in-process.
+        if self.is_admin_path(&path) {
+            self.handle_admin(session, &path).await?;
+            return Ok(true);
+        }
+        if self.is_metrics_path(&path) {
+            self.handle_metrics(session).await?;
             return Ok(true);
         }
 
-        if self.dump_request {
-            let req = session.req_header();
-            let headers_str = req
-                .headers
-                .iter()
-                .map(|(k, v)| format!("  {}: {}", k, v.to_str().unwrap_or("<binary>")))
-                .collect::<Vec<_>>()
-                .join("\n");
-            println!(
-                "[{}] [REQUEST] {} {}\n{}",
-                timestamp(),
-                req.method,
-                req.uri,
-                headers_str
-            );
-        }
+        self.runtime
+            .read()
+            .metrics()
+            .requests_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ctx.started_at = Instant::now();
+        ctx.attempt_started_at = ctx.started_at;
         Ok(false)
-    }
-
-    async fn upstream_peer(
-        &self,
-        _session: &mut pingora_proxy::Session,
-        ctx: &mut Self::CTX,
-    ) -> pingora::Result<Box<HttpPeer>> {
-        let (key, provider) = self
-            .select_any_key()
-            .ok_or_else(|| pingora::Error::new_up(ErrorType::new("NoKeyAvailable")))?;
-
-        let base_url = key.base_url.as_deref().unwrap_or("https://api.openai.com");
-        let parsed = match Url::parse(base_url) {
-            Ok(url) => url,
-            Err(e) => {
-                warn!(
-                    "Failed to parse base_url '{}' for key {}: {}. Falling back to default.",
-                    base_url, key.id, e
-                );
-                Url::parse("https://api.openai.com").expect("default URL is always valid")
-            }
-        };
-
-        let host = parsed.host_str().unwrap_or("api.openai.com").to_string();
-        let port = parsed.port().unwrap_or(443);
-        let tls = parsed.scheme() == "https";
-
-        ctx.key_id = Some(key.id.clone());
-        ctx.api_key = Some(key.key.clone());
-        ctx.provider = Some(provider);
-        ctx.upstream_host = Some(host.clone());
-
-        let address = format!("{}:{}", host, port);
-        let ip_addr = {
-            let cache_key = address.clone();
-            let now = Instant::now();
-
-            if let Ok(cache) = self.dns_cache.read() {
-                if let Some(entry) = cache.get(&cache_key) {
-                    if entry.expires_at > now {
-                        let ip = entry.ip.clone();
-                        drop(cache);
-                        if let Ok(mut write_cache) = self.dns_cache.write() {
-                            write_cache.insert(
-                                cache_key,
-                                DnsCacheEntry {
-                                    ip: ip.clone(),
-                                    expires_at: now + Duration::from_secs(DNS_CACHE_TTL_SECS),
-                                },
-                            );
-                        }
-                        ip
-                    } else {
-                        drop(cache);
-                        String::new()
-                    }
-                } else {
-                    drop(cache);
-                    String::new()
-                }
-            } else {
-                String::new()
-            }
-        };
-
-        let ip_addr = if ip_addr.is_empty() {
-            match lookup_host(&address).await {
-                Ok(mut addrs) => {
-                    if let Some(addr) = addrs.next() {
-                        let ip = addr.ip().to_string();
-                        if let Ok(mut cache) = self.dns_cache.write() {
-                            cache.insert(
-                                address.clone(),
-                                DnsCacheEntry {
-                                    ip: ip.clone(),
-                                    expires_at: Instant::now()
-                                        + Duration::from_secs(DNS_CACHE_TTL_SECS),
-                                },
-                            );
-                        }
-                        ip
-                    } else {
-                        warn!("DNS lookup returned no addresses for {}", address);
-                        host.clone()
-                    }
-                }
-                Err(e) => {
-                    warn!("DNS lookup failed for {}: {}", address, e);
-                    host.clone()
-                }
-            }
-        } else {
-            ip_addr
-        };
-
-        let mut peer = HttpPeer::new(format!("{}:{}", ip_addr, port), tls, host.clone());
-        if let Some(timeout) = self.idle_timeout
-            && let Some(opts) = peer.get_mut_peer_options()
-        {
-            opts.idle_timeout = Some(timeout);
-        }
-
-        info!("proxying to {}:{} (sni: {})", ip_addr, port, host);
-
-        Ok(Box::new(peer))
     }
 
     async fn request_body_filter(
         &self,
-        _session: &mut pingora_proxy::Session,
-        body: &mut Option<bytes::Bytes>,
-        _end_of_stream: bool,
-        _ctx: &mut Self::CTX,
-    ) -> pingora::Result<()> {
-        if self.dump_request
-            && let Some(bytes) = body.as_deref()
-            && !bytes.is_empty()
-        {
-            const MAX_LOG_LEN: usize = 151200;
-
-            if let Ok(body_str) = std::str::from_utf8(bytes) {
-                let json_str = body_str.strip_prefix("data: ").unwrap_or(body_str);
-                let pretty = match serde_json::from_str::<Value>(json_str) {
-                    Ok(v) => match serde_json::to_string_pretty(&v) {
-                        Ok(s) => s,
-                        Err(_) => body_str.to_string(),
-                    },
-                    Err(_) => body_str.to_string(),
-                };
-
-                let output = if pretty.len() > MAX_LOG_LEN {
-                    format!(
-                        "{}\n... (truncated, {} bytes total)",
-                        pretty.chars().take(MAX_LOG_LEN).collect::<String>(),
-                        pretty.len()
-                    )
-                } else {
-                    pretty
-                };
-
-                println!("[{}] [REQUEST BODY]\n---\n{}\n---", timestamp(), output);
-            } else {
-                println!(
-                    "[{}] [REQUEST BODY] <binary {} bytes>",
-                    timestamp(),
-                    bytes.len()
-                );
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(chunk) = body.as_deref() {
+            ctx.body.push(chunk, self.settings.request_scan_limit);
+            if ctx.model.is_none() && !ctx.body.is_empty() {
+                let path = session.req_header().uri.path().to_string();
+                ctx.model = self.resolve_model(ctx.body.bytes(), &path);
+                ctx.estimated_tokens = estimate_request_tokens(ctx.body.bytes());
             }
+        }
+
+        if end_of_stream && ctx.model.is_none() {
+            // No body (GET/HEAD): the path may still name the model.
+            let path = session.req_header().uri.path().to_string();
+            ctx.model = self.resolve_model(&[], &path);
+            ctx.estimated_tokens = 0;
         }
         Ok(())
     }
 
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<Box<HttpPeer>> {
+        // Handle a retry: whatever the previous attempt was, drop its guard
+        // (already settled) so the key is not double-counted.
+        ctx.guard = None;
+
+        let mut selection = self.select(ctx, ctx.model.as_deref());
+        if let Err(error) = &selection
+            && let Some(wait) = error.retry_after()
+            && ctx.attempts == 0
+            && self.wait_for_key(wait).await
+        {
+            selection = self.select(ctx, ctx.model.as_deref());
+        }
+
+        let selected = match selection {
+            Ok(selected) => selected,
+            Err(error) => {
+                let registry = Arc::clone(self.runtime.read().metrics());
+                if error.retry_after().is_some() {
+                    registry
+                        .keys_exhausted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    registry
+                        .rejected_no_key
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                let status = if error.retry_after().is_some() { 429 } else { 503 };
+                let mut header = ResponseHeader::build(status, None)?;
+                if let Some(wait) = error.retry_after() {
+                    header.insert_header("Retry-After", wait.as_secs().max(1).to_string())?;
+                }
+                header.insert_header("X-LLM-Broker-Error", error.to_string())?;
+                if let Some(model) = ctx.model.as_deref() {
+                    header.insert_header("X-LLM-Broker-Model", model)?;
+                }
+                session.set_keepalive(None);
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                warn!(
+                    model = ctx.model.as_deref().unwrap_or("-"),
+                    "request refused: {error}"
+                );
+                // The refusal response is already written; mark the request
+                // settled so logging does not double count it against a key.
+                ctx.settled = true;
+                return Err(pingora::Error::new_down(ErrorType::HTTPStatus(status)));
+            }
+        };
+
+        ctx.excluded.insert(selected.key.id.clone());
+        ctx.provider = Some(selected.provider.clone());
+        ctx.upstream_model = selected.upstream_model.clone();
+        ctx.key = Some(Arc::clone(&selected.key));
+        ctx.guard = Some(selected.key.reserve());
+        ctx.attempts += 1;
+        ctx.attempt_started_at = Instant::now();
+        ctx.settled = false;
+
+        if ctx.attempts > 1 {
+            let runtime = self.runtime.read();
+            let metrics = runtime.metrics();
+            metrics
+                .key_rotations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .key(&selected.provider, &selected.key.id)
+                .retries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let peer = build_peer(
+            &selected.base_url,
+            self.settings.idle_timeout,
+            self.settings.connect_timeout,
+        )
+        .await?;
+
+        debug!(
+            provider = %selected.provider,
+            key = %selected.key.id,
+            attempt = ctx.attempts,
+            "dispatching to upstream"
+        );
+        Ok(Box::new(peer))
+    }
+
     async fn upstream_request_filter(
         &self,
-        _session: &mut pingora_proxy::Session,
+        session: &mut Session,
         req: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
-        if let Some(ref host) = ctx.upstream_host {
-            req.insert_header("Host", host.as_str()).ok();
+        let Some(provider) = ctx.provider.clone() else {
+            return Ok(());
+        };
+        let Some(key_id) = ctx.key_id().map(|s| s.to_string()) else {
+            return Ok(());
+        };
+
+        let (auth, host, path_prefix) = {
+            let runtime = self.runtime.read();
+            match runtime.broker().pool(&provider) {
+                Some(pool) => (
+                    pool.auth.clone(),
+                    host_of(&pool.base_url),
+                    pool.path_prefix.clone(),
+                ),
+                None => return Ok(()),
+            }
+        };
+
+        // Reach the right virtual host and identify the broker.
+        req.insert_header("Host", host.as_str())?;
+        req.insert_header("User-Agent", "llm-broker/2.0")?;
+        req.remove_header("X-Forwarded-For");
+        req.remove_header("X-Forwarded-Host");
+
+        // NOTE: the requested model is forwarded unchanged. Pingora writes the
+        // upstream request header before the body streams, so a body rewrite
+        // here would desynchronise `Content-Length`; routing on the requested
+        // model (and letting the provider alias it) is the correct behaviour.
+        if let (Some(requested), Some(upstream)) = (
+            ctx.model.as_deref(),
+            ctx.upstream_model.as_deref(),
+        ) && requested != upstream
+        {
+            debug!("provider {provider} maps model `{requested}` to `{upstream}`");
         }
 
-        req.insert_header("User-Agent", "llm-broker/1.0").ok();
+        // Apply the credential and rebuild path/query.
+        if let Some(secret) = self.secret_of(&provider, &key_id) {
+            auth.apply(req, &secret);
 
-        if let (Some(api_key), Some(provider)) = (&ctx.api_key, &ctx.provider) {
-            match provider {
-                Provider::Anthropic => {
-                    req.insert_header("x-api-key", api_key.as_bytes()).ok();
-                }
-                Provider::Azure => {
-                    req.insert_header("api-key", api_key.as_bytes()).ok();
-                }
-                _ => {
-                    req.insert_header("Authorization", format!("Bearer {}", api_key).as_bytes())
-                        .ok();
-                }
-            }
+            let original = session.req_header().uri.clone();
+            let (path, query) = split_uri(&original);
+            let new_path = if path_prefix.is_empty() {
+                path
+            } else {
+                format!("{}{}", path_prefix.trim_end_matches('/'), path)
+            };
+            let new_query = auth.decorate_query(query.as_deref(), &secret);
+            apply_uri(req, &new_path, new_query.as_deref())?;
         }
 
         Ok(())
@@ -353,82 +554,78 @@ impl ProxyHttp for PingoraProxy {
 
     async fn upstream_response_filter(
         &self,
-        _session: &mut pingora_proxy::Session,
+        _session: &mut Session,
         resp: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         let status = resp.status.as_u16();
-        if (status == 429 || status >= 500)
-            && let (Some(key_id), Some(provider)) = (&ctx.key_id, &ctx.provider)
-        {
-            let cooldown = Duration::from_secs(self.initial_cooldown_secs);
-            self.load_balancer.mark_failure(provider, key_id, cooldown);
+        ctx.upstream_status = Some(status);
+
+        if !Self::is_retryable_status(status) {
+            return Ok(());
         }
 
-        Ok(())
-    }
+        let retry_after = Self::retry_after(resp);
+        let outcome = if status == 429 {
+            Outcome::RateLimited { retry_after }
+        } else {
+            Outcome::Failure
+        };
+        let key_id = ctx.key_id().unwrap_or("-").to_string();
 
-    async fn response_filter(
-        &self,
-        _session: &mut pingora_proxy::Session,
-        resp: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
-    ) -> pingora::Result<()> {
-        if self.dump_response {
-            let headers_str = resp
-                .headers
-                .iter()
-                .map(|(k, v)| format!("  {}: {}", k, v.to_str().unwrap_or("<binary>")))
-                .collect::<Vec<_>>()
-                .join("\n");
-            println!(
-                "[{}] [RESPONSE] {}\n{}",
-                timestamp(),
-                resp.status,
-                headers_str
+        // Record the failure against the key that produced it, *before* any
+        // response is committed downstream.
+        self.settle(ctx, outcome);
+
+        if ctx.attempts as usize >= self.settings.max_retries {
+            warn!(
+                status,
+                attempts = ctx.attempts,
+                model = ctx.model.as_deref().unwrap_or("-"),
+                "all attempts exhausted, returning upstream status"
             );
+            return Ok(());
         }
-        Ok(())
+
+        // Back off briefly so a rate-limited upstream is not hit again at once.
+        let pause = retry_after.unwrap_or(Duration::from_millis(250));
+        let ceiling = self
+            .settings
+            .max_wait_for_key
+            .max(Duration::from_secs(1));
+        if pause <= ceiling {
+            tokio::time::sleep(pause).await;
+        }
+
+        warn!(
+            status,
+            attempt = ctx.attempts,
+            key = %key_id,
+            "retrying on another key"
+        );
+
+        // Returning a retryable error re-enters `upstream_peer`, which selects
+        // a different key because this one is now in `ctx.excluded`. pingora's
+        // retry buffer replays the request body for the new attempt.
+        let mut error = pingora::Error::new_up(ErrorType::HTTPStatus(status));
+        error.set_retry(true);
+        Err(error)
     }
 
     fn upstream_response_body_filter(
         &self,
-        _session: &mut pingora_proxy::Session,
-        body: &mut Option<bytes::Bytes>,
-        _end_of_stream: bool,
-        _ctx: &mut Self::CTX,
-    ) -> pingora::Result<Option<std::time::Duration>> {
-        if self.dump_response
-            && let Some(bytes) = body.as_deref()
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<Option<Duration>> {
+        if let Some(chunk) = body.as_deref()
+            && !chunk.is_empty()
         {
-            if let Ok(body_str) = std::str::from_utf8(bytes) {
-                const MAX_LOG_LEN: usize = 151200;
-                let json_str = body_str.strip_prefix("data: ").unwrap_or(body_str);
-                let pretty = match serde_json::from_str::<Value>(json_str) {
-                    Ok(v) => {
-                        serde_json::to_string_pretty(&v).unwrap_or_else(|_| body_str.to_string())
-                    }
-                    Err(_) => body_str.to_string(),
-                };
-
-                let output = if pretty.len() > MAX_LOG_LEN {
-                    format!(
-                        "{}\n... (truncated, {} bytes total)",
-                        pretty.chars().take(MAX_LOG_LEN).collect::<String>(),
-                        pretty.len()
-                    )
-                } else {
-                    pretty
-                };
-
-                println!("[{}] [RESPONSE BODY]\n---\n{}\n---", timestamp(), output);
-            } else {
-                println!(
-                    "[{}] [RESPONSE BODY] <binary {} bytes>",
-                    timestamp(),
-                    bytes.len()
-                );
-            }
+            ctx.usage.push(chunk);
+        }
+        if end_of_stream {
+            ctx.usage.finish();
         }
         Ok(None)
     }
@@ -436,68 +633,508 @@ impl ProxyHttp for PingoraProxy {
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
-        session: &mut pingora_proxy::Session,
-        mut e: Box<pingora::Error>,
+        _session: &mut Session,
+        mut error: Box<pingora::Error>,
         ctx: &mut Self::CTX,
         _client_reused: bool,
     ) -> Box<pingora::Error> {
-        let etype = e.etype().clone();
+        let etype = error.etype().clone();
         warn!(
-            "proxy error: {} (peer: {}, uri: {:?})",
-            e,
-            peer,
-            session.req_header().uri
+            "upstream error: {error} (peer: {peer}, key: {}, attempt: {})",
+            ctx.key_id().unwrap_or("-"),
+            ctx.attempts
         );
 
-        let should_mark_failure = matches!(etype, ErrorType::ConnectRefused);
-        if should_mark_failure && let (Some(key_id), Some(provider)) = (&ctx.key_id, &ctx.provider)
-        {
-            let cooldown = Duration::from_secs(self.initial_cooldown_secs);
-            self.load_balancer.mark_failure(provider, key_id, cooldown);
-        }
+        self.runtime
+            .read()
+            .metrics()
+            .upstream_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let should_retry = !matches!(
+        // A transport failure means this key's connection is unusable.
+        self.settle(ctx, Outcome::Failure);
+
+        // Connect refused means the host is wrong; retrying another key for the
+        // same provider will fail the same way, so only retry on transient
+        // transport errors.
+        let transient = matches!(
             etype,
-            ErrorType::ConnectRefused | ErrorType::ConnectionClosed
+            ErrorType::ConnectionClosed
+                | ErrorType::ReadError
+                | ErrorType::WriteError
+                | ErrorType::ReadTimedout
+                | ErrorType::WriteTimedout
+                | ErrorType::ConnectTimedout
         );
-        let mark_as_upstream = matches!(etype, ErrorType::ConnectRefused);
+        let can_retry = transient && (ctx.attempts as usize) < self.settings.max_retries;
 
-        // Must explicitly set retry decision - pingora panics if not set
-        if should_retry {
-            e.set_retry(true);
+        if can_retry {
+            error.set_retry(true);
         } else {
-            e.set_retry(false);
-            if mark_as_upstream {
-                e.as_up();
-            }
+            error.set_retry(false);
+            error.as_up();
         }
+        error
+    }
 
-        e
+    async fn logging(
+        &self,
+        _session: &mut Session,
+        _error: Option<&pingora::Error>,
+        ctx: &mut Self::CTX,
+    ) where
+        Self::CTX: Send + Sync,
+    {
+        let outcome = match ctx.upstream_status {
+            Some(status) if (200..300).contains(&status) => Outcome::Success,
+            Some(429) => Outcome::RateLimited { retry_after: None },
+            Some(status) if status >= 500 => Outcome::Failure,
+            // Control-plane traffic never selected a key.
+            None if ctx.key.is_none() => Outcome::Cancelled,
+            _ => Outcome::Failure,
+        };
+        self.settle(ctx, outcome);
+
+        if ctx.key.is_some() || ctx.started_at != ctx.attempt_started_at {
+            self.runtime
+                .read()
+                .metrics()
+                .requests_in_flight
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |value| Some(value.saturating_sub(1)),
+                )
+                .ok();
+        }
     }
 }
 
-pub fn run_pingora_server(config: Config, dump_request: bool, dump_response: bool) {
-    let server_conf = config.server.to_pingora_conf();
+/// Rewrite the JSON `"model"` value in a request body.
+///
+/// Only the first occurrence of the exact value is replaced, which is what
+/// OpenAI-compatible payloads need. Not wired into the request path: pingora
+/// emits the upstream request header before the body streams, so a body rewrite
+/// would desynchronise `Content-Length`. Kept (and tested) for a future
+/// body-buffered mode.
+#[allow(dead_code)]
+pub fn rewrite_model(body: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let needle = format!("\"{from}\"");
+    let position = text.find(&needle)?;
+    let mut out = String::with_capacity(text.len() + to.len().saturating_sub(from.len()));
+    out.push_str(&text[..position]);
+    out.push('"');
+    out.push_str(to);
+    out.push('"');
+    out.push_str(&text[position + needle.len()..]);
+    Some(out.into_bytes())
+}
 
+/// Split a URI into its path and query.
+fn split_uri(uri: &HttpUri) -> (String, Option<String>) {
+    (
+        uri.path().to_string(),
+        uri.query().map(|q| q.to_string()),
+    )
+}
+
+/// Replace the request URI's path and query in place.
+fn apply_uri(req: &mut RequestHeader, path: &str, query: Option<&str>) -> pingora::Result<()> {
+    let uri = match query.filter(|q| !q.is_empty()) {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    let parsed: HttpUri = uri
+        .parse()
+        .map_err(|_| pingora::Error::new_down(ErrorType::new("InvalidUpstreamUri")))?;
+    req.set_uri(parsed);
+    Ok(())
+}
+
+/// Host header for an upstream base URL.
+fn host_of(base_url: &str) -> String {
+    Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| "api.openai.com".to_string())
+}
+
+/// Build the upstream peer, resolving DNS for a concrete IP.
+async fn build_peer(
+    base_url: &str,
+    idle_timeout: Duration,
+    connect_timeout: Option<Duration>,
+) -> pingora::Result<HttpPeer> {
+    let parsed = Url::parse(base_url).map_err(|error| {
+        pingora::Error::explain(
+            ErrorType::new("InvalidBaseUrl"),
+            format!("cannot parse base_url `{base_url}`: {error}"),
+        )
+    })?;
+
+    let host = parsed.host_str().unwrap_or("api.openai.com").to_string();
+    let tls = parsed.scheme() == "https";
+    let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+
+    let address = format!("{host}:{port}");
+    let ip = match lookup_host(&address).await {
+        Ok(mut addrs) => addrs
+            .next()
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_else(|| host.clone()),
+        Err(error) => {
+            warn!("DNS lookup failed for {address}: {error}");
+            host.clone()
+        }
+    };
+
+    let mut peer = HttpPeer::new(format!("{ip}:{port}"), tls, host);
+    if let Some(options) = peer.get_mut_peer_options() {
+        options.idle_timeout = Some(idle_timeout);
+        if let Some(connect_timeout) = connect_timeout {
+            options.connection_timeout = Some(connect_timeout);
+        }
+    }
+    Ok(peer)
+}
+
+/// Build pingora's server configuration, applying the retry budget.
+pub fn build_server_conf(config: &Config) -> pingora::server::configuration::ServerConf {
+    let mut conf = pingora::server::configuration::ServerConf::default();
+    if let Some(threads) = config.server.threads {
+        conf.threads = threads;
+    }
+    conf.daemon = config.server.daemon;
+    if let Some(pid_file) = config.server.pid_file.as_ref().filter(|p| !p.is_empty()) {
+        conf.pid_file = pid_file.clone();
+    }
+    if let Some(user) = config.server.user.as_ref().filter(|u| !u.is_empty()) {
+        conf.user = Some(user.clone());
+    }
+    if let Some(group) = config.server.group.as_ref().filter(|g| !g.is_empty()) {
+        conf.group = Some(group.clone());
+    }
+    // pingora re-enters `upstream_peer` on every retry, which is exactly how
+    // key rotation is implemented here.
+    conf.max_retries = config.server.max_retries.max(1);
+    conf
+}
+
+/// Build a runtime from a config, keeping the source path for persistence.
+pub fn runtime_from_config(
+    config: Config,
+    path: Option<std::path::PathBuf>,
+) -> anyhow::Result<SharedRuntime> {
+    Ok(shared(Runtime::new(config, path)?))
+}
+
+/// Start the proxy server with the control plane configured by the file.
+pub fn run_server(config: Config, runtime: SharedRuntime) -> anyhow::Result<()> {
+    let server_conf = build_server_conf(&config);
     let mut server = Server::new_with_opt_and_conf(None, server_conf);
     server.bootstrap();
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    let load_balancer = config.load_balancer();
-    let idle_timeout = Some(Duration::from_secs(config.load_balancing.idle_timeout_secs));
-    let proxy = PingoraProxy::new(
-        load_balancer,
-        config.load_balancing.initial_cooldown_secs,
-        idle_timeout,
-        dump_request,
-        dump_response,
+    let settings = ProxySettings::from_config(&config);
+    let token = config.admin.resolved_token()?;
+
+    // Control plane on its own listener, when configured that way.
+    if settings.admin_enabled && settings.admin_mode == AdminMode::Separate {
+        let router = AdminRouter::new(
+            Arc::clone(&runtime),
+            token.clone(),
+            config.admin.allow_insecure,
+        );
+        let service = crate::proxy::control::ControlService::new(router);
+        let mut svc = pingora::proxy::http_proxy_service(&server.configuration, service);
+        let addr = format!("{}:{}", config.admin.host, config.admin.port);
+        svc.add_tcp(&addr);
+        println!("LLM Broker admin API listening on http://{addr}");
+        server.add_service(svc);
+    }
+
+    let proxy = ProxyService::new(
+        Arc::clone(&runtime),
+        Some(AdminRouter::new(
+            Arc::clone(&runtime),
+            token,
+            config.admin.allow_insecure,
+        )),
     );
+    let mut svc = pingora::proxy::http_proxy_service(&server.configuration, proxy);
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    svc.add_tcp(&addr);
+    println!(
+        "LLM Broker listening on http://{addr} (admin: {})",
+        describe_admin(&config)
+    );
+    server.add_service(svc);
 
-    let mut http_proxy = http_proxy_service(&server.configuration, proxy);
-    http_proxy.add_tcp(&addr);
-
-    println!("LLM Broker (Pingora) listening on {}", addr);
-
-    server.add_service(http_proxy);
     server.run_forever();
+}
+
+fn describe_admin(config: &Config) -> String {
+    if !config.admin.enabled || config.admin.mode == AdminMode::Off {
+        return "disabled".to_string();
+    }
+    match config.admin.mode {
+        AdminMode::Separate => format!("http://{}:{}", config.admin.host, config.admin.port),
+        AdminMode::Path => format!("path {}", config.admin.path),
+        AdminMode::Off => "disabled".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ApiKeyConfig, ProviderConfig, ServerConfig};
+
+    fn minimal_config() -> Config {
+        Config {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 11436,
+                threads: None,
+                daemon: false,
+                pid_file: None,
+                user: None,
+                group: None,
+                connect_timeout_ms: 0,
+                idle_timeout_ms: None,
+                max_retries: 3,
+            },
+            proxy_type: None,
+            providers: vec![ProviderConfig {
+                name: "openai".into(),
+                base_url: Some("https://api.openai.test".into()),
+                path_prefix: None,
+                auth: None,
+                auth_query_param: None,
+                default_models: vec!["gpt-4".into()],
+                max_rpm: None,
+                max_tpm: None,
+                max_concurrency: None,
+                api_keys: vec![ApiKeyConfig {
+                    id: "k1".into(),
+                    key: "sk-test".into(),
+                    enabled: true,
+                    models: vec![],
+                    weight: 1,
+                    max_rpm: None,
+                    max_tpm: None,
+                    max_concurrency: None,
+                    model_map: None,
+                }],
+            }],
+            routes: vec![],
+            default_route: None,
+            load_balancing: Default::default(),
+            health: Default::default(),
+            observability: Default::default(),
+            admin: Default::default(),
+        }
+    }
+
+    fn settings() -> ProxySettings {
+        ProxySettings {
+            idle_timeout: Duration::from_secs(30),
+            connect_timeout: None,
+            metrics_path: "/metrics".into(),
+            metrics_enabled: true,
+            access_log: false,
+            usage_tracking: true,
+            usage_scan_limit: 4096,
+            admin_path: "/admin".into(),
+            admin_enabled: true,
+            admin_mode: AdminMode::Path,
+            max_wait_for_key: Duration::from_secs(5),
+            max_retries: 3,
+            request_scan_limit: 1024,
+        }
+    }
+
+    fn service() -> ProxyService {
+        ProxyService {
+            runtime: shared(Runtime::new(minimal_config(), None).unwrap()),
+            settings: settings(),
+            admin: None,
+            admin_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn retryable_statuses_cover_429_and_5xx_but_not_client_errors() {
+        assert!(ProxyService::is_retryable_status(429));
+        assert!(ProxyService::is_retryable_status(500));
+        assert!(ProxyService::is_retryable_status(503));
+        assert!(ProxyService::is_retryable_status(408));
+        // A malformed request must never be replayed on another key.
+        assert!(!ProxyService::is_retryable_status(400));
+        assert!(!ProxyService::is_retryable_status(401));
+        assert!(!ProxyService::is_retryable_status(404));
+        assert!(!ProxyService::is_retryable_status(200));
+    }
+
+    #[test]
+    fn admin_paths_are_matched_with_a_boundary() {
+        let service = service();
+        assert!(service.is_admin_path("/admin"));
+        assert!(service.is_admin_path("/admin/keys"));
+        assert!(!service.is_admin_path("/administrator"));
+        assert!(service.is_metrics_path("/metrics"));
+        assert!(!service.is_metrics_path("/v1/metrics"));
+    }
+
+    #[test]
+    fn admin_paths_are_ignored_when_the_control_plane_is_disabled() {
+        let mut service = service();
+        service.settings.admin_enabled = false;
+        assert!(!service.is_admin_path("/admin/status"));
+        service.settings.metrics_enabled = false;
+        assert!(!service.is_metrics_path("/metrics"));
+    }
+
+    #[test]
+    fn admin_routes_are_derived_from_the_mount_point() {
+        let service = service();
+        assert_eq!(service.admin_route("/admin/keys/openai/k1"), "keys/openai/k1");
+        assert_eq!(service.admin_route("/admin"), "");
+        assert_eq!(service.admin_route("/admin/status"), "status");
+    }
+
+    #[test]
+    fn body_buffer_stops_collecting_after_the_limit() {
+        let mut buffer = BodyBuffer::default();
+        buffer.push(b"hello", 16);
+        assert!(buffer.is_complete());
+        assert_eq!(buffer.bytes(), b"hello");
+
+        // Adding six more bytes would exceed the 16-byte limit.
+        buffer.push(b"worlds", 10);
+        assert!(!buffer.is_complete(), "the buffer must stop collecting");
+        assert!(buffer.is_empty());
+
+        buffer.push(b"more", 16);
+        assert!(buffer.is_empty(), "an overflowed buffer stops growing");
+    }
+
+    #[test]
+    fn body_buffer_accumulates_across_chunks() {
+        let mut buffer = BodyBuffer::default();
+        buffer.push(br#"{"model":"gp"#, 1024);
+        buffer.push(br#"t-4"}"#, 1024);
+        assert_eq!(buffer.bytes(), br#"{"model":"gpt-4"}"#);
+    }
+
+    #[test]
+    fn retry_after_header_parsing() {
+        let mut resp = ResponseHeader::build(429, None).unwrap();
+        resp.insert_header("Retry-After", "42").unwrap();
+        assert_eq!(
+            ProxyService::retry_after(&resp),
+            Some(Duration::from_secs(42))
+        );
+
+        let plain = ResponseHeader::build(429, None).unwrap();
+        assert_eq!(ProxyService::retry_after(&plain), None);
+    }
+
+    #[test]
+    fn model_rewriting_replaces_only_the_model_value() {
+        let body = br#"{"model":"fast","messages":[{"content":"fast is nice"}]}"#;
+        let rewritten = rewrite_model(body, "fast", "gpt-4o").unwrap();
+        assert_eq!(
+            String::from_utf8(rewritten).unwrap(),
+            r#"{"model":"gpt-4o","messages":[{"content":"fast is nice"}]}"#
+        );
+    }
+
+    #[test]
+    fn model_rewriting_is_idempotent_when_applied_twice() {
+        // Regression guard: retries must not nest an alias.
+        let body = br#"{"model":"fast","messages":[]}"#;
+        let once = rewrite_model(body, "fast", "gpt-4o").unwrap();
+        assert!(
+            rewrite_model(&once, "fast", "gpt-4o").is_none(),
+            "the first rewrite must remove the original name"
+        );
+    }
+
+    #[test]
+    fn model_rewriting_returns_none_when_nothing_matches() {
+        assert!(rewrite_model(br#"{"model":"other"}"#, "fast", "gpt-4o").is_none());
+        assert!(rewrite_model(b"not json", "fast", "gpt-4o").is_none());
+    }
+
+    #[test]
+    fn uri_rewrites_preserve_query_strings() {
+        let mut req = RequestHeader::build("POST", b"/v1/chat?api-version=1", None).unwrap();
+        apply_uri(&mut req, "/openai/v1/chat", Some("api-version=1&key=abc")).unwrap();
+        assert_eq!(req.uri.to_string(), "/openai/v1/chat?api-version=1&key=abc");
+    }
+
+    #[test]
+    fn uri_rewrites_without_a_query_are_clean() {
+        let mut req = RequestHeader::build("POST", b"/v1/chat", None).unwrap();
+        apply_uri(&mut req, "/v1/chat", None).unwrap();
+        assert_eq!(req.uri.to_string(), "/v1/chat");
+    }
+
+    #[test]
+    fn split_uri_separates_path_and_query() {
+        let uri: HttpUri = "/a/b?x=1&y=2".parse().unwrap();
+        let (path, query) = split_uri(&uri);
+        assert_eq!(path, "/a/b");
+        assert_eq!(query.as_deref(), Some("x=1&y=2"));
+
+        let uri: HttpUri = "/a/b".parse().unwrap();
+        let (path, query) = split_uri(&uri);
+        assert_eq!(path, "/a/b");
+        assert!(query.is_none());
+    }
+
+    #[test]
+    fn host_of_extracts_the_hostname() {
+        assert_eq!(host_of("https://api.openai.com/v1"), "api.openai.com");
+        assert_eq!(host_of("https://api.example.com:8443/x"), "api.example.com");
+        assert_eq!(host_of("not a url"), "api.openai.com");
+    }
+
+    #[test]
+    fn server_conf_carries_the_retry_budget() {
+        let mut config = minimal_config();
+        config.server.max_retries = 7;
+        config.server.threads = Some(3);
+        let conf = build_server_conf(&config);
+        assert_eq!(conf.max_retries, 7);
+        assert_eq!(conf.threads, 3);
+    }
+
+    #[test]
+    fn proxy_settings_derive_from_config() {
+        let mut config = minimal_config();
+        config.observability.metrics_path = "/stats".into();
+        config.load_balancing.max_wait_for_key_secs = 9;
+        let settings = ProxySettings::from_config(&config);
+        assert_eq!(settings.metrics_path, "/stats");
+        assert_eq!(settings.max_wait_for_key, Duration::from_secs(9));
+        // Admin mode defaults to `off`-equivalent (`enabled = false`).
+        assert!(!settings.admin_enabled);
+    }
+
+    #[test]
+    fn model_resolution_prefers_the_body_then_the_path() {
+        let service = service();
+        assert_eq!(
+            service.resolve_model(br#"{"model":"gpt-4o"}"#, "/v1/chat/completions").as_deref(),
+            Some("gpt-4o")
+        );
+        assert_eq!(
+            service
+                .resolve_model(b"", "/v1/models/gemini-pro:generateContent")
+                .as_deref(),
+            Some("gemini-pro")
+        );
+        assert_eq!(service.resolve_model(b"", "/v1/chat/completions"), None);
+    }
 }
