@@ -901,11 +901,16 @@ pub fn build_server_conf(config: &Config) -> pingora::server::configuration::Ser
     // pingora re-enters `upstream_peer` on every retry, which is exactly how
     // key rotation is implemented here.
     conf.max_retries = config.server.max_retries.max(1);
-    // pingora sleeps this on the main thread during a graceful shutdown and
-    // ignores further signals meanwhile, so pingora's 300s default makes
-    // Ctrl+C look broken. Bound it, and bound how long the runtimes get too.
+    // pingora sleeps the grace period on the main thread during a graceful
+    // shutdown, dropping signals meanwhile, so its 300s default made Ctrl+C
+    // look broken. Bound it by the configured value.
     conf.grace_period_seconds = Some(config.server.graceful_shutdown_secs);
-    conf.graceful_shutdown_timeout_seconds = Some(config.server.graceful_shutdown_secs);
+    // The runtime shutdown timeout is a *separate*, additional wait, and
+    // pingora sleeps it twice (once inside `Runtime::shutdown_timeout`, once
+    // after). Using the grace period here doubled the shutdown: a 30s setting
+    // produced a 60s stop. Leave it at pingora's small default, since the grace
+    // period is what lets in-flight requests finish.
+    debug_assert!(config.server.graceful_shutdown_secs < 3600);
     conf
 }
 
@@ -1224,7 +1229,9 @@ mod tests {
         config.server.graceful_shutdown_secs = 5;
         let conf = build_server_conf(&config);
         assert_eq!(conf.grace_period_seconds, Some(5));
-        assert_eq!(conf.graceful_shutdown_timeout_seconds, Some(5));
+        // Deliberately not tied to the grace period: pingora sleeps this one
+        // twice, so sharing the value doubled the observed shutdown time.
+        assert_eq!(conf.graceful_shutdown_timeout_seconds, None);
     }
 
     #[test]
