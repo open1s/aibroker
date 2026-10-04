@@ -72,6 +72,8 @@ src/
   main.rs                  CLI, config loading, startup
   config/mod.rs            Schema, validation, persistence, `env:` secrets
   core/                    Framework-independent; no HTTP types
+    security.rs            Client tokens, egress scopes, per-client budgets
+    policy.rs              Rego egress policy (regorus); builds policy facts
     key_state.rs           Per-key health, cooldown, limits, counters, KeyGuard
     ratelimit.rs           Sliding-window RPM/TPM limiter
     pool.rs                KeyPool: availability gate + strategy dispatch
@@ -129,6 +131,30 @@ not, add the test.
 7. **Secrets never appear in admin responses.** `/admin/keys` and `/admin/status`
    expose state, never `key`. `/admin/config` is the documented exception and is
    token-gated.
+
+## Data security (what may leave the machine)
+
+Balancing picks the key; `core/security.rs` and `core/policy.rs` decide whether
+the request may be forwarded at all. Enforcement happens once per request in
+`upstream_peer`, *before* the body streams, so disallowed content is never
+uploaded, and the client's in-flight slot is released in `logging`.
+
+- **Tokens** are compared in constant time, and must never be logged, echoed in
+  a refusal, or returned by the admin API. `/admin/security` reports scopes and
+  budgets only; a test asserts the payload contains no token.
+- **Pattern matching lives in Rust**, and the verdict reaches the policy as
+  `client.model_allowed`. OPA's `glob.match` cannot match `gpt-4o` against
+  `gpt-*` (its default delimiter is `.`), and one implementation keeps the
+  policy and the broker from disagreeing about what a pattern means. regorus
+  also ships no string builtins unless the `glob`/`regex` features are on.
+- **A policy failure refuses the request.** A broker that forwards traffic when
+  its policy engine is broken is worse than one that returns 500. An invalid
+  policy fails at `Runtime::new`, not on the first request.
+- **Denials are counted twice**: per client, and registry-wide by reason. An
+  unknown token cannot be attributed to a client, and a policy denial happens
+  after `authenticate`, so both counters are needed or the events vanish.
+- **Empty `[[clients]]` means open**, which keeps the single-user setup
+  working. Do not change that default silently.
 
 ## Load balancing strategies
 
