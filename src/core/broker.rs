@@ -177,10 +177,8 @@ impl Broker {
         let tuning = HealthTuning {
             enabled: config.health.enabled,
             latency_alpha: config.health.latency_alpha,
-            slow_latency_ms: config.health.slow_latency_ms,
             unhealthy_threshold: config.health.unhealthy_threshold,
             failure_threshold: config.health.failure_threshold,
-            recovery_threshold: config.health.recovery_threshold,
         };
 
         let mut pools = BTreeMap::new();

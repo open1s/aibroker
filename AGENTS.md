@@ -203,6 +203,32 @@ load, and both bugs above passed every unit test they had. `Score` is a trait so
 a ranking can order lexicographically — do not compress two independent
 decisions (explored? / how fast?) into one `f64`.
 
+## Health means reliability, not speed
+
+`health_score` is the circuit breaker's input, so it must answer exactly one
+question: *does this key fail?* It rises on success and drops by a fifth per
+consecutive failure, and **latency must never enter it**.
+
+This was wrong in a way that looked plausible and was caught from a screenshot,
+not from a test. Health was pulled toward a latency factor, `1 - observed/slow`,
+with `slow_latency_ms` defaulting to 5,000 ms. A local LLM proxy's healthy
+answers take tens of seconds, so the factor was `1 - 42000/5000`, clamped to 0,
+and **every successful request drove the score toward zero**: three working
+NVIDIA keys reported 1-2% health. Capping the damage with a floor was still the
+same mistake — a flawless key read 60%, which is what prompted "why not 100?".
+
+The second-order effect is what makes it dangerous, not cosmetic: with the score
+pinned near zero, `score < unhealthy_threshold` was permanently true, so the
+first failure skipped the cooldown ramp and opened at the 25-minute cap on a key
+that had been serving fine.
+
+So: latency may deprioritise a key (`latency_us` feeds `least_latency` and the
+`latency_ms` column) but must never mark it unhealthy. Two config knobs were
+removed with this change — `slow_latency_ms` (it existed only for this mistake)
+and `recovery_threshold` (it was read and then discarded by a `let _ =`, so it
+never did anything). Unknown keys in an existing config are ignored rather than
+rejected, and a test pins that so an old file keeps loading.
+
 ## Key rotation
 
 Cooldown follows `initial * multiplier^level`, capped at `max_cooldown_secs`

@@ -125,9 +125,13 @@ prebuilt binaries for five targets.
   pre-body signal. Providers that cannot serve the model are never called.
 - **Real rate limiting.** Sliding-window RPM *and* TPM accounting per key, plus
   concurrency caps. The window cannot burst past the configured limit.
-- **Health scoring and circuit breaking.** EWMA latency, an exponential
-  failure score, and cooldowns that really ramp (1min → 5min → 25min by
-  default, jittered) and honour an upstream `Retry-After`.
+- **Health scoring and circuit breaking.** Health is **reliability only**: it
+  falls by a fifth per consecutive failure and rises on success, so a key that
+  answers every request reads 100% however slow it is. Cooldowns ramp
+  (1min → 5min → 25min by default, jittered) and honour an upstream
+  `Retry-After`. Latency is tracked and reported separately, and is what the
+  `least_latency` strategy ranks on — slowness is a routing preference, not a
+  health problem.
 - **Seven selection strategies** including least-busy, latency-based,
   usage-based and power-of-two-choices, with configurable fallbacks.
 - **Runtime key management.** Add, patch, disable, delete and reset keys over

@@ -319,18 +319,12 @@ pub struct HealthConfig {
     /// EWMA weight for latency observations (0.0-1.0, higher = more reactive).
     #[serde(default = "default_latency_alpha")]
     pub latency_alpha: f64,
-    /// Latency (ms) considered "slow" when scoring key health.
-    #[serde(default = "default_slow_latency_ms")]
-    pub slow_latency_ms: u64,
     /// `health_score` below this opens the circuit.
     #[serde(default = "default_unhealthy_threshold")]
     pub unhealthy_threshold: f64,
     /// Consecutive failures that immediately open the circuit.
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,
-    /// Successes in half-open state required to close the circuit again.
-    #[serde(default = "default_recovery_threshold")]
-    pub recovery_threshold: u32,
 }
 
 /// Metrics and logging.
@@ -445,17 +439,11 @@ fn default_idle_timeout() -> u64 {
 fn default_latency_alpha() -> f64 {
     0.2
 }
-fn default_slow_latency_ms() -> u64 {
-    5_000
-}
 fn default_unhealthy_threshold() -> f64 {
     0.3
 }
 fn default_failure_threshold() -> u32 {
     3
-}
-fn default_recovery_threshold() -> u32 {
-    2
 }
 fn default_metrics_path() -> String {
     "/metrics".to_string()
@@ -488,10 +476,8 @@ impl Default for HealthConfig {
         Self {
             enabled: true,
             latency_alpha: default_latency_alpha(),
-            slow_latency_ms: default_slow_latency_ms(),
             unhealthy_threshold: default_unhealthy_threshold(),
             failure_threshold: default_failure_threshold(),
-            recovery_threshold: default_recovery_threshold(),
         }
     }
 }
@@ -1005,6 +991,36 @@ mod tests {
         assert!(redacted.contains("model = \"gpt-4o\""), "{redacted}");
         assert!(redacted.contains("key = \"<redacted>\""), "{redacted}");
         assert!(!redacted.contains("\"secret\""), "{redacted}");
+    }
+
+    #[test]
+    fn a_config_using_removed_health_knobs_still_loads() {
+        // `slow_latency_ms` and `recovery_threshold` are gone: the first made
+        // health depend on latency, which reported working keys as unhealthy,
+        // and the second was read and then discarded, so it never did anything.
+        // Removing a key must not break an existing config file, so this pins
+        // that serde ignores the unknown ones.
+        let toml = r#"
+[server]
+port = 11436
+
+[health]
+enabled = true
+slow_latency_ms = 5000
+recovery_threshold = 2
+unhealthy_threshold = 0.3
+
+[[providers]]
+name = "p"
+base_url = "http://127.0.0.1:1"
+[[providers.api_keys]]
+id = "k"
+key = "s"
+models = ["m"]
+"#;
+        let config: Config = toml::from_str(toml).expect("an older config must still load");
+        assert_eq!(config.health.unhealthy_threshold, 0.3);
+        assert!(config.health.enabled);
     }
 
     #[test]

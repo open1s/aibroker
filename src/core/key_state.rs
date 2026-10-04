@@ -144,10 +144,8 @@ impl Default for HealthStats {
 pub struct HealthTuning {
     pub enabled: bool,
     pub latency_alpha: f64,
-    pub slow_latency_ms: u64,
     pub unhealthy_threshold: f64,
     pub failure_threshold: u32,
-    pub recovery_threshold: u32,
 }
 
 impl Default for HealthTuning {
@@ -155,10 +153,8 @@ impl Default for HealthTuning {
         Self {
             enabled: true,
             latency_alpha: 0.2,
-            slow_latency_ms: 5_000,
             unhealthy_threshold: 0.3,
             failure_threshold: 3,
-            recovery_threshold: 2,
         }
     }
 }
@@ -312,6 +308,11 @@ impl KeyState {
     }
 
     /// Current health score in `0.0..=1.0`.
+    ///
+    /// Reflects **reliability only**: it falls on failures and rises on
+    /// successes, and says nothing about how fast the key is. Slowness is
+    /// reported separately (`latency_ms`) and acted on by the `least_latency`
+    /// strategy.
     pub fn health_score(&self) -> f64 {
         self.health.read().score
     }
@@ -544,25 +545,28 @@ impl KeyState {
         };
         self.latency_us.store(next, Ordering::Relaxed);
 
-        let latency_factor = if next == 0 {
-            1.0
-        } else {
-            let slow = tuning.slow_latency_ms.max(1) as f64;
-            let observed = next as f64 / 1000.0;
-            (1.0 - (observed / slow)).clamp(0.0, 1.0)
-        };
         self.window_roll_over();
 
         let mut health = self.health.write();
-        // Successes lift the score quickly; latency drags it down smoothly.
-        // The target is the latency factor itself, so a fast key recovers to
-        // a perfect score within a few requests.
-        let target = latency_factor.min(1.0);
-        health.score = (health.score + (target - health.score) * 0.3).clamp(0.0, 1.0);
+        // A success lifts the score toward a perfect one, and latency does not
+        // enter into it.
+        //
+        // This is the correction to a genuine design mistake: health was
+        // previously pulled toward a *latency factor*, so a key that answered
+        // every request correctly was reported as unhealthy merely for being
+        // slow -- 1-2% on three working NVIDIA keys whose answers took 40-60 s,
+        // against a 5 s threshold. Merely capping that damage (a 0.6 floor) was
+        // still wrong in the same way: a flawless key read 60%.
+        //
+        // Health now answers exactly one question -- "does this key fail?" --
+        // and it is the circuit breaker's input, which is the only thing that
+        // should be. Latency has its own home: `latency_us` below, which
+        // `least_latency` ranks on. Slowness is a routing preference; failure is
+        // a health problem.
+        health.score = (health.score + (1.0 - health.score) * 0.3).clamp(0.0, 1.0);
         health.consecutive_failures = 0;
         health.half_open_probe_in_flight = false;
         health.half_open_successes = health.half_open_successes.saturating_add(1);
-        let _ = tuning.recovery_threshold; // recovery is driven by failure reset
     }
 
     /// Record a failure and escalate the cooldown.
@@ -977,6 +981,103 @@ mod tests {
         }
         assert!(key.health_score() > 0.95, "score {}", key.health_score());
         assert_eq!(key.health_snapshot().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn a_slow_but_working_key_is_not_reported_as_unhealthy() {
+        // The measured defect: three NVIDIA keys serving 42-57 s answers sat at
+        // 1-2% health: the score was pulled toward a latency factor, which was
+        // `1 - 42000/5000` clamped to 0, so every *successful* request drove it
+        // toward zero. Health drives the circuit breaker, so a
+        // merely slow key was on the edge of being held open.
+        let key = key_with(None, None);
+        let tuning = HealthTuning::default();
+
+        for _ in 0..12 {
+            key.record_success(Duration::from_millis(42_000), 100, 50, &tuning);
+        }
+
+        let score = key.health_score();
+        // A flawless key reads 100% however slow it is: health answers "does
+        // this key fail?", and this one has not.
+        assert!(
+            score > 0.99,
+            "a working key must reach full health, got {score}"
+        );
+        assert!(
+            score > tuning.unhealthy_threshold,
+            "and certainly stay above the unhealthy threshold, got {score}"
+        );
+        assert_eq!(
+            key.health_state(),
+            HealthState::Closed,
+            "successes must not open the circuit"
+        );
+    }
+
+    #[test]
+    fn latency_is_reported_separately_from_health() {
+        // Health must not encode slowness, but the measurement must still be
+        // available -- it is what `least_latency` ranks on, and what the
+        // dashboard shows in its own column.
+        let tuning = HealthTuning::default();
+        let slow = key_with(None, None);
+        let fast = key_with(None, None);
+        for _ in 0..12 {
+            slow.record_success(Duration::from_millis(60_000), 0, 0, &tuning);
+            fast.record_success(Duration::from_millis(200), 0, 0, &tuning);
+        }
+
+        assert!(
+            (slow.health_score() - 1.0).abs() < 1e-9,
+            "a reliable key is healthy regardless of speed: {}",
+            slow.health_score()
+        );
+        assert!((fast.health_score() - 1.0).abs() < 1e-9);
+        assert!(
+            slow.latency_ms().unwrap_or(0.0) > fast.latency_ms().unwrap_or(0.0) * 10.0,
+            "latency must still be tracked: {:?} vs {:?}",
+            slow.latency_ms(),
+            fast.latency_ms()
+        );
+    }
+
+    #[test]
+    fn a_slow_key_escalates_from_the_initial_cooldown_not_the_cap() {
+        // Crossing the failure threshold on a slow-but-working key must open the
+        // initial cooldown, not the capped one.
+        //
+        // Under the old formula the score was already ~0.01 after a few slow
+        // successes, so the first failure left it below the threshold and the
+        // ramp was skipped: a key that had been serving fine opened at the
+        // 25-minute cap instead of 1 minute. With health back at 1.0, the
+        // failure threshold -- not the score -- is what triggers the cooldown.
+        let key = key_with(None, None);
+        let tuning = HealthTuning::default();
+        let policy = CooldownPolicy::default();
+
+        for _ in 0..12 {
+            key.record_success(Duration::from_millis(45_000), 0, 0, &tuning);
+        }
+
+        let mut cooldown = None;
+        for _ in 0..tuning.failure_threshold {
+            key.record_failure(&policy, &tuning);
+            cooldown = key.cooldown_remaining();
+        }
+
+        let cooldown = cooldown.expect("the failure threshold must cool the key");
+        // Jitter is +/-20% on the step, so bound the *step*, not the value: the
+        // point is that it is the initial one and not the 25-minute cap.
+        let upper = policy.initial.mul_f64(1.0 + policy.jitter) + Duration::from_secs(1);
+        assert!(
+            cooldown <= upper,
+            "the first cooldown should be the initial step (<= {upper:?}), got {cooldown:?}"
+        );
+        assert!(
+            cooldown < policy.max,
+            "it must not have jumped to the cap, got {cooldown:?}"
+        );
     }
 
     #[test]

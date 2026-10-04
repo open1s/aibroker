@@ -152,14 +152,17 @@ idle_timeout_secs = 120
 enabled = true
 # EWMA weight for latency observations.
 latency_alpha = 0.2
-# Latency considered "slow" when scoring a key.
-slow_latency_ms = 5_000
 # Score below this opens the circuit for the key.
 unhealthy_threshold = 0.3
 # Consecutive failures that open the circuit immediately.
 failure_threshold = 3
-# Successes needed in the half-open state to close it again.
-recovery_threshold = 2
+
+# Health is reliability only: it falls by a fifth per consecutive failure and
+# rises on success, so a key that answers every request reads 100% however slow
+# it is. Latency is measured separately (`latency_ms` on the dashboard) and is
+# what the `least_latency` strategy ranks on. This matters for an LLM proxy,
+# where a healthy answer routinely takes tens of seconds: scoring health by
+# latency reported working keys as nearly dead.
 
 # ---------------------------------------------------------------------------
 # Observability

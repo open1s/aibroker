@@ -114,10 +114,8 @@ impl Runtime {
         HealthTuning {
             enabled: health.enabled,
             latency_alpha: health.latency_alpha,
-            slow_latency_ms: health.slow_latency_ms,
             unhealthy_threshold: health.unhealthy_threshold,
             failure_threshold: health.failure_threshold,
-            recovery_threshold: health.recovery_threshold,
         }
     }
 
