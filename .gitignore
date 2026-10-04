@@ -18,3 +18,4 @@ config.toml
 /local-config.toml
 /.admin-token.tmp
 /test*.toml
+/.client-token.tmp

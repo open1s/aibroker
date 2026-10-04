@@ -371,6 +371,16 @@ impl AdminRouter {
                 .into_iter()
                 .map(|(reason, count)| (reason.as_str().to_string(), count))
                 .collect::<std::collections::BTreeMap<_, _>>(),
+            "content_guard": runtime.content_guard().map(|guard| {
+                json!({
+                    "enabled": true,
+                    // Names only. A pattern is configuration, and a rule name is
+                    // what a finding reports, so this is what an operator needs
+                    // to correlate a log line with the config.
+                    "action": guard.action().as_str(),
+                    "rules": guard.rule_names().collect::<Vec<_>>(),
+                })
+            }),
             "policy": {
                 "source": match policy.source() {
                     crate::core::policy::PolicySource::Default => "default",
@@ -944,6 +954,38 @@ mod tests {
         let response = router.handle(authed("GET", "", b"", "wrong"));
         assert_eq!(response.status, 401);
         assert!(response.challenge.is_none());
+    }
+
+    #[test]
+    fn the_security_endpoint_reports_the_content_guard() {
+        // Whether a content guard is on, and which rules, is security posture:
+        // an operator should not have to read the config file or the process
+        // arguments to find out.
+        let runtime = runtime();
+        let router = router(Arc::clone(&runtime), Some("secret"));
+        {
+            let mut runtime = runtime.write();
+            runtime
+                .apply(|config| {
+                    config.content_guard = crate::config::ContentGuardConfig {
+                        enabled: true,
+                        action: Some("deny".to_string()),
+                        patterns: vec![crate::config::ContentPattern {
+                            name: "aws-key".into(),
+                            pattern: r"AKIA[0-9A-Z]{16}".into(),
+                        }],
+                        allow: vec![],
+                    };
+                })
+                .expect("content guard config should apply");
+        }
+
+        let response = router.handle(authed("GET", "/security", b"", "secret"));
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(body.contains("\"content_guard\""), "{body}");
+        assert!(body.contains("\"action\": \"deny\""), "{body}");
+        assert!(body.contains("aws-key"), "{body}");
     }
 
     #[test]

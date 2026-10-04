@@ -442,8 +442,10 @@ What this buys you:
   whoever owns the data-classification rules;
 - a policy that fails to evaluate **refuses** the request rather than forwarding
   it — a broken policy is never an open door;
-- `GET /admin/security` shows the live configuration (client scopes, budgets,
-  denial counts by reason, which policy is loaded) without exposing a token.
+- `GET /admin/security` shows the live configuration -- client scopes, budgets,
+  denial counts by reason, which policy is loaded, and which content rules are
+  active by name -- without exposing a token, a client token, or a pattern's
+  contents.
 
 ## Admin API
 
