@@ -151,10 +151,11 @@ impl Dump {
 
     /// Dump a chunk of the request body.
     ///
-    /// pingora replays the whole body from its retry buffer when a request is
-    /// rotated onto another key. The content is printed once and later copies
-    /// are reported as replays, so the byte counters describe the client's
-    /// request rather than the number of times we sent it.
+    /// Only the beginning of a body is printed. A large LLM request arrives as
+    /// many chunks -- an agentic client easily sends hundreds of kilobytes --
+    /// and per-chunk progress buries the log. The size is still accounted for,
+    /// and a retry (pingora replays the body from its buffer on a key rotation)
+    /// is reported rather than re-counted.
     pub fn request_body(&mut self, chunk: &[u8]) {
         if !self.config.dump_request {
             return;
@@ -171,12 +172,10 @@ impl Dump {
             );
             return;
         }
-        // Genuine streaming upload: report progress without reprinting.
+        // A large upload arrives as many chunks. Print nothing further: the
+        // first chunk showed the payload's shape and the summary reports the
+        // total, so per-chunk progress would only bury it.
         self.request_bytes += chunk.len();
-        self.emit(
-            "req body",
-            &format!("chunk {} bytes (total {})", chunk.len(), self.request_bytes),
-        );
     }
 
     /// Dump the response status line and headers.
@@ -409,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn a_streamed_upload_accumulates() {
+    fn a_streamed_upload_accumulates_without_logging_every_chunk() {
         let mut dump = Dump::new(DumpConfig {
             dump_request: true,
             dump_response: false,
@@ -417,7 +416,8 @@ mod tests {
         });
         dump.request_body(b"aaaa");
         dump.request_body(b"bbbbbb");
-        assert_eq!(dump.request_bytes, 10);
+        dump.request_body(b"cc");
+        assert_eq!(dump.request_bytes, 12, "size is still accounted for");
     }
 
     #[test]
