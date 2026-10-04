@@ -407,6 +407,15 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 - `llm_broker_key_tokens_total{direction}`, `..._key_latency_milliseconds` histogram
 - `llm_broker_key_rotations_total`, `llm_broker_keys_exhausted_total`
 - `llm_broker_requests_in_flight`, `llm_broker_uptime_seconds`
+- `llm_broker_client_auth_failures_total` — requests refused for a missing or
+  unknown client token
+- `llm_broker_policy_denials_total` — requests refused by the egress policy
+- `llm_broker_client_denials_total{reason}` — the same refusals broken down by
+  `missing_credential`, `unknown_credential`, `client_disabled`,
+  `model_forbidden`, `provider_forbidden`, `rate_limited`,
+  `too_many_in_flight`, `policy_error`. This is the series to alert on: a spike
+  in `unknown_credential` is someone probing the port, and any
+  `policy_error` means traffic is being refused because a policy broke.
 
 Token counts come from the response `usage` object when it is present
 (OpenAI, Anthropic, Gemini and Ollama field names are recognised), which also
