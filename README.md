@@ -305,6 +305,37 @@ The detected dialect appears in the audit log as `api=` and in
 `llm_broker_requests_by_api_total{api=...}`, so you can see which shape is
 actually flowing.
 
+## How the strategies actually distribute
+
+Measured through the proxy, 30 sequential requests against 3 identical healthy
+keys:
+
+| Strategy | Distribution | Notes |
+|---|---|---|
+| `round_robin` | 10 / 10 / 10 | deterministic |
+| `least_busy` | 10 / 10 / 10 | in-flight, then a coarse health tier |
+| `least_latency` | 10 / 10 / 10 | explores each key, then bands by latency |
+| `usage_based` | 10 / 10 / 10 | lowest RPM/TPM utilisation |
+| `weighted_random` | 10 / 10 / 10 | weight × headroom × health |
+| `power_of_two` | 11 / 8 / 11 | best of two random draws |
+| `fallback` | 30 / 0 / 0 | **by design**: first healthy key wins |
+
+`fallback` is the one strategy that is meant to pin; it is ordered failover, not
+a spreader. Every other strategy shares an identical pool.
+
+Two defects this measurement exposed, both since fixed:
+
+- `least_latency` treated an unmeasured key as infinitely slow, so after the
+  first request measured key 1, keys 2 and 3 were never tried again —
+  **30 / 0 / 0** every run. It also ignored capacity, so once the favourite's
+  quota was gone the broker burned its retries rotating off exhausted keys.
+  It now explores every key once, then bands by latency (100 ms) and breaks ties
+  by utilisation, so the fastest key is preferred without being monopolised.
+- `least_busy` folded health into the same number as in-flight, at a scale
+  larger than the tie tolerance. Two idle keys therefore looked different,
+  tie-breaking never ran, and traffic pinned to the marginally healthiest key —
+  **2 / 25 / 3** every run.
+
 ## Who may use it, and what may leave
 
 Balancing decides *which* key serves a request. Two more layers decide whether

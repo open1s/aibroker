@@ -1229,3 +1229,64 @@ fn a_decoy_model_in_the_body_is_not_picked_up() {
         "the provider's own key must be the credential, not anything from the body"
     );
 }
+
+#[test]
+fn a_healthy_pool_shares_load_evenly_under_least_latency() {
+    // End-to-end guard for a measured defect. `least_latency` ranked an
+    // unmeasured key as infinitely slow, so after the first request measured
+    // key1, keys 2 and 3 were never tried again: 30/0/0 over three runs. It then
+    // ignored capacity, so when the favourite's quota ran out the broker spent
+    // its retries rotating off exhausted keys.
+    //
+    // The assertion is deliberately loose. Exact equality would depend on
+    // timing, and this is about the gross failure (one key taking everything),
+    // not about a perfect split.
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200; 60]);
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[
+                ("key1", "sk-mock-1"),
+                ("key2", "sk-mock-2"),
+                ("key3", "sk-mock-3"),
+            ],
+        )],
+        vec![],
+    );
+    config.load_balancing.strategy = "least_latency".to_string();
+    spawn_broker(config, proxy_port);
+
+    let total = 30usize;
+    for _ in 0..total {
+        let response = post_with_model(
+            proxy_port,
+            "/v1/chat/completions",
+            CHAT_BODY,
+            Some("test-model"),
+        );
+        assert_eq!(response.status, 200, "{}", response.status_line);
+    }
+
+    let requests = seen.lock().expect("lock").clone();
+    assert_eq!(requests.len(), total, "every request should be served once");
+
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for request in &requests {
+        let key = request.authorization.clone().unwrap_or_default();
+        *counts.entry(key).or_insert(0) += 1;
+    }
+
+    assert_eq!(counts.len(), 3, "all three keys should be used: {counts:?}");
+    // A third of 30 is 10; allow a wide band, but not a monopoly.
+    for (key, count) in &counts {
+        assert!(
+            (4..=16).contains(count),
+            "{key} received {count} of {total} requests, which is not a share: {counts:?}"
+        );
+    }
+}

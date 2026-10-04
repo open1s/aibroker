@@ -174,6 +174,24 @@ uploaded, and the client's in-flight slot is released in `logging`.
 `load_balancing.fallback_strategies` lists strategies tried in order when the
 primary one cannot place the request.
 
+**A strategy must share an identical pool.** `fallback` is the documented
+exception: it is ordered failover, so pinning is its contract. Every other
+strategy is expected to spread, and two shipped with defects that pinned traffic
+instead — both found by *measuring* the distribution through a running proxy
+rather than by reading the code, and both invisible to the existing unit tests:
+
+- `least_latency` ranked an unmeasured key as infinitely slow. Once one key was
+  measured it won forever, so the rest were never tried: 30/0/0.
+- `least_busy` mixed health into the same float as in-flight at a magnitude
+  larger than `best_by`'s tie tolerance, so equal keys were never "tied" and
+  rotation never ran: 2/25/3.
+
+When adding or changing a strategy, measure it. A unit test on `select` proves
+which candidate a scoring function prefers; it does not prove that a pool shares
+load, and both bugs above passed every unit test they had. `Score` is a trait so
+a ranking can order lexicographically — do not compress two independent
+decisions (explored? / how fast?) into one `f64`.
+
 ## Key rotation
 
 Cooldown follows `initial * multiplier^level`, capped at `max_cooldown_secs`

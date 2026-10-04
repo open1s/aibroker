@@ -131,8 +131,73 @@ impl Candidate {
         (f64::from(self.weight) * headroom * health).max(1e-3)
     }
 
-    fn latency_rank(&self) -> f64 {
-        self.latency_ms.unwrap_or(f64::MAX)
+    /// Latency rank for `least_latency`: explore first, then exploit.
+    ///
+    /// `latency_ms` is `None` until a key has served a request. Treating that as
+    /// "infinitely slow" means a key is only chosen once every *other* key has a
+    /// measurement -- and since a fast, healthy winner keeps winning, the rest
+    /// are never measured at all. Measured: 30/0/0 across three runs.
+    ///
+    /// Ranking an unmeasured key *first* fixes that. `best_by` rotates among
+    /// equal scores, so the unmeasured keys are visited in turn, each gets a
+    /// measurement, and only then does the fastest one start to dominate --
+    /// which is what someone choosing `least_latency` is asking for, now over a
+    /// pool that has actually been tried.
+    /// Coarse health bucket, so small differences do not defeat tie-breaking.
+    ///
+    /// `0` is a healthy key. A key has to fall a full tier before it loses to
+    /// an idle peer, which is what keeps a pool of healthy keys sharing load
+    /// while still routing around one that is genuinely failing.
+    pub fn health_tier(&self) -> u8 {
+        let health = self.health_score.clamp(0.0, 1.0);
+        if health >= 0.9 {
+            0
+        } else if health >= 0.7 {
+            1
+        } else if health >= 0.5 {
+            2
+        } else if health >= 0.25 {
+            3
+        } else {
+            4
+        }
+    }
+
+    /// Latency band width, in milliseconds.
+    ///
+    /// Keys within one band are treated as equally fast, so load is shared
+    /// between them by capacity instead of all of it going to whichever is
+    /// marginally quicker. Without this, `least_latency` pinned ~93% of traffic
+    /// to one key and spent the rest retrying off exhausted keys.
+    const LATENCY_BAND_MS: f64 = 100.0;
+
+    /// Rank for `least_latency`: explore, then prefer the fastest band that is
+    /// not saturated.
+    ///
+    /// Ordering is deliberate:
+    ///
+    /// 1. an unmeasured key sorts first, so every key is tried before any is
+    ///    judged (treating "unmeasured" as "infinitely slow" starved the pool);
+    /// 2. then the latency band, so a clearly faster key is genuinely preferred;
+    /// 3. then utilisation, so within a band the emptier key wins. This is what
+    ///    stops the fastest key from absorbing every request until its quota is
+    ///    gone and the broker has to rotate off a 429.
+    fn latency_rank(&self) -> (u8, u32, u32) {
+        match self.latency_ms {
+            // 0 sorts before 1: unmeasured keys are explored first.
+            None => (0, 0, 0),
+            Some(latency) => {
+                let band = if latency.is_finite() && latency > 0.0 {
+                    (latency / Self::LATENCY_BAND_MS).floor() as u32
+                } else {
+                    u32::MAX
+                };
+                // Utilisation as a permille, so it orders as an integer and
+                // near-equal values tie exactly (letting `best_by` rotate).
+                let utilisation = (self.utilisation().clamp(0.0, 1.0) * 1000.0) as u32;
+                (1, band, utilisation)
+            }
+        }
     }
 }
 
@@ -173,8 +238,19 @@ pub fn select(
         // first candidate on a tie, which pinned every request to the same key
         // while a fresh pool sits at identical utilisation.
         Strategy::LeastBusy => best_by(candidates, counter, |c| {
-            // Lower is better; health breaks exact ties downward.
-            (c.in_flight as f64) - c.health_score * 1e-9
+            // In-flight first, *lexicographically*, then a coarse health tier.
+            //
+            // The bug this replaces: health was folded into the same number as
+            // in-flight (`in_flight - health * 1e-9`). Health is quantised, so
+            // two idle keys differed by a real amount, `best_by` saw no tie,
+            // rotation never ran, and every request went to the marginally
+            // healthiest key -- measured at 2/25/3 over three runs.
+            //
+            // Tiering rather than scaling is deliberate. A 0.1% health
+            // difference must not send all load to one key: only a genuinely
+            // degraded key should be avoided, and in-flight remains the
+            // dominant signal.
+            (c.in_flight, c.health_tier())
         }),
         Strategy::LeastLatency => best_by(candidates, counter, |c| c.latency_rank()),
         Strategy::UsageBased => best_by(candidates, counter, |c| {
@@ -207,20 +283,79 @@ pub fn select(
 /// A plain minimum would always return the first candidate, which collapses a
 /// pool of equally-idle keys onto one key. Ties are resolved by rotating
 /// through them, so "least busy" also means "evenly spread".
-fn best_by(
+/// A score that can be compared and told apart from a near-equal one.
+///
+/// A single `f64` cannot carry two decisions. `least_latency` needs "has this
+/// key been measured at all?" *and* "how fast was it?", and folding them into
+/// one float is how it came to pin all traffic on one key. A tuple orders
+/// lexicographically, which is exactly the intent.
+pub trait Score: Copy + PartialOrd {
+    /// The largest value, so the comparison starts from the worst possible.
+    fn worst() -> Self;
+    /// Whether two scores are close enough to call a tie.
+    ///
+    /// The tolerance must be *smaller* than the smallest difference the caller
+    /// cares about, or a real difference is treated as a tie and the tie-break
+    /// rotation silently stops working.
+    fn is_tie(self, other: Self) -> bool;
+}
+
+impl Score for f64 {
+    fn worst() -> Self {
+        f64::INFINITY
+    }
+
+    fn is_tie(self, other: Self) -> bool {
+        (self - other).abs() <= 1e-9
+    }
+}
+
+impl Score for (u32, u8) {
+    fn worst() -> Self {
+        (u32::MAX, u8::MAX)
+    }
+
+    fn is_tie(self, other: Self) -> bool {
+        self == other
+    }
+}
+
+impl Score for (u8, u32, u32) {
+    fn worst() -> Self {
+        (u8::MAX, u32::MAX, u32::MAX)
+    }
+
+    fn is_tie(self, other: Self) -> bool {
+        self == other
+    }
+}
+
+impl Score for (u8, f64) {
+    fn worst() -> Self {
+        (u8::MAX, f64::INFINITY)
+    }
+
+    fn is_tie(self, other: Self) -> bool {
+        // The flag is exact; the value uses the float tolerance.
+        self.0 == other.0 && (self.1 - other.1).abs() <= 1e-9
+    }
+}
+
+/// Pick the lowest score, rotating among ties so identical keys share load.
+fn best_by<S: Score>(
     candidates: &[Candidate],
     counter: &RotationCounter,
-    score: impl Fn(&Candidate) -> f64,
+    score: impl Fn(&Candidate) -> S,
 ) -> usize {
-    let mut best = f64::INFINITY;
+    let mut best = S::worst();
     let mut tied: Vec<usize> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let value = score(candidate);
-        if value < best - f64::EPSILON {
+        if value.is_tie(best) {
+            tied.push(candidate.index);
+        } else if value < best {
             best = value;
             tied.clear();
-            tied.push(candidate.index);
-        } else if (value - best).abs() <= f64::EPSILON.max(best.abs() * 1e-9) {
             tied.push(candidate.index);
         }
     }
@@ -352,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn least_latency_ignores_keys_without_measurements_until_they_have_one() {
+    fn least_latency_prefers_the_fastest_once_everything_is_measured() {
         let candidates = vec![
             candidate(0, 0, 1, Some(120.0)),
             candidate(1, 0, 1, Some(45.0)),
@@ -363,8 +498,18 @@ mod tests {
             &RotationCounter::new(),
             0.0,
         );
-        assert_eq!(picked, 1);
+        assert_eq!(picked, 1, "the fastest measured key wins");
+    }
 
+    #[test]
+    fn least_latency_explores_an_unmeasured_key_before_judging_it() {
+        // This test previously asserted the opposite ("an unmeasured key must
+        // not win on latency"), which is what pinned every request to the first
+        // key ever measured: measured at 30/0/0 over three runs.
+        //
+        // A key with no measurement has not been shown to be slow, and choosing
+        // it is the only way to find out. `best_by` rotates among ties, so
+        // several unmeasured keys are visited in turn.
         let unmeasured = vec![candidate(0, 0, 1, Some(120.0)), candidate(1, 0, 1, None)];
         let picked = select(
             Strategy::LeastLatency,
@@ -372,7 +517,46 @@ mod tests {
             &RotationCounter::new(),
             0.0,
         );
-        assert_eq!(picked, 0, "an unmeasured key must not win on latency");
+        assert_eq!(picked, 1, "the unmeasured key should be tried");
+
+        // With two unmeasured keys they alternate, rather than both being
+        // starved behind a measured one.
+        let two_unmeasured = vec![
+            candidate(0, 0, 1, Some(10.0)),
+            candidate(1, 0, 1, None),
+            candidate(2, 0, 1, None),
+        ];
+        let counter = RotationCounter::new();
+        let seen: Vec<usize> = (0..4)
+            .map(|_| select(Strategy::LeastLatency, &two_unmeasured, &counter, 0.0))
+            .collect();
+        assert!(seen.contains(&1) && seen.contains(&2), "saw {seen:?}");
+        assert!(
+            !seen.contains(&0),
+            "the measured key waits its turn: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn least_latency_still_prefers_a_measured_key_over_a_slow_one() {
+        // Exploration must not defeat the purpose: once every key is measured,
+        // the slow ones lose.
+        let candidates = vec![
+            candidate(0, 0, 1, Some(900.0)),
+            candidate(1, 0, 1, Some(20.0)),
+            candidate(2, 0, 1, Some(500.0)),
+        ];
+        for _ in 0..5 {
+            assert_eq!(
+                select(
+                    Strategy::LeastLatency,
+                    &candidates,
+                    &RotationCounter::new(),
+                    0.0
+                ),
+                1
+            );
+        }
     }
 
     #[test]
@@ -406,6 +590,56 @@ mod tests {
             .map(|_| select(Strategy::LeastBusy, &candidates, &counter, 0.0))
             .collect();
         assert_eq!(picked, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn least_busy_spreads_across_idle_keys_with_different_health() {
+        // The measured bug. All three keys are idle, but health is quantised --
+        // one failure in a pool of three moves it by a whole step -- so the
+        // keys do *not* score identically. With health scaled at 1e-9 the term
+        // was ~1e-12, larger than `best_by`'s tolerance, so "equal" keys were
+        // never tied, rotation never ran, and traffic pinned to one key.
+        //
+        // Live measurement before the fix: 2/25/3, 1/26/3, 2/24/4 over three
+        // runs of 30 requests. Now the tie is real and they rotate.
+        let mut candidates = vec![
+            candidate(0, 0, 1, None),
+            candidate(1, 0, 1, None),
+            candidate(2, 0, 1, None),
+        ];
+        candidates[0].health_score = 1.0;
+        candidates[1].health_score = 0.999;
+        candidates[2].health_score = 0.998;
+
+        let counter = RotationCounter::new();
+        let mut counts = [0usize; 3];
+        for _ in 0..30 {
+            let picked = select(Strategy::LeastBusy, &candidates, &counter, 0.0);
+            counts[picked] += 1;
+        }
+        assert_eq!(
+            counts,
+            [10, 10, 10],
+            "a healthy pool must share load regardless of tie-break health"
+        );
+    }
+
+    #[test]
+    fn least_busy_still_avoids_a_genuinely_unhealthy_key() {
+        // Tiering must not blunt the strategy: a degraded key has to lose to an
+        // idle, healthy one.
+        let mut candidates = vec![candidate(0, 0, 1, None), candidate(1, 0, 1, None)];
+        candidates[0].health_score = 0.4; // tier 3
+        candidates[1].health_score = 1.0; // tier 0
+
+        let counter = RotationCounter::new();
+        for _ in 0..6 {
+            assert_eq!(
+                select(Strategy::LeastBusy, &candidates, &counter, 0.0),
+                1,
+                "the degraded key must not receive traffic"
+            );
+        }
     }
 
     #[test]
