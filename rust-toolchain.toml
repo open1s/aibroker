@@ -1,0 +1,14 @@
+[toolchain]
+# Pinned so CI and local development lint with the same compiler.
+#
+# `dtolnay/rust-toolchain@stable` (what CI used to install) floats to whatever
+# is newest, so a Rust release could turn the build red between two pushes with
+# no source change. Rust 1.99 renamed `Atomic::fetch_update` to `try_update`
+# and made the old name deprecated, which is exactly that failure mode: clippy
+# with `-D warnings` began failing on unchanged code.
+#
+# Bumping this version is therefore a deliberate change: update the channel,
+# run `cargo clippy --all-targets -- -D warnings` and `cargo test`, and commit
+# the resulting fixes together.
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

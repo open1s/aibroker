@@ -783,7 +783,7 @@ impl ProxyHttp for ProxyService {
                 .read()
                 .metrics()
                 .requests_in_flight
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                     |value| Some(value.saturating_sub(1)),
