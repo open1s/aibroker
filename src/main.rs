@@ -144,6 +144,10 @@ fn main() {
 }
 
 /// Process-wide count of shutdown signals received.
+///
+/// Unix-only: on other platforms [`install_signal_handlers`] is a no-op, and an
+/// unused static is a hard error under `-D warnings`.
+#[cfg(unix)]
 static SHUTDOWN_SIGNALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Handler for the shutdown signals.
@@ -191,6 +195,8 @@ fn install_signal_handlers() {
     }
 }
 
+/// Non-Unix platforms keep the default disposition, which already terminates
+/// the process on Ctrl+C.
 #[cfg(not(unix))]
 fn install_signal_handlers() {}
 
