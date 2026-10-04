@@ -290,7 +290,11 @@ impl ProxyService {
 
         // Which client, if any.
         let client = match registry.authenticate(token) {
-            ClientDecision::Allowed(client) => Some(client),
+            ClientDecision::Allowed(client) => {
+                ctx.client_name = Some(client.name.clone());
+                ctx.authenticated = true;
+                Some(client)
+            }
             ClientDecision::Open => None,
             ClientDecision::Denied(denied) => {
                 let is_auth = matches!(
@@ -345,7 +349,9 @@ impl ProxyService {
             true,
         );
         match policy.check(&facts) {
-            Ok(decision) if decision.allowed => {}
+            Ok(decision) if decision.allowed => {
+                ctx.policy_reason = Some(decision.reason.clone());
+            }
             Ok(decision) => {
                 metrics
                     .rejected_policy
@@ -488,7 +494,12 @@ impl ProxyService {
         );
 
         if self.settings.access_log {
+            // `client` is part of the audit trail: without it a log line says
+            // which key was spent but not on whose behalf, which is the first
+            // question asked when data ends up somewhere it should not.
             info!(
+                client = ctx.client_name.as_deref().unwrap_or("-"),
+                authenticated = ctx.authenticated,
                 provider = %provider,
                 key = %key_id,
                 model = model.as_deref().unwrap_or("-"),
@@ -497,6 +508,7 @@ impl ProxyService {
                 latency_ms = total_latency.as_millis() as u64,
                 tokens_in = usage.input,
                 tokens_out = usage.output,
+                policy = ctx.policy_reason.as_deref().unwrap_or("-"),
                 "request completed"
             );
         }

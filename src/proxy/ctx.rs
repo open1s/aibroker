@@ -54,6 +54,12 @@ pub struct RequestContext {
     pub client_hold: Option<Arc<ClientAccess>>,
     /// Whether the edge check (authentication + policy) has run.
     pub edge_checked: bool,
+    /// Name of the authenticated client, for the audit trail.
+    pub client_name: Option<String>,
+    /// Why the policy allowed this request, for the audit trail.
+    pub policy_reason: Option<String>,
+    /// Whether the caller passed client authentication.
+    pub authenticated: bool,
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -93,6 +99,9 @@ impl Default for RequestContext {
             dump: None,
             client_hold: None,
             edge_checked: false,
+            client_name: None,
+            policy_reason: None,
+            authenticated: false,
         }
     }
 }

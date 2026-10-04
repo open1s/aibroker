@@ -88,6 +88,32 @@ pub fn render(runtime: &SharedRuntime, admin_path: &str) -> String {
         "config_path": runtime.config_path().map(|p| p.display().to_string()),
         "models": config.known_models(),
         "admin_path": admin_path,
+        "security": {
+            "client_auth_required": runtime.requires_client_auth(),
+            // The exact sentence the page shows when the proxy is open. Kept
+            // in the payload rather than only in the template so a test can
+            // assert the state without pattern-matching JavaScript source.
+            "open_warning": if runtime.requires_client_auth() {
+                None
+            } else {
+                Some(
+                    "No client authentication: any process that can reach this port can spend \
+                     your keys. Define [[clients]] to require a token.",
+                )
+            },
+            "clients": runtime.clients().statuses(),
+            "denials": runtime
+                .clients()
+                .denials()
+                .into_iter()
+                .map(|(reason, count)| (reason.as_str().to_string(), count))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            "policy_source": match runtime.policy().source() {
+                crate::core::policy::PolicySource::Default => "default",
+                crate::core::policy::PolicySource::Rego => "rego",
+            },
+            "policy_from": runtime.policy().description(),
+        },
     });
 
     // `serde_json` does *not* escape `/`, so a `</script>` inside a config
@@ -190,6 +216,66 @@ mod tests {
         assert!(
             !html.contains("sk-test"),
             "the dashboard must not leak a credential"
+        );
+    }
+
+    #[test]
+    fn dashboard_shows_the_security_plane_without_tokens() {
+        let runtime = runtime();
+        {
+            let mut runtime = runtime.write();
+            runtime
+                .apply(|config| {
+                    config.clients.push(crate::config::ClientConfig {
+                        name: "laptop".into(),
+                        token: "dashboard-secret-token".into(),
+                        enabled: true,
+                        allowed_models: vec!["gpt-*".into()],
+                        allowed_providers: vec![],
+                        max_rpm: Some(30),
+                        max_tpm: None,
+                        max_concurrency: None,
+                    });
+                })
+                .expect("apply");
+        }
+
+        let html = render(&runtime, "/admin");
+        // The client and its scope are visible...
+        assert!(html.contains("laptop"), "client should be listed");
+        assert!(html.contains("gpt-*"), "scope should be visible");
+        assert!(
+            html.contains("Who may send what"),
+            "the section heading should be present"
+        );
+        // ...but no token, and not the tell-tale "open proxy" warning.
+        assert!(
+            !html.contains("dashboard-secret-token"),
+            "the dashboard must never embed a client token"
+        );
+        // The warning is a payload *value*, so this cannot accidentally match
+        // the template's JavaScript source.
+        // The payload is compact, so there is no space after the colon.
+        assert!(
+            html.contains("\"open_warning\":null"),
+            "the open-proxy warning must be cleared when clients are configured"
+        );
+    }
+
+    #[test]
+    fn dashboard_warns_when_the_proxy_is_open() {
+        let html = render(&runtime(), "/admin");
+        assert!(
+            html.contains("\"client_auth_required\":false"),
+            "the payload should report an open proxy"
+        );
+        assert!(
+            html.contains("No client authentication"),
+            "the payload should carry the warning the page renders"
+        );
+        assert!(
+            !html.contains("\"open_warning\":null"),
+            "an open proxy must not clear the warning"
         );
     }
 

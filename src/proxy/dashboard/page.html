@@ -103,6 +103,44 @@ html += `<tr><th>Models</th><td>${d.models.length ? d.models.map((m) => '<code>'
 html += `<tr><th>Routes</th><td>${d.routes.length ? d.routes.map((r) => '<code>' + esc(r.pattern) + '</code> → ' + esc(r.providers.join(', '))).join('<br>') : '<span class="muted">none</span>'}</td></tr>`;
 html += '</tbody></table>';
 
+html += '<h2>Who may send what</h2>';
+const sec = d.security || {};
+const clients = sec.clients || [];
+// The two states are exclusive: a closed proxy lists its clients, an open one
+// says so. The wording lives here once, but `security.open_warning` in the
+// payload is what the renderer and its tests agree on.
+if (sec.client_auth_required === true) {
+  const denialRows = Object.entries(sec.denials || {});
+  html += '<div class="cards">';
+  html += card('Clients', num(clients.length), 'ok');
+  html += card('Egress policy', sec.policy_source === 'rego' ? 'Rego' : 'built-in default', 'ok');
+  html += card('Refused', num(denialRows.reduce((a, [, n]) => a + n, 0)), denialRows.length ? 'warn' : '');
+  html += '</div>';
+  if (denialRows.length) {
+    html += '<p class="muted">Refused by reason: ' +
+      denialRows.map(([r, n]) => `<code>${esc(r)}</code> ${num(n)}`).join(' · ') + '</p>';
+  }
+} else {
+  html += `<p class="warn">${esc(sec.open_warning)}</p>`;
+}
+if (sec.policy_from) {
+  html += `<p class="muted">Policy loaded from <code>${esc(sec.policy_from)}</code>.</p>`;
+}
+if (sec.client_auth_required === true && clients.length) {
+  html += '<table><thead><tr><th>Client</th><th>Models</th><th>Providers</th><th class="num">RPM</th><th class="num">TPM</th><th class="num">In flight</th><th class="num">Admitted</th><th class="num">Refused</th></tr></thead><tbody>';
+  html += clients.map((c) => `<tr class="${c.enabled ? '' : 'off'}">
+    <td>${esc(c.name)}${c.enabled ? '' : ' <span class="pill off">disabled</span>'}</td>
+    <td>${(c.allowed_models || []).length ? c.allowed_models.map((m) => '<code>' + esc(m) + '</code>').join(' ') : '<span class="muted">any</span>'}</td>
+    <td>${(c.allowed_providers || []).length ? c.allowed_providers.map((p) => '<code>' + esc(p) + '</code>').join(' ') : '<span class="muted">any</span>'}</td>
+    <td class="num">${c.max_rpm ? num(c.rpm) + ' / ' + num(c.max_rpm) : num(c.rpm)}</td>
+    <td class="num">${c.max_tpm ? num(c.tpm) + ' / ' + num(c.max_tpm) : num(c.tpm)}</td>
+    <td class="num">${c.max_concurrency ? num(c.in_flight) + ' / ' + num(c.max_concurrency) : num(c.in_flight)}</td>
+    <td class="num">${num(c.admitted)}</td>
+    <td class="num">${c.denied ? '<span class="warn">' + num(c.denied) + '</span>' : '0'}</td>
+  </tr>`).join('');
+  html += '</tbody></table>';
+}
+
 html += '<h2>Providers</h2><table><thead><tr><th>Name</th><th>Endpoint</th><th>Auth</th><th>Strategy</th><th class="num">Keys</th><th class="num">Available</th><th class="num">In flight</th></tr></thead><tbody>';
 html += d.providers.map((p) => `<tr><td>${esc(p.name)}</td><td><code>${esc(p.base_url)}</code></td><td>${esc(p.auth)}</td><td>${esc(p.strategy)}</td><td class="num">${num(p.keys)}</td><td class="num">${num(p.available)}</td><td class="num">${num(p.in_flight)}</td></tr>`).join('');
 html += '</tbody></table>';
