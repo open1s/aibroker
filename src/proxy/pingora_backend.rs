@@ -348,6 +348,10 @@ impl ProxyService {
             None,
             true,
         );
+        // Reset first: `upstream_peer` runs again for every retry, so a stale
+        // reason from an earlier attempt would otherwise be reported against the
+        // attempt that succeeded.
+        ctx.policy_reason = None;
         match policy.check(&facts) {
             Ok(decision) if decision.allowed => {
                 ctx.policy_reason = Some(decision.reason.clone());
@@ -358,6 +362,7 @@ impl ProxyService {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 metrics.record_denial(&decision.reason);
                 registry.record_edge_denial(DenyReason::ModelForbidden, client.as_deref());
+                ctx.policy_reason = Some(decision.reason.clone());
                 warn!(
                     model = ctx.model.as_deref().unwrap_or("-"),
                     reason = %decision.reason,
@@ -437,6 +442,9 @@ impl ProxyService {
             .await?;
         session.write_response_body(Some(body.into()), true).await?;
         ctx.settled = true;
+        // Record the status, or the audit line and the metrics report zero for
+        // a refused request and cannot say how it was refused.
+        ctx.upstream_status = Some(status);
         Ok(())
     }
 
@@ -508,7 +516,7 @@ impl ProxyService {
                 latency_ms = total_latency.as_millis() as u64,
                 tokens_in = usage.input,
                 tokens_out = usage.output,
-                policy = ctx.policy_reason.as_deref().unwrap_or("-"),
+                reason = ctx.policy_reason.as_deref().unwrap_or("-"),
                 "request completed"
             );
         }

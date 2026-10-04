@@ -390,8 +390,21 @@ pub fn build_facts<'a>(
     }
 }
 
-/// Explain a denial when the policy does not.
-fn derive_reason(facts: &RequestFacts<'_>, _allowed: bool) -> &'static str {
+/// Explain a decision when the policy does not.
+///
+/// The two directions are separate on purpose. This used to describe only why a
+/// request was *refused*, and was then also used for the allowed case, so a
+/// successful request was audited with `reason="denied_by_policy"` -- a log line
+/// that contradicted its own status code.
+fn derive_reason(facts: &RequestFacts<'_>, allowed: bool) -> &'static str {
+    if allowed {
+        return if facts.client.name.is_some() {
+            "client_admitted"
+        } else {
+            "open_proxy"
+        };
+    }
+
     if !facts.budget.allowed {
         return "client_budget_exhausted";
     }
@@ -400,6 +413,15 @@ fn derive_reason(facts: &RequestFacts<'_>, _allowed: bool) -> &'static str {
     }
     if facts.client.name.is_some() && !facts.client.enabled {
         return "client_disabled";
+    }
+    // The allow-list verdicts name the actual rule that failed. Without these
+    // a refusal for a model read `denied_by_policy`, which tells an operator
+    // nothing about what to change.
+    if !facts.client.model_allowed {
+        return "model_forbidden";
+    }
+    if !facts.client.provider_allowed {
+        return "provider_forbidden";
     }
     if facts.request.model.is_none() && !facts.client.allowed_models.is_empty() {
         return "model_unknown";
@@ -593,7 +615,8 @@ mod tests {
         );
         let decision = policy.check(&facts).unwrap();
         assert!(decision.is_denied());
-        assert_eq!(decision.reason, "denied_by_policy");
+        // The reason names the rule that failed, not a generic denial.
+        assert_eq!(decision.reason, "model_forbidden");
     }
 
     #[test]
@@ -896,6 +919,45 @@ reason := "streaming is not permitted" if input.request.stream
         let decision = policy.check(&refused).unwrap();
         assert!(decision.is_denied());
         assert_eq!(decision.reason, "this client may not use that model");
+    }
+
+    #[test]
+    fn an_allowed_decision_is_never_described_as_a_denial() {
+        // Regression: the audit reason for a 200 read `denied_by_policy`,
+        // contradicting the status it was logged beside.
+        let policy = PolicyEngine::builtin().unwrap();
+        let empty: Vec<String> = Vec::new();
+        let providers = strings(&["openai"]);
+
+        let open = facts(
+            None,
+            true,
+            &empty,
+            &empty,
+            Some("m"),
+            &providers,
+            false,
+            true,
+        );
+        let decision = policy.check(&open).unwrap();
+        assert!(decision.allowed);
+        assert_eq!(decision.reason, "open_proxy");
+
+        let models = strings(&["gpt-*"]);
+        let admitted = facts(
+            Some("laptop"),
+            true,
+            &models,
+            &providers,
+            Some("gpt-4o"),
+            &providers,
+            true,
+            true,
+        );
+        let decision = policy.check(&admitted).unwrap();
+        assert!(decision.allowed);
+        assert_eq!(decision.reason, "client_admitted");
+        assert!(!decision.reason.contains("denied"), "{}", decision.reason);
     }
 
     #[test]
