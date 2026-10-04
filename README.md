@@ -349,6 +349,14 @@ Two defects this measurement exposed, both since fixed:
   tie-breaking never ran, and traffic pinned to the marginally healthiest key —
   **2 / 25 / 3** every run.
 
+Two safety features deserve a note before you rely on them: **start the content
+guard in `report` mode** and watch it against real traffic before letting it
+refuse anything, and **keep the guard patterns and the `[dump] redact` list in
+step** — they are independent lists, and a shape that is detected but not
+redacted still lands in the log. [SECURITY.md](SECURITY.md) states the threat
+model, what is explicitly *not* protected, and the commands to re-verify every
+claim after a change.
+
 ## Who may use it, and what may leave
 
 Balancing decides *which* key serves a request. Two more layers decide whether

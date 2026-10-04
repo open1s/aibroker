@@ -140,6 +140,12 @@ not, add the test.
 
 ## Data security (what may leave the machine)
 
+`SECURITY.md` is the operator-facing counterpart to this section: the threat
+model, what is *not* protected (a compromised user account, prompt content the
+patterns do not cover), and the commands to re-verify each claim. Keep it true —
+its commands were run against a live broker, and one of them (the cooldown check)
+was what surfaced the lifetime-counter bug.
+
 Balancing picks the key; `core/security.rs` and `core/policy.rs` decide whether
 the request may be forwarded at all. Enforcement happens once per request in
 `upstream_peer`, *before* the body streams, so disallowed content is never
