@@ -1,16 +1,118 @@
 # LLM Broker
 
-A local LLM proxy that spreads traffic across a pool of API keys, rotates onto
-another key the moment one is rate limited, and exposes the pool for runtime
-management.
+[![CI](https://github.com/open1s/aibroker/actions/workflows/ci.yml/badge.svg)](https://github.com/open1s/aibroker/actions/workflows/ci.yml)
+[![Release](https://github.com/open1s/aibroker/actions/workflows/release.yml/badge.svg)](https://github.com/open1s/aibroker/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**Point every client at one local URL and let a pool of API keys absorb the
+rate limits.**
+
+A local proxy for LLM APIs that spreads traffic across many keys, and when one
+of them hits a `429`, replays the *same request* on another key before your
+client ever notices. Drop-in for anything that speaks the OpenAI API — coding
+agents, scripts, notebooks, your own services.
 
 ```
-client ──▶ LLM Broker ──┬──▶ provider A ──▶ key pool
-                        ├──▶ provider B ──▶ key pool
-                        └──▶ provider C ──▶ key pool
-                              ▲
-                     /metrics · /admin
+      your client / agent
+              │  one base URL, one key that never rotates
+              ▼
+        ┌─────────────┐
+        │ LLM Broker  │   routing · retries · health · metrics
+        └──────┬──────┘
+               │
+   ┌───────────┼───────────┬───────────┐
+   ▼           ▼           ▼           ▼
+provider A  provider B  provider C   …    each with a pool of keys
+   │           │           │
+ key key     key key     key key         rate limited? parked and skipped
 ```
+
+## Why this exists
+
+If you run an agent or a batch job against a metered LLM API, you have probably
+hit one of these:
+
+- an evening of work stops because one key hit its rate limit;
+- you keep several keys around, and switching between them is a manual edit;
+- a provider starts returning errors and you only notice when the run dies;
+- you cannot answer "which key is actually being used, and how close is it to
+  its quota?"
+
+Doing this by hand — retry loops, key juggling, watching dashboards — is
+exactly the job a proxy should do. LLM Broker is that proxy, and nothing else:
+one binary, one config file, no database, no control plane to run.
+
+**Why not a hosted gateway?** Your prompts are your code. This runs on your
+machine, keys never leave your host, and it keeps working when your network to
+a SaaS control plane does not. Everything is one small Rust binary.
+
+## Who it is for
+
+- **Coding-agent users** (Codex CLI, Claude Code, Cline, Aider, Continue, …)
+  who have several keys and want the tool to just keep going. Point the tool's
+  base URL at the broker; the agent keeps its own key, which the broker ignores
+  and replaces.
+- **Anyone running batches or evaluations** that must survive a rate limit
+  rather than die on it.
+- **Teams with per-developer or per-team keys**, who want quotas visible and
+  manageable without handing keys around by chat.
+
+## Get started in a minute
+
+```bash
+# 1. Build (or grab a binary from Releases)
+cargo build --release
+
+# 2. Describe your keys
+cp config.example.toml config.toml   # annotated, every option explained
+$EDITOR config.toml                  # add keys as env:NAME references
+
+# 3. Check it, then run it
+./target/release/aibroker --config config.toml --check
+./target/release/aibroker --config config.toml
+```
+
+Now point any OpenAI-compatible client at it:
+
+```bash
+curl http://127.0.0.1:11436/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+```
+
+The `Authorization` header from the client is ignored — the broker always
+substitutes a key from its own pool. That is what lets an existing tool work
+unchanged: no code, no SDK, no wrapper script.
+
+Then watch it work:
+
+- <http://127.0.0.1:11436/admin> — read-only dashboard (key health, cooldowns,
+  RPM/TPM against limits, token counters, routing table);
+- <http://127.0.0.1:11436/metrics> — Prometheus;
+- `--dump-request --dump-response` — the full exchange, one line per event,
+  credentials redacted, which is how you debug an integration;
+- `aibroker --check-admin http://127.0.0.1:11436/admin/status` — the same from a
+  shell.
+
+## Is it production-ready?
+
+It is a local tool, and it is honest about that: no clustering, no shared state
+between instances, config in one TOML file. What it does have is tests — 183 of
+them, including end-to-end tests that prove a `429` really does rotate onto
+another key with the body replayed — a pinned toolchain, and a clean
+`clippy -D warnings` build on Linux, macOS and Windows. Every release ships
+prebuilt binaries for five targets.
+
+## Comparison
+
+|  | LLM Broker | by hand / wrapper script | hosted gateway |
+|---|---|---|---|
+| Key rotation on `429` | inside the request | your retry code | usually |
+| Prompts leave your machine | **no** | no | yes |
+| Setup | one binary + TOML | code you maintain | account + config |
+| Works offline / air-gapped | **yes** | yes | no |
+| Per-key quotas and metrics | built in | build it | built in |
+| Multi-tenant, billing, SSO | not a goal | no | yes |
 
 ## What it does
 
@@ -32,30 +134,6 @@ client ──▶ LLM Broker ──┬──▶ provider A ──▶ key pool
   the admin API, persisted back to the config file, with no restart.
 - **Observability.** Prometheus `/metrics`, per-key and per-model counters, and
   optional structured access logs.
-
-## Quick start
-
-```bash
-cargo build --release
-
-# Start from the annotated example.
-cp config.example.toml config.toml
-$EDITOR config.toml
-
-./target/release/aibroker --config config.toml --check   # validate first
-./target/release/aibroker --config config.toml
-```
-
-Point any OpenAI-compatible client at `http://127.0.0.1:11436`:
-
-```bash
-curl http://127.0.0.1:11436/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
-```
-
-The `Authorization` header from the client is ignored: the broker always
-replaces it with a credential from its own pool.
 
 ## CLI
 
@@ -343,9 +421,12 @@ cargo build --release --offline
 # 55 checks: rotation, retry budget, exhaustion, streaming, metrics, admin API
 python3 tests/manual/run_feature_tests.py --profile mock
 
-# 18 checks against a real provider configured in test-real-config.toml:
-# a genuine completion, token accounting, round-robin and 410 fail-fast
+# 18 checks against a real provider. Copy config.example.toml to
+# test-real-config.toml (gitignored: it holds live keys), point it at a
+# provider, then either let the harness start a broker or --port attach to one
+# you already have running.
 python3 tests/manual/run_feature_tests.py --profile real
+python3 tests/manual/run_feature_tests.py --profile real --port 11436 --admin-token "$TOKEN"
 ```
 
 The mock profile starts `tests/manual/mock_upstream.py`, a scripted upstream
