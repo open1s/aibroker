@@ -83,6 +83,8 @@ src/
   proxy/
     pingora_backend.rs     ProxyHttp adapter: routing, retry, in-process admin/metrics
     admin.rs               Control-plane routing + authentication (transport-free)
+    dashboard.rs           Read-only status page served at the admin mount point
+    dashboard/page.html    The page template (static asset, embedded via include_str!)
     control.rs             Control-plane listener for `admin.mode = "separate"`
     body.rs                Model and `usage` extraction from bodies
 tests/proxy_integration.rs Real proxy + mock upstream over TCP

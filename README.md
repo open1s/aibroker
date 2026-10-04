@@ -169,6 +169,43 @@ The control plane can add credentials, so it **fails closed**: with no
 `admin.allow_insecure` is set explicitly. Send the token as
 `Authorization: Bearer <token>` or `X-Admin-Token`.
 
+### Viewing it
+
+Three ways in, depending on what you want:
+
+**Browser dashboard** — `GET /admin` (or `/` on a `mode = "separate"`
+listener) renders a read-only page: available keys, per-key health, cooldown,
+latency, RPM/TPM against their limits, token counters, the routing table and
+the live strategy. It makes no external requests and holds no state of its own,
+so it is safe on an air-gapped host. Everything that *changes* state stays on
+the JSON API below, where the request is explicit.
+
+```bash
+# Path mode: browse http://127.0.0.1:11436/admin
+# Separate mode: browse http://127.0.0.1:11437/
+curl -H 'Authorization: Bearer <token>' http://127.0.0.1:11436/admin | less
+```
+
+**CLI** — the binary can query a running broker directly, which is handy over
+SSH or in a script:
+
+```bash
+aibroker --check-admin http://127.0.0.1:11436/admin/status \
+  --admin-token "$LLM_BROKER_ADMIN_TOKEN"
+aibroker --check-admin http://127.0.0.1:11436/admin/keys      # per-key state
+aibroker --check-admin http://127.0.0.1:11436/metrics         # Prometheus text
+```
+
+The token may also come from `LLM_BROKER_ADMIN_TOKEN`.
+
+**Raw JSON** — every route below, with `curl` and `jq`:
+
+```bash
+TOKEN=...; BASE=http://127.0.0.1:11436/admin
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/status" | jq .
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/keys"   | jq '.providers'
+```
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/admin/health` | Liveness |

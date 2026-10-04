@@ -232,6 +232,8 @@ impl AdminRouter {
         let method = request.method.to_ascii_uppercase();
 
         match (method.as_str(), segments.as_slice()) {
+            // A human-friendly view of everything below. Read-only.
+            ("GET", []) => self.dashboard(),
             ("GET", ["health"]) => self.health(),
             ("GET", ["status"]) => self.status(),
             ("GET", ["config"]) => self.config(),
@@ -250,6 +252,14 @@ impl AdminRouter {
             ("GET", ["metrics"]) => self.metrics(),
             _ => AdminResponse::error(404, format!("no admin route for `{path}`")),
         }
+    }
+
+    /// The read-only status page.
+    fn dashboard(&self) -> AdminResponse {
+        let runtime = self.runtime.read();
+        let admin_path = runtime.config().admin.path.clone();
+        let html = crate::proxy::dashboard::render(&self.runtime, &admin_path);
+        AdminResponse::text(200, "text/html; charset=utf-8", html)
     }
 
     fn health(&self) -> AdminResponse {
@@ -300,6 +310,7 @@ impl AdminRouter {
                 "keys_total": total_keys,
                 "keys_healthy": healthy_keys,
                 "strategy": runtime.strategy().as_str(),
+                "dashboard": runtime.config().admin.path,
                 "config_path": runtime.config_path().map(|p| p.display().to_string()),
             }),
         )

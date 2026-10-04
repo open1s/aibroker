@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>LLM Broker</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; opacity: .6; margin: 28px 0 8px; }
+  .sub { opacity: .6; margin-bottom: 20px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .card { border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; padding: 10px 12px; }
+  .card .label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; }
+  .card .value { font-size: 20px; font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); white-space: nowrap; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; font-weight: 600; }
+  td.num, th.num { text-align: right; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 12px; border: 1px solid currentColor; }
+  .ok { color: #0a7d33; }
+  .warn { color: #9a6700; }
+  .bad { color: #c1272d; }
+  .off { opacity: .5; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .muted { opacity: .55; }
+</style>
+</head>
+<body data-admin-path="@ADMIN_PATH@">
+<h1>LLM Broker</h1>
+<div class="sub">Read-only view. State changes go through the JSON admin API.</div>
+<div id="app">Loading…</div>
+<noscript><p class="muted">JavaScript is disabled: the JSON endpoints below still work.</p></noscript>
+<h2>JSON API</h2>
+<table><tbody>
+<tr><th><code>@ADMIN_PATH@/status</code></th><td class="muted">GET &mdash; providers, key counts, in-flight, strategy</td></tr>
+<tr><th><code>@ADMIN_PATH@/keys</code></th><td class="muted">GET &mdash; per-key state, never the secret</td></tr>
+<tr><th><code>@ADMIN_PATH@/models</code></th><td class="muted">GET &mdash; models the config declares</td></tr>
+<tr><th><code>@ADMIN_PATH@/routes</code></th><td class="muted">GET &mdash; the compiled routing table</td></tr>
+<tr><th><code>@ADMIN_PATH@/config</code></th><td class="muted">GET &mdash; the on-disk document (contains secrets)</td></tr>
+<tr><th><code>@ADMIN_PATH@/config/strategy</code></th><td class="muted">GET, PUT &mdash; read or change the selection strategy</td></tr>
+<tr><th><code>@ADMIN_PATH@/metrics</code></th><td class="muted">GET &mdash; Prometheus text</td></tr>
+<tr><th><code>metrics</code> (proxy port)</th><td class="muted">GET <code>/metrics</code></td></tr>
+</tbody></table>
+<p class="muted">Mutating routes (add/patch/delete/enable/disable/reset a key,
+<code>config/reload</code>) are documented in the README and require the same
+token.</p>
+<script id="data" type="application/json">@PAYLOAD@</script>
+<script>
+const d = JSON.parse(document.getElementById('data').textContent);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = (n) => (n === null || n === undefined) ? '—' : Number(n).toLocaleString();
+const secs = (s) => s === null || s === undefined ? '—' : (s >= 60 ? Math.round(s/60) + 'm' : s + 's');
+
+function card(label, value, cls) {
+  return `<div class="card"><div class="label">${esc(label)}</div>` +
+         `<div class="value ${cls || ''}">${esc(value)}</div></div>`;
+}
+
+function keyRow(k) {
+  const cooling = k.cooldown_secs !== null && k.cooldown_secs !== undefined;
+  let state = cooling ? 'cooling ' + secs(k.cooldown_secs) : k.state;
+  let cls = !k.enabled || cooling ? 'off' : (k.state === 'closed' ? 'ok' : 'warn');
+  const rpm = k.max_rpm ? `${num(k.rpm)} / ${num(k.max_rpm)}` : num(k.rpm);
+  const tpm = k.max_tpm ? `${num(k.tpm)} / ${num(k.max_tpm)}` : num(k.tpm);
+  return `<tr class="${!k.enabled ? 'off' : ''}">
+    <td>${esc(k.provider)}</td>
+    <td><code>${esc(k.id)}</code></td>
+    <td><span class="pill ${cls}">${esc(k.enabled ? state : 'disabled')}</span></td>
+    <td class="num">${(k.health * 100).toFixed(0)}%</td>
+    <td class="num">${k.latency_ms === null ? '—' : Math.round(k.latency_ms) + 'ms'}</td>
+    <td class="num">${num(k.in_flight)}</td>
+    <td class="num">${rpm}</td>
+    <td class="num">${tpm}</td>
+    <td class="num">${num(k.successes)} / ${num(k.failures)}</td>
+    <td class="num">${k.rate_limited ? '<span class="warn">' + num(k.rate_limited) + '</span>' : '0'}</td>
+    <td class="num">${num(k.tokens_in)} / ${num(k.tokens_out)}</td>
+  </tr>`;
+}
+
+const healthy = d.keys.filter((k) => k.enabled && (k.cooldown_secs === null || k.cooldown_secs === undefined)).length;
+let html = '';
+html += '<h2>Overview</h2><div class="cards">';
+html += card('Keys available', healthy + ' / ' + d.keys_total, healthy === 0 ? 'bad' : 'ok');
+html += card('In flight', num(d.requests_in_flight));
+html += card('Requests', num(d.requests_total));
+html += card('Key rotations', num(d.rotations));
+html += card('Upstream failures', num(d.failures), d.failures ? 'warn' : '');
+html += card('Pool exhausted', num(d.exhausted), d.exhausted ? 'warn' : '');
+html += card('Tokens in', num(d.tokens_in));
+html += card('Tokens out', num(d.tokens_out));
+html += card('Uptime', Math.floor(d.uptime_seconds / 60) + 'm');
+html += '</div>';
+
+html += '<h2>Configuration</h2>';
+html += '<table><tbody>';
+html += `<tr><th>Strategy</th><td><code>${esc(d.strategy)}</code>${d.fallbacks.length ? ' → ' + d.fallbacks.map(esc).join(' → ') : ''}</td></tr>`;
+html += `<tr><th>Config file</th><td><code>${esc(d.config_path || '(none — admin API only)')}</code></td></tr>`;
+html += `<tr><th>Models</th><td>${d.models.length ? d.models.map((m) => '<code>' + esc(m) + '</code>').join(' ') : '<span class="muted">none declared</span>'}</td></tr>`;
+html += `<tr><th>Routes</th><td>${d.routes.length ? d.routes.map((r) => '<code>' + esc(r.pattern) + '</code> → ' + esc(r.providers.join(', '))).join('<br>') : '<span class="muted">none</span>'}</td></tr>`;
+html += '</tbody></table>';
+
+html += '<h2>Providers</h2><table><thead><tr><th>Name</th><th>Endpoint</th><th>Auth</th><th>Strategy</th><th class="num">Keys</th><th class="num">Available</th><th class="num">In flight</th></tr></thead><tbody>';
+html += d.providers.map((p) => `<tr><td>${esc(p.name)}</td><td><code>${esc(p.base_url)}</code></td><td>${esc(p.auth)}</td><td>${esc(p.strategy)}</td><td class="num">${num(p.keys)}</td><td class="num">${num(p.available)}</td><td class="num">${num(p.in_flight)}</td></tr>`).join('');
+html += '</tbody></table>';
+
+html += '<h2>Keys</h2><table><thead><tr><th>Provider</th><th>Key</th><th>State</th><th class="num">Health</th><th class="num">Latency</th><th class="num">In flight</th><th class="num">RPM</th><th class="num">TPM</th><th class="num">OK / Fail</th><th class="num">429s</th><th class="num">Tokens in / out</th></tr></thead><tbody>';
+html += d.keys.map(keyRow).join('');
+html += '</tbody></table>';
+
+document.getElementById('app').outerHTML = html;
+</script>
+</body>
+</html>

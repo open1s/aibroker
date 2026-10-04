@@ -129,7 +129,8 @@ fn is_known_route(path: &str) -> bool {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     matches!(
         segments.as_slice(),
-        ["health"]
+        // `GET /` on the admin listener is the dashboard.
+        [] | ["health"]
             | ["status"]
             | ["config"]
             | ["config", "reload"]
@@ -173,7 +174,6 @@ mod tests {
     #[test]
     fn unknown_routes_are_rejected_early() {
         for path in [
-            "",
             "nope",
             "keys/openai",
             "keys/openai/k1/delete",
@@ -181,6 +181,12 @@ mod tests {
         ] {
             assert!(!is_known_route(path), "`{path}` should not be known");
         }
+    }
+
+    #[test]
+    fn the_root_serves_the_dashboard() {
+        assert!(is_known_route(""));
+        assert!(is_known_route("/"));
     }
 
     #[test]
