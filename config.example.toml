@@ -278,3 +278,21 @@ enabled = true
 # allow if input.request.estimated_tokens <= 4000
 # reason := "prompts over 4000 tokens are not permitted" if input.request.estimated_tokens > 4000
 # """
+
+# ---------------------------------------------------------------------------
+# Shadow (dry-run) policy
+# ---------------------------------------------------------------------------
+# A candidate policy evaluated against live traffic but never enforced. Use it
+# to find out what a policy would do before letting it block anything: write the
+# new rules here, watch llm_broker_shadow_policy_blocks_total and the
+# "shadow policy would have refused" log lines, then move them into `inline` or
+# `files` once the numbers look right.
+#
+# dry_run = "candidate.rego"
+# dry_run_inline = """
+# package llm.authz
+# import rego.v1
+# default allow := false
+# allow if input.request.estimated_tokens <= 4000
+# reason := "prompts over 4000 tokens would be refused" if input.request.estimated_tokens > 4000
+# """

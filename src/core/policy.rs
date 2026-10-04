@@ -271,6 +271,52 @@ impl PolicyEngine {
         })
     }
 
+    /// Compile a **shadow** policy: evaluated on live traffic, never enforced.
+    ///
+    /// `None` when nothing is configured, so the caller has nothing to skip.
+    pub fn from_dry_run(config: &PolicyConfig) -> Result<Option<Self>> {
+        let from_file = config.dry_run.as_deref().filter(|p| !p.trim().is_empty());
+        let from_inline = config
+            .dry_run_inline
+            .as_deref()
+            .filter(|p| !p.trim().is_empty());
+        if from_file.is_none() && from_inline.is_none() {
+            return Ok(None);
+        }
+
+        let mut engine = Engine::new();
+        let mut sources = Vec::new();
+        if let Some(path) = from_file {
+            let source = std::fs::read_to_string(path).map_err(|e| {
+                LlmBrokerError::InvalidConfig(format!(
+                    "cannot read shadow policy file `{path}`: {e}"
+                ))
+            })?;
+            engine
+                .add_policy(path.to_string(), source)
+                .map_err(|e| policy_error(path, &e))?;
+            sources.push(path.to_string());
+        }
+        if let Some(source) = from_inline {
+            let name = format!("{}.shadow", config.inline_name);
+            engine
+                .add_policy(name.clone(), source.to_string())
+                .map_err(|e| policy_error(&name, &e))?;
+            sources.push(name);
+        }
+        // Compile now: a shadow policy with a syntax error is a configuration
+        // mistake, and finding it at startup is the point.
+        engine
+            .eval_bool_query(DECISION_QUERY.to_string(), false)
+            .map_err(|e| policy_error(&sources.join(", "), &e))?;
+
+        Ok(Some(Self {
+            engine: Mutex::new(engine),
+            source: PolicySource::Rego,
+            description: sources.join(", "),
+        }))
+    }
+
     /// Load and compile a policy from a file, for tests and tooling.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_string_lossy().to_string();

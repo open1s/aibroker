@@ -281,11 +281,12 @@ impl ProxyService {
         session: &mut Session,
         ctx: &mut RequestContext,
     ) -> pingora::Result<()> {
-        let (registry, policy, providers, metrics, requires_auth) = {
+        let (registry, policy, shadow, providers, metrics, requires_auth) = {
             let runtime = self.runtime.read();
             (
                 Arc::clone(runtime.clients()),
                 Arc::clone(runtime.policy()),
+                runtime.shadow_policy().map(Arc::clone),
                 runtime.broker().route_candidates(ctx.model.as_deref()),
                 Arc::clone(runtime.metrics()),
                 runtime.requires_client_auth(),
@@ -411,6 +412,37 @@ impl ProxyService {
                         Some("policy evaluation failed"),
                     )
                     .await;
+            }
+        }
+
+        // A shadow policy is evaluated on the same facts and its verdict is
+        // recorded, but it never changes the outcome. This is how a candidate
+        // policy is tried against real traffic before it is allowed to block
+        // anything: the count of would-be denials is the evidence for or
+        // against switching it on.
+        if let Some(shadow) = shadow.as_ref() {
+            match shadow.check(&facts) {
+                Ok(decision) if decision.is_denied() => {
+                    metrics
+                        .shadow_policy_blocks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(
+                        target: "llm_broker::policy",
+                        model = ctx.model.as_deref().unwrap_or("-"),
+                        client = facts.client.name.unwrap_or("-"),
+                        reason = %decision.reason,
+                        "shadow policy would have refused this request"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // A shadow policy is not in the decision path, so failing to
+                    // evaluate it must not fail the request.
+                    warn!(
+                        target: "llm_broker::policy",
+                        "shadow policy evaluation failed: {error}"
+                    );
+                }
             }
         }
 

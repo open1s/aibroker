@@ -32,6 +32,8 @@ pub struct Runtime {
     clients: Arc<ClientRegistry>,
     /// Egress policy, evaluated per request.
     policy: Arc<PolicyEngine>,
+    /// Candidate policy evaluated on live traffic but never enforced.
+    shadow_policy: Option<Arc<PolicyEngine>>,
     config_path: Option<PathBuf>,
 }
 
@@ -45,12 +47,14 @@ impl Runtime {
         let broker = Broker::from_config(&config)?;
         let clients = Arc::new(ClientRegistry::from_config(&config.clients)?);
         let policy = Arc::new(PolicyEngine::from_config(&config.policy)?);
+        let shadow_policy = PolicyEngine::from_dry_run(&config.policy)?.map(Arc::new);
         Ok(Self {
             config,
             broker,
             metrics: Arc::new(Registry::new()),
             clients,
             policy,
+            shadow_policy,
             config_path,
         })
     }
@@ -81,6 +85,11 @@ impl Runtime {
     /// The compiled egress policy.
     pub fn policy(&self) -> &Arc<PolicyEngine> {
         &self.policy
+    }
+
+    /// The shadow policy, when one is configured for evaluation only.
+    pub fn shadow_policy(&self) -> Option<&Arc<PolicyEngine>> {
+        self.shadow_policy.as_ref()
     }
 
     /// Whether the proxy requires a client token.
@@ -128,12 +137,14 @@ impl Runtime {
         // syntax error cannot replace a working one.
         let clients = Arc::new(ClientRegistry::from_config(&candidate.clients)?);
         let policy = Arc::new(PolicyEngine::from_config(&candidate.policy)?);
+        let shadow_policy = PolicyEngine::from_dry_run(&candidate.policy)?.map(Arc::new);
         restore_state(&broker, &previous);
 
         self.config = candidate;
         self.broker = broker;
         self.clients = clients;
         self.policy = policy;
+        self.shadow_policy = shadow_policy;
         self.metrics
             .config_reloads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -163,11 +174,13 @@ impl Runtime {
         let broker = Broker::from_config(&config)?;
         let clients = Arc::new(ClientRegistry::from_config(&config.clients)?);
         let policy = Arc::new(PolicyEngine::from_config(&config.policy)?);
+        let shadow_policy = PolicyEngine::from_dry_run(&config.policy)?.map(Arc::new);
         restore_state(&broker, &previous);
         self.config = config;
         self.broker = broker;
         self.clients = clients;
         self.policy = policy;
+        self.shadow_policy = shadow_policy;
         self.metrics
             .config_reloads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

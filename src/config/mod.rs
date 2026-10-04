@@ -118,6 +118,21 @@ pub struct PolicyConfig {
     /// Name given to the inline policy in error messages.
     #[serde(default = "default_inline_name")]
     pub inline_name: String,
+
+    /// A candidate policy to **evaluate without enforcing**, as a file.
+    ///
+    /// Writing a policy is risky: `default allow := false` with a typo blocks
+    /// every request. Syntax checking proves nothing about behaviour. A shadow
+    /// policy is evaluated against live traffic, its would-be denials are
+    /// counted and logged, and the request proceeds on the enforcing policy's
+    /// verdict -- so "this would have blocked 30% of today's traffic" is
+    /// answerable before the policy is switched on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<String>,
+
+    /// Inline shadow policy, for a rule too small to be worth a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run_inline: Option<String>,
 }
 
 fn default_inline_name() -> String {
@@ -131,6 +146,8 @@ impl Default for PolicyConfig {
             files: Vec::new(),
             inline: String::new(),
             inline_name: default_inline_name(),
+            dry_run: None,
+            dry_run_inline: None,
         }
     }
 }

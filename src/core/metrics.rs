@@ -61,6 +61,8 @@ pub struct Registry {
     /// Requests refused by client authentication or the egress policy.
     pub rejected_client_auth: AtomicU64,
     pub rejected_policy: AtomicU64,
+    /// Requests a *shadow* policy would have refused. They were served.
+    pub shadow_policy_blocks: AtomicU64,
     pub requests_in_flight: AtomicU64,
     pub config_reloads: AtomicU64,
     pub tokens_in_total: AtomicU64,
@@ -98,6 +100,7 @@ impl Registry {
             rejected_admin_auth: AtomicU64::new(0),
             rejected_client_auth: AtomicU64::new(0),
             rejected_policy: AtomicU64::new(0),
+            shadow_policy_blocks: AtomicU64::new(0),
             client_denials: Mutex::new(BTreeMap::new()),
             api_formats: Mutex::new(BTreeMap::new()),
             requests_in_flight: AtomicU64::new(0),
@@ -347,6 +350,11 @@ impl Registry {
             "llm_broker_client_auth_failures_total",
             "Proxy requests rejected for a missing or unknown client token.",
             self.rejected_client_auth.load(Ordering::Relaxed)
+        );
+        counter!(
+            "llm_broker_shadow_policy_blocks_total",
+            "Requests a shadow (dry-run) policy would have refused. These were served.",
+            self.shadow_policy_blocks.load(Ordering::Relaxed)
         );
         counter!(
             "llm_broker_policy_denials_total",

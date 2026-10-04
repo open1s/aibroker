@@ -397,6 +397,39 @@ Point `[policy] files = ["policy.rego"]` at it. [policy.example.rego](policy.exa
 documents every fact the policy can see and includes worked examples; a test
 compiles it with the real engine, so it cannot silently rot.
 
+### Trying a policy before it can break anything
+
+A policy is code that runs on every request, and `default allow := false` with a
+mistyped rule blocks all traffic. Checking that it *compiles* says nothing about
+what it will do to today's requests. So a candidate policy can be attached in
+**shadow mode**: it is evaluated against live traffic, its would-be denials are
+counted and logged, and every request is served on the enforcing policy's
+verdict.
+
+```toml
+[policy]
+enabled = true
+inline = "..."            # enforcing
+
+# Attach a candidate. It reports; it cannot block.
+dry_run = "candidate.rego"
+# or, for a rule too small to be worth a file:
+# dry_run_inline = "..."
+```
+
+```bash
+# How many of today's requests would the candidate have refused?
+curl -s localhost:11436/metrics | grep shadow_policy_blocks
+llm_broker_shadow_policy_blocks_total 5
+
+# ...and why, per request, in the log:
+grep 'shadow policy would have refused' broker.log
+```
+
+A shadow policy is still configuration: a syntax error fails at startup rather
+than being ignored, and an error *during* evaluation is logged without affecting
+the request, because a shadow policy is not in the decision path.
+
 What this buys you:
 
 - a request for a model or provider a client is not cleared for is refused

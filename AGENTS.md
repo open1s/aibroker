@@ -152,6 +152,14 @@ uploaded, and the client's in-flight slot is released in `logging`.
   `gpt-*` (its default delimiter is `.`), and one implementation keeps the
   policy and the broker from disagreeing about what a pattern means. regorus
   also ships no string builtins unless the `glob`/`regex` features are on.
+- **A shadow policy never blocks.** `policy.dry_run` / `dry_run_inline` compile
+  a second engine that is evaluated on the same facts and only *reports*
+  (`llm_broker_shadow_policy_blocks_total` plus a warning per would-be denial).
+  Keep it out of the decision path: an evaluation error there must be logged and
+  ignored, because the request's outcome is the enforcing policy's business. The
+  regression test asserts both halves -- requests served, and the counter moved
+  -- since asserting only the status would pass even if the shadow engine were
+  never called.
 - **A policy failure refuses the request.** A broker that forwards traffic when
   its policy engine is broken is worse than one that returns 500. An invalid
   policy fails at `Runtime::new`, not on the first request.

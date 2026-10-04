@@ -214,7 +214,11 @@ fn provider(name: &str, base_url: String, keys: &[(&str, &str)]) -> ProviderConf
 }
 
 /// Start the broker proxy on `port` in a background thread.
-fn spawn_broker(config: Config, port: u16) {
+///
+/// Returns the shared runtime so a test can assert on the registry a request
+/// actually wrote to -- a counter is the only way to prove a diagnostic path
+/// ran, when by design it changes no response.
+fn spawn_broker_with_runtime(config: Config, port: u16) -> aibroker::core::runtime::SharedRuntime {
     let runtime = shared(Runtime::new(config.clone(), None).expect("runtime"));
     // Touch the metrics/admin plumbing so the same code path as production is
     // exercised, even though these tests do not call the control plane.
@@ -227,15 +231,22 @@ fn spawn_broker(config: Config, port: u16) {
         )),
     );
 
+    let for_server = Arc::clone(&runtime);
     std::thread::spawn(move || {
         let _ = run_server(
             config,
-            runtime,
+            for_server,
             aibroker::proxy::dump::DumpConfig::default(),
         );
     });
 
     wait_for_port(port);
+    runtime
+}
+
+/// Start the broker proxy on `port`, discarding the runtime.
+fn spawn_broker(config: Config, port: u16) {
+    let _ = spawn_broker_with_runtime(config, port);
 }
 
 /// Start the mock upstream on `port`.
@@ -1066,6 +1077,7 @@ reason := "test-model is not permitted by policy" if input.request.model == "tes
 "#
         .to_string(),
         inline_name: "test.rego".to_string(),
+        ..Default::default()
     };
     spawn_broker(config, proxy_port);
 
@@ -1108,6 +1120,7 @@ fn a_broken_policy_refuses_traffic_instead_of_forwarding_it() {
         files: vec![],
         inline: "package llm.authz\nthis is not valid rego\n".to_string(),
         inline_name: "broken.rego".to_string(),
+        ..Default::default()
     };
 
     let error = match Runtime::new(config, None) {
@@ -1289,4 +1302,159 @@ fn a_healthy_pool_shares_load_evenly_under_least_latency() {
             "{key} received {count} of {total} requests, which is not a share: {counts:?}"
         );
     }
+}
+
+#[test]
+fn a_shadow_policy_reports_but_never_blocks() {
+    // The point of a shadow policy: find out what a candidate policy *would*
+    // do to real traffic without letting it break anything. Everything here is
+    // denied by the shadow policy and must still be served.
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200; 12]);
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    // The enforcing policy allows everything; the shadow policy denies
+    // everything with an explanatory reason.
+    config.policy = aibroker::config::PolicyConfig {
+        enabled: true,
+        inline: r#"package llm.authz
+import rego.v1
+default allow := true
+"#
+        .to_string(),
+        inline_name: "allow-all.rego".to_string(),
+        dry_run_inline: Some(
+            r#"package llm.authz
+import rego.v1
+default allow := false
+reason := "the shadow policy denies everything"
+"#
+            .to_string(),
+        ),
+        ..Default::default()
+    };
+    let runtime = spawn_broker_with_runtime(config, proxy_port);
+
+    let before = runtime
+        .read()
+        .metrics()
+        .shadow_policy_blocks
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    for _ in 0..5 {
+        let response = post_with_model(
+            proxy_port,
+            "/v1/chat/completions",
+            CHAT_BODY,
+            Some("test-model"),
+        );
+        assert_eq!(
+            response.status, 200,
+            "a shadow policy must never change the outcome: {}",
+            response.status_line
+        );
+    }
+
+    assert_eq!(
+        seen.lock().expect("lock").len(),
+        5,
+        "every request should have reached the provider"
+    );
+
+    // The report is the whole value of the feature: without this assertion the
+    // test would pass even if the shadow policy were never evaluated.
+    let after = runtime
+        .read()
+        .metrics()
+        .shadow_policy_blocks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        5,
+        "every request should have been reported as a would-be denial"
+    );
+}
+
+#[test]
+fn an_enforcing_policy_still_blocks_while_a_shadow_one_runs() {
+    // The mirror of the test above, proving the two are independent: same
+    // policy content, but this time it is the enforcing one.
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200; 12]);
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.policy = aibroker::config::PolicyConfig {
+        enabled: true,
+        inline: r#"package llm.authz
+import rego.v1
+default allow := false
+reason := "this policy denies everything"
+"#
+        .to_string(),
+        inline_name: "deny-all.rego".to_string(),
+        ..Default::default()
+    };
+    spawn_broker(config, proxy_port);
+
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(response.status, 403, "{}", response.status_line);
+    assert!(
+        response.body.contains("this policy denies everything"),
+        "{}",
+        response.body
+    );
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "a denied request must not be forwarded"
+    );
+}
+
+#[test]
+fn a_broken_shadow_policy_fails_at_startup() {
+    // A shadow policy is still configuration; a syntax error should be found
+    // when the broker starts, not silently ignored.
+    let upstream_port = free_port();
+    let mut config = base_config(
+        free_port(),
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.policy = aibroker::config::PolicyConfig {
+        enabled: true,
+        dry_run_inline: Some("package llm.authz\nthis is not rego\n".to_string()),
+        ..Default::default()
+    };
+
+    let error = match Runtime::new(config, None) {
+        Ok(_) => panic!("a broken shadow policy must fail the runtime"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid policy"), "{error}");
 }
