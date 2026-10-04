@@ -129,6 +129,11 @@ prebuilt binaries for five targets.
   pre-body signal. Providers that cannot serve the model are never called.
 - **Real rate limiting.** Sliding-window RPM *and* TPM accounting per key, plus
   concurrency caps. The window cannot burst past the configured limit.
+- **Cooldowns that escalate within a failure, not across a lifetime.** Repeated
+  rate limits back off further (1min → 5min → 25min, jittered) and honour an
+  upstream `Retry-After`, but a key that serves cleanly for a minute starts the
+  ramp over — otherwise two 429s in an afternoon would leave it jumping to the
+  capped cooldown hours later.
 - **Health scoring and circuit breaking.** Health is **reliability only**: it
   falls by a fifth per consecutive failure and rises on success, so a key that
   answers every request reads 100% however slow it is. Cooldowns ramp

@@ -78,8 +78,17 @@ impl std::fmt::Display for UnavailableReason {
 #[derive(Debug, Clone, Copy, Default)]
 struct Cooldown {
     until: Option<Instant>,
-    /// Number of times this key has been tripped since its last success.
+    /// How far up the backoff ramp this key currently is.
+    ///
+    /// Reset once the key has served cleanly for
+    /// [`KeyState::COOLDOWN_LEVEL_RESET_AFTER`], so the level tracks a *run* of
+    /// failures rather than a lifetime count. It used to only ever increase
+    /// (`level = 0` existed solely in the admin `reset`), which meant a key that
+    /// was rate limited twice in one afternoon and then served for hours would
+    /// jump straight back to the capped cooldown on its next 429.
     level: u32,
+    /// When `level` was last raised.
+    last_escalated: Option<Instant>,
 }
 
 /// A single credential with all of its runtime state.
@@ -305,6 +314,32 @@ impl KeyState {
     pub fn latency_ms(&self) -> Option<f64> {
         let us = self.latency_us.load(Ordering::Relaxed);
         (us > 0).then(|| us as f64 / 1000.0)
+    }
+
+    /// How long a key must serve cleanly before its backoff ramp resets.
+    ///
+    /// Long enough that a burst of concurrent 429s still escalates (those
+    /// failures arrive within seconds of each other), short enough that a key
+    /// which has been working for a while is not punished for ancient history.
+    pub const COOLDOWN_LEVEL_RESET_AFTER: Duration = Duration::from_secs(60);
+
+    /// The current backoff ramp position, for tests and diagnostics.
+    pub fn cooldown_level(&self) -> u32 {
+        self.cooldown.read().level
+    }
+
+    /// Backdate the recorded escalation, so a test can age it without sleeping
+    /// for a minute.
+    ///
+    /// Deliberately only rewrites the timestamp: the decay itself must run
+    /// through `record_success`, or a test would pass by calling the code under
+    /// test directly instead of exercising the path production uses.
+    #[cfg(test)]
+    fn backdate_cooldown_escalation_for_test(&self, by: Duration) {
+        let mut cooldown = self.cooldown.write();
+        if cooldown.last_escalated.is_some() {
+            cooldown.last_escalated = Some(Instant::now() - by);
+        }
     }
 
     /// Current health score in `0.0..=1.0`.
@@ -567,6 +602,27 @@ impl KeyState {
         health.consecutive_failures = 0;
         health.half_open_probe_in_flight = false;
         health.half_open_successes = health.half_open_successes.saturating_add(1);
+        drop(health);
+
+        // A long clean run means the next failure is a fresh problem, not a
+        // continuation of the last one, so the backoff starts over. Sustained
+        // success is the signal; a single success is not, or a burst of
+        // concurrent 429s would never escalate at all.
+        self.decay_cooldown_level(Instant::now());
+    }
+
+    /// Reset the backoff ramp if the key has served cleanly for long enough.
+    ///
+    /// Takes `now` so a test can age the escalation without sleeping for a
+    /// minute; the behaviour under test is the comparison, not the clock.
+    fn decay_cooldown_level(&self, now: Instant) {
+        let mut cooldown = self.cooldown.write();
+        if let Some(since) = cooldown.last_escalated
+            && now.saturating_duration_since(since) >= Self::COOLDOWN_LEVEL_RESET_AFTER
+        {
+            cooldown.level = 0;
+            cooldown.last_escalated = None;
+        }
     }
 
     /// Record a failure and escalate the cooldown.
@@ -612,6 +668,7 @@ impl KeyState {
         let seconds = (capped * jitter).max(1.0);
         cooldown.until = Some(Instant::now() + Duration::from_secs_f64(seconds));
         cooldown.level = cooldown.level.saturating_add(1);
+        cooldown.last_escalated = Some(Instant::now());
     }
 
     /// Park the key for an explicit duration, e.g. from `Retry-After`.
@@ -619,6 +676,7 @@ impl KeyState {
         let mut cooldown = self.cooldown.write();
         cooldown.until = Some(Instant::now() + duration);
         cooldown.level = cooldown.level.saturating_add(1);
+        cooldown.last_escalated = Some(Instant::now());
     }
 
     /// Record that the upstream answered 429.
@@ -638,6 +696,7 @@ impl KeyState {
             let mut cooldown = self.cooldown.write();
             cooldown.until = None;
             cooldown.level = 0;
+            cooldown.last_escalated = None;
         }
         {
             let mut health = self.health.write();
@@ -942,6 +1001,66 @@ mod tests {
         // 60 -> 300 -> 1500 (capped), i.e. 1min -> 5min -> 25min.
         assert!((policy.initial.as_secs_f64() * policy.multiplier) == 300.0);
         assert!((300.0 * policy.multiplier) == 1500.0);
+    }
+
+    #[test]
+    fn a_burst_escalates_the_cooldown() {
+        // Repeated 429s in quick succession must ramp: each one is evidence the
+        // key is exhausted, and the pause has to get longer.
+        let key = key_with(None, None);
+        let policy = CooldownPolicy::default();
+
+        key.record_rate_limited(None, &policy);
+        let first = key.cooldown_remaining().expect("cooled");
+        key.record_rate_limited(None, &policy);
+        let second = key.cooldown_remaining().expect("cooled");
+
+        assert!(
+            second > first,
+            "a second consecutive 429 should escalate: {first:?} then {second:?}"
+        );
+        assert_eq!(key.cooldown_level(), 2);
+    }
+
+    #[test]
+    fn sustained_success_resets_the_cooldown_ramp() {
+        // The bug: `level` was a lifetime counter, so a key rate limited twice
+        // in an afternoon and then healthy for hours would jump straight back to
+        // the capped cooldown on its next 429. Measured live: a transient burst
+        // put all three keys at 160-224 s instead of the initial 60 s, turning a
+        // hiccup into a three-minute outage.
+        let key = key_with(None, None);
+        let policy = CooldownPolicy::default();
+
+        key.record_rate_limited(None, &policy);
+        key.record_rate_limited(None, &policy);
+        assert_eq!(key.cooldown_level(), 2, "the ramp should have climbed");
+
+        // A success alone is not enough -- a burst arrives within seconds.
+        key.record_success(Duration::from_millis(50), 0, 0, &HealthTuning::default());
+        assert_eq!(
+            key.cooldown_level(),
+            2,
+            "one success must not erase an in-progress burst"
+        );
+
+        // A long clean run is the signal that the old failure is history.
+        key.backdate_cooldown_escalation_for_test(KeyState::COOLDOWN_LEVEL_RESET_AFTER);
+        key.record_success(Duration::from_millis(50), 0, 0, &HealthTuning::default());
+        assert_eq!(
+            key.cooldown_level(),
+            0,
+            "sustained success should start the ramp over"
+        );
+
+        // And the next 429 is then a fresh initial step, not a capped one.
+        key.record_rate_limited(None, &policy);
+        let cooldown = key.cooldown_remaining().expect("cooled");
+        let upper = policy.initial.mul_f64(1.0 + policy.jitter) + Duration::from_secs(1);
+        assert!(
+            cooldown <= upper,
+            "the next cooldown should restart at the initial step (<= {upper:?}), got {cooldown:?}"
+        );
     }
 
     #[test]

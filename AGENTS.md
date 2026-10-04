@@ -265,6 +265,28 @@ and `recovery_threshold` (it was read and then discarded by a `let _ =`, so it
 never did anything). Unknown keys in an existing config are ignored rather than
 rejected, and a test pins that so an old file keeps loading.
 
+## Cooldowns track a run of failures, not a lifetime
+
+`cooldown.level` picks the backoff step (`initial * multiplier^level`). It must
+reset once the key has served cleanly for a while, or it becomes a lifetime
+counter and a key that was rate limited twice in an afternoon and then served
+for hours jumps straight back to the capped cooldown on its next 429.
+
+That was the behaviour, and it was measured rather than reasoned about: a burst
+of 20 concurrent requests left **all three** keys at 160-224 s (level 2) instead
+of the initial 60 s, turning a momentary rate limit into a three-minute outage.
+`level = 0` existed only in the admin `reset()`.
+
+The reset is driven by *sustained* success
+(`KeyState::COOLDOWN_LEVEL_RESET_AFTER`, 60 s since the last escalation), not by
+a single success — a burst of concurrent 429s arrives within seconds of itself,
+and resetting on each success would mean the ramp never climbs at all.
+
+Two traps when testing this: the decay must be reachable through
+`record_success` (a test helper that calls the decay directly makes the test pass
+against a mutation that removes the call), and the clock has to be injectable
+(`decay_cooldown_level(now)`) or the test sleeps for a minute.
+
 ## Key rotation
 
 Cooldown follows `initial * multiplier^level`, capped at `max_cooldown_secs`
