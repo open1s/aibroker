@@ -9,3 +9,7 @@ config.toml
 *.log
 /broker-*.log
 /local-config.toml
+
+# CI log downloads
+/.ci-*.log
+/.ci-*.zip

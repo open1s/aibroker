@@ -34,13 +34,27 @@ Bumping the pin is a deliberate change:
 ```bash
 # 1. install and select the new channel (mise manages the toolchains here)
 mise install rust@<version>
-# 2. update channel in rust-toolchain.toml and the two `toolchain:` values
-#    in .github/workflows/ci.yml
+# 2. update channel in rust-toolchain.toml and the `toolchain:` values in
+#    BOTH .github/workflows/ci.yml and .github/workflows/release.yml
 # 3. fix fallout, then prove it on that toolchain
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+# 4. prove a cross target still builds the way CI does
+cargo build --release --target x86_64-apple-darwin
 ```
+
+Two traps when touching this:
+
+- **Keep the workflows and the file in step.** `rust-toolchain.toml` wins over
+  the action's `toolchain:` input, so a workflow left on `@stable` installs a
+  different compiler than the one being tested. That mismatch is what broke the
+  release job: `@stable` installed 1.99.0 in `release.yml` while the file pinned
+  the same channel but with different targets.
+- **`rust-toolchain.toml` also overrides the action's `targets:` input.**
+  Cross targets then have to be installed explicitly, or the build fails with
+  `can't find crate for \`core\``. `release.yml` does this with a dedicated
+  `rustup target add` step; keep that step when editing the workflow.
 
 Sandbox note: the DSH file sandbox blocks writes to the global mise cargo
 registry, so a plain `cargo build` can fail while *downloading*. Everything is

@@ -46,11 +46,3 @@ pingora = { version = "0.8.0", features = ["proxy"] }
 async-trait = "0.1"
 bytes = "1"
 
-# `pingora-rustls` depends on rustls with default features, which selects the
-# `aws-lc-rs` provider and pulls in `aws-lc-sys`: a cmake + NASM C build that is
-# the only thing failing our x86_64-apple-darwin release (cross-built on an
-# arm64 runner). The crate never uses aws-lc-rs -- it hashes with `ring` and
-# installs no provider -- so we patch the dependency declaration to ring only.
-# Remove this patch once upstream ships the same change.
-[patch.crates-io]
-pingora-rustls = { path = "vendor/pingora-rustls-0.8.0" }

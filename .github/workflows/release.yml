@@ -35,9 +35,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: ${{ matrix.target }}
+          # Keep in step with rust-toolchain.toml and .github/workflows/ci.yml.
+          toolchain: 1.99.0
+
+      # `rust-toolchain.toml` pins the channel and takes precedence over the
+      # action's `targets:` input, so the cross target has to be added
+      # explicitly. Without this, building x86_64-apple-darwin on an arm64
+      # runner fails with "can't find crate for `core`".
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
