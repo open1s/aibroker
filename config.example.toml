@@ -332,5 +332,23 @@ enabled = true
 # pattern = "ghp_[A-Za-z0-9]{20,}"
 #
 # [[content_guard.patterns]]
+# name = "openai-key"
+# # NOTE the hyphens and underscores: a modern key is `sk-proj-...`, so a
+# # character class without them silently matches nothing.
+# pattern = "sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}"
+#
+# [[content_guard.patterns]]
+# name = "anthropic-key"
+# pattern = "sk-ant-[A-Za-z0-9_-]{20,}"
+#
+# [[content_guard.patterns]]
+# name = "nvidia-key"
+# pattern = "nvapi-[A-Za-z0-9_-]{20,}"
+#
+# [[content_guard.patterns]]
+# name = "slack-token"
+# pattern = "xox[baprs]-[A-Za-z0-9-]{10,}"
+#
+# [[content_guard.patterns]]
 # name = "email"
 # pattern = "[\\w.+-]+@[\\w-]+\\.[\\w.]+"

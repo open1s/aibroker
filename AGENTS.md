@@ -181,6 +181,28 @@ uploaded, and the client's in-flight slot is released in `logging`.
   what makes the guarantee real. Any future "refuse mid-stream" control needs the
   same treatment, plus a test that asserts the upstream saw no secret -- asserting
   the status code alone passes while the data escapes.
+- **The content guard must be exercised with a realistic body.** Three separate
+  defects in it were invisible to unit tests and to small hand-written probes,
+  and every one made the guard *report nothing while looking healthy*:
+  1. The OpenAI rule shipped with a character class that excludes hyphens, so it
+     cannot match a modern project-scoped key whose prefix contains one. Miss the
+     format and the rule is inert.
+  2. The scan sat inside `ctx.body.is_empty()`, so only the **first chunk** of a
+     body was ever inspected. A 6.5 KB agent request put its key at offset 6278,
+     in the second chunk.
+  3. The allow-list was applied to the *whole body*, so one `example.com` in a
+     `git config` line suppressed every finding in the request — a bypass that a
+     naive "does the guard fire?" test would not notice, because the separate
+     `[dump] redact` list still scrubbed the key from the log.
+
+  The lesson generalises: test a security control with input from the shape of
+  traffic it will actually see, and assert on the *finding*, not on the absence
+  of an alarming log line.
+
+  Keep sample values obviously synthetic (the keyword `EXAMPLE` is itself on the
+  shipped allow-list), and note that GitHub push protection rejects realistic
+  ones: it blocked this very commit until the fixtures were made unmistakably
+  fake. That is the mechanism working, not an obstacle to route around.
 - **A finding never carries the match.** It names the rule and the field. A
   security log that repeats the secret becomes the leak.
 - **A policy failure refuses the request.** A broker that forwards traffic when

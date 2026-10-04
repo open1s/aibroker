@@ -17,9 +17,11 @@
 //!   inspection is to *find out* before blocking: a false positive that refuses
 //!   a request is a broken tool. `deny` is available once the patterns have been
 //!   watched against real traffic.
-//! - **An allow-list runs first.** A pattern that matches test fixtures or
-//!   documentation examples produces noise that trains people to ignore the
-//!   guard.
+//! - **An allow-list runs first, by masking.** A pattern that matches test
+//!   fixtures or documentation examples produces noise that trains people to
+//!   ignore the guard — but only the matched spans are blanked, never the whole
+//!   body. Skipping the body was a bypass: one `example.com` in a `git config`
+//!   line suppressed every finding in the request.
 //! - **Findings never include the match.** The report names the pattern, not the
 //!   secret — otherwise the security log becomes the leak.
 
@@ -143,22 +145,51 @@ impl ContentGuard {
     /// with three secrets in it is one problem, and listing them all buries the
     /// signal.
     ///
-    /// The allow-list is applied to the *whole body* before any rule runs. That
-    /// is coarse on purpose — patterns cannot be allowed per-match without
-    /// inspecting the match, which is what this module refuses to log.
+    /// Allow-listed spans are *blanked out*, not used to skip the request.
+    ///
+    /// Skipping the whole body when any allow pattern matched was a bypass. A
+    /// realistic agent request contains an address like `dev@example.com` in a
+    /// `git config` line, so a body that also carried a live `sk-proj-...` key
+    /// reported **nothing** — the allow-list matched first and the scan never
+    /// ran. Measured on a 6.5 KB request: the guard saw 0 findings while the key
+    /// was redacted from the log, which is exactly the "looks like it works"
+    /// failure this module is supposed to prevent.
+    ///
+    /// Masking keeps the intent — a documentation example should not raise an
+    /// alert — without letting one benign string disable inspection of the rest.
+    /// The replacement is a same-byte-length filler so offsets and the
+    /// surrounding JSON stay intact.
     pub fn scan(&self, body: &[u8]) -> Option<Finding> {
         if self.rules.is_empty() {
             return None;
         }
-        let text = std::str::from_utf8(body).ok()?;
-        if self.allow.iter().any(|pattern| pattern.is_match(text)) {
-            return None;
+        let mut text = std::str::from_utf8(body).ok()?.to_string();
+        for pattern in &self.allow {
+            let spans: Vec<(usize, usize)> = pattern
+                .find_iter(&text)
+                .map(|m| (m.start(), m.end()))
+                .collect();
+            if spans.is_empty() {
+                continue;
+            }
+            let mut masked = String::with_capacity(text.len());
+            let mut cursor = 0usize;
+            for (start, end) in spans {
+                masked.push_str(&text[cursor..start]);
+                // Same byte length, so every other offset is unaffected.
+                for _ in 0..(end - start) {
+                    masked.push(' ');
+                }
+                cursor = end;
+            }
+            masked.push_str(&text[cursor..]);
+            text = masked;
         }
         for rule in &self.rules {
-            if let Some(found) = rule.regex.find(text) {
+            if let Some(found) = rule.regex.find(&text) {
                 return Some(Finding {
                     rule: rule.name.clone(),
-                    field: field_around(text, found.start()),
+                    field: field_around(&text, found.start()),
                 });
             }
         }
@@ -257,11 +288,72 @@ mod tests {
             "the allow-list should suppress this"
         );
         assert!(
+            // Deliberately does not contain the allow-listed word, and is
+            // obviously not a credential: a synthetic value that *did* contain
+            // it would be suppressed by the allow-list and prove nothing.
             guard
-                .scan(br#"{"content":"AKIAIOSFODNN7REALKEY"}"#)
+                .scan(br#"{"content":"AKIAFAKEKEYFAKEKEY12"}"#)
                 .is_some(),
-            "and only this"
+            "and only the allow-listed one is suppressed"
         );
+    }
+
+    #[test]
+    fn an_allow_listed_string_does_not_disable_the_rest_of_the_scan() {
+        // The bypass this replaces: the allow-list was applied to the whole
+        // body, so one benign `example.com` in a `git config` line suppressed
+        // every finding in a 6.5 KB request -- including a live API key. It
+        // looked like the guard was working, because the redactor (a separate
+        // list) still scrubbed the key from the log.
+        let guard = ContentGuard::new(
+            &[(
+                "openai-key".to_string(),
+                r"sk-proj-[A-Za-z0-9_-]{20,}".to_string(),
+            )],
+            &[r"example\.com".to_string()],
+            GuardAction::Report,
+        )
+        .unwrap();
+
+        let body = br#"{"messages":[{"content":"git config user.email dev@example.com && export KEY=sk-proj-EXAMPLE-NOT-A-REAL-KEY-0001"}]}"#;
+        let finding = guard
+            .scan(body)
+            .expect("the key must still be found when an example is also present");
+        assert_eq!(finding.rule, "openai-key");
+    }
+
+    #[test]
+    fn an_allow_listed_value_alone_is_still_suppressed() {
+        // The masking must not defeat the allow-list's purpose.
+        let guard = ContentGuard::new(
+            &[("aws-key".to_string(), r"AKIA[0-9A-Z]{16}".to_string())],
+            &[r"EXAMPLE".to_string()],
+            GuardAction::Report,
+        )
+        .unwrap();
+
+        assert!(
+            guard
+                .scan(br#"{"content":"AKIAIOSFODNN7EXAMPLE"}"#)
+                .is_none(),
+            "an allow-listed example should not raise a finding"
+        );
+    }
+
+    #[test]
+    fn masking_preserves_offsets_for_the_field_lookup() {
+        // The filler is the same byte length as the match, so the reported
+        // field still points at the right key.
+        let guard = ContentGuard::new(
+            &[("key".to_string(), r"SECRET-[0-9]+".to_string())],
+            &[r"benign-very-long-placeholder".to_string()],
+            GuardAction::Report,
+        )
+        .unwrap();
+        let body = br#"{"a":"benign-very-long-placeholder","content":"SECRET-42"}"#;
+        let finding = guard.scan(body).expect("found");
+        assert_eq!(finding.rule, "key");
+        assert_eq!(finding.field, "content");
     }
 
     #[test]
@@ -341,6 +433,107 @@ mod tests {
             );
         }
         assert_eq!(GuardAction::parse("nonsense"), None);
+    }
+
+    /// The credential patterns shipped in `config.example.toml`, paired with a
+    /// realistic value each one is supposed to catch.
+    ///
+    /// This exists because a pattern that misses the real format is
+    /// indistinguishable from a working guard: it reports zero findings and
+    /// looks healthy. The `openai-key` rule shipped as `sk-[A-Za-z0-9]{20,}`,
+    /// which does **not** match a modern `sk-proj-...` key because of the
+    /// hyphen, and nothing noticed until a body containing one was sent through
+    /// a live broker.
+    const SHIPPED_RULES: &[(&str, &str, &str)] = &[
+        ("aws-key", r"AKIA[0-9A-Z]{16}", "AKIAIOSFODNN7EXAMPLE"),
+        (
+            "private-key",
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+        ),
+        (
+            "github-token",
+            r"ghp_[A-Za-z0-9]{20,}",
+            "ghp_EXAMPLENOTAREALKEY00000000",
+        ),
+        (
+            "openai-key",
+            r"sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}",
+            "sk-proj-EXAMPLE-NOT-A-REAL-KEY-0001",
+        ),
+        (
+            "anthropic-key",
+            r"sk-ant-[A-Za-z0-9_-]{20,}",
+            "sk-ant-EXAMPLE-NOT-A-REAL-KEY-0001",
+        ),
+        (
+            "nvidia-key",
+            r"nvapi-[A-Za-z0-9_-]{20,}",
+            "nvapi-EXAMPLE-NOT-A-REAL-KEY-0000001",
+        ),
+        (
+            "slack-token",
+            r"xox[baprs]-[A-Za-z0-9-]{10,}",
+            "xoxb-EXAMPLE-NOT-A-REAL-TOKEN-0001",
+        ),
+        ("email", r"[\w.+-]+@[\w-]+\.[\w.]+", "ada@example.com"),
+    ];
+
+    #[test]
+    fn every_shipped_pattern_matches_a_realistic_value() {
+        for (name, pattern, sample) in SHIPPED_RULES {
+            let guard = ContentGuard::new(
+                &[(name.to_string(), pattern.to_string())],
+                &[],
+                GuardAction::Report,
+            )
+            .unwrap_or_else(|e| panic!("rule `{name}` does not compile: {e}"));
+
+            assert!(
+                guard.scan(sample.as_bytes()).is_some(),
+                "rule `{name}` ({pattern}) does not match `{sample}`, so it would \
+                 report nothing while appearing to protect"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_patterns_are_the_ones_in_the_example_config() {
+        // Guards against the example and this list drifting apart: if someone
+        // edits a pattern in one place, this fails rather than silently leaving
+        // the documented rule broken.
+        let example = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"),
+        )
+        .expect("the example config should be readable");
+
+        for (name, pattern, _) in SHIPPED_RULES {
+            let expected = format!("# pattern = \"{}\"", pattern.replace('\\', "\\\\"));
+            assert!(
+                example.contains(&expected),
+                "config.example.toml does not contain the {name} pattern this test \
+                 verifies; expected a line `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_only_rule_would_miss_a_hyphenated_key() {
+        // The exact defect, kept as a test so the reasoning is not lost: this is
+        // the pattern that shipped and reported nothing.
+        let broken = guard(&[("openai-key", r"sk-[A-Za-z0-9]{20,}")]);
+        assert!(
+            broken
+                .scan(b"sk-proj-EXAMPLE-NOT-A-REAL-KEY-0001")
+                .is_none(),
+            "the old pattern is expected to miss a hyphenated key"
+        );
+
+        let fixed = guard(&[("openai-key", r"sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}")]);
+        assert!(
+            fixed.scan(b"sk-proj-EXAMPLE-NOT-A-REAL-KEY-0001").is_some(),
+            "the corrected pattern must match"
+        );
     }
 
     #[test]

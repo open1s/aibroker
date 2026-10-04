@@ -176,7 +176,7 @@ mod tests {
             (r"ghp_[A-Za-z0-9]{20,}", "<gh-token>"),
         ]))
         .unwrap();
-        let out = redactor.apply("keys AKIAIOSFODNN7EXAMPLE and ghp_abcdefghijklmnopqrstuvwx");
+        let out = redactor.apply("keys AKIAIOSFODNN7EXAMPLE and ghp_EXAMPLENOTAREALKEY00000000");
         assert!(out.contains("<aws-key>"), "{out}");
         assert!(out.contains("<gh-token>"), "{out}");
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "{out}");

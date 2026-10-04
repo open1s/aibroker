@@ -745,12 +745,20 @@ impl ProxyHttp for ProxyService {
             dump.request_body(chunk);
         }
 
+        // Accumulate every chunk, not just the first.
+        //
+        // This used to sit inside `ctx.body.is_empty()`, so a body that arrived
+        // in pieces was only ever inspected up to its first chunk. Measured on a
+        // realistic agent request -- 6.5 KB, with a credential at offset 6278 in
+        // the second chunk -- the content guard reported nothing at all while
+        // appearing to work. The parse below stays first-chunk-only: the model
+        // and the dialect are settled once the opening JSON is in.
+        let first_chunk = ctx.body.is_empty();
         if let Some(chunk) = body.as_deref()
             && !chunk.is_empty()
-            && ctx.body.is_empty()
         {
             ctx.body.push(chunk, self.settings.request_scan_limit);
-            if !ctx.body.is_empty() {
+            if first_chunk && !ctx.body.is_empty() {
                 // One parse serves the model, the token estimate and the
                 // dialect, instead of scanning the body three times.
                 let payload = Payload::parse(ctx.body.bytes());
@@ -773,6 +781,14 @@ impl ProxyHttp for ProxyService {
             // Inspect the content itself: an API key pasted into a prompt, a
             // customer's email, an ID number. This is the only check that looks
             // at what is actually about to leave the building.
+            //
+            // Deliberately *outside* the `ctx.body.is_empty()` block above: the
+            // body arrives in chunks, so scanning only the first one missed
+            // anything past it. Measured on a realistic agent request -- a
+            // 6.5 KB body whose secret sat at offset 6278 in the *second* chunk
+            // -- the guard reported nothing at all while appearing to work.
+            // After the first chunk the buffer keeps growing (up to
+            // `request_scan_limit`), so a later secret is found once it lands.
             //
             // The verdict is reduced to owned data before anything is awaited:
             // holding the guard across `.await` makes this future non-`Send`,
