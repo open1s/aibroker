@@ -335,6 +335,7 @@ impl AdminRouter {
             ("GET", ["models"]) => self.models(),
             ("GET", ["routes"]) => self.routes(),
             ("GET", ["metrics"]) => self.metrics(),
+            ("GET", ["security"]) => self.security(),
             _ => AdminResponse::error(404, format!("no admin route for `{path}`")),
         }
     }
@@ -349,6 +350,36 @@ impl AdminRouter {
 
     fn health(&self) -> AdminResponse {
         AdminResponse::json(200, &json!({"status": "ok"}))
+    }
+
+    /// Who may use the proxy, and which policy decides.
+    ///
+    /// Reports the *configuration* of the security plane, never a token: an
+    /// operator needs to see that authentication is off, or that a client is
+    /// scoped to two models, without the endpoint becoming a credential store.
+    fn security(&self) -> AdminResponse {
+        let runtime = self.runtime.read();
+        let clients = runtime.clients();
+        let policy = runtime.policy();
+
+        let payload = serde_json::json!({
+            "client_auth_required": runtime.requires_client_auth(),
+            "client_count": clients.len(),
+            "clients": clients.statuses(),
+            "denials_by_reason": clients
+                .denials()
+                .into_iter()
+                .map(|(reason, count)| (reason.as_str().to_string(), count))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            "policy": {
+                "source": match policy.source() {
+                    crate::core::policy::PolicySource::Default => "default",
+                    crate::core::policy::PolicySource::Rego => "rego",
+                },
+                "loaded_from": policy.description(),
+            },
+        });
+        AdminResponse::json(200, &payload)
     }
 
     fn status(&self) -> AdminResponse {
@@ -911,6 +942,42 @@ mod tests {
         let response = router.handle(authed("GET", "", b"", "wrong"));
         assert_eq!(response.status, 401);
         assert!(response.challenge.is_none());
+    }
+
+    #[test]
+    fn the_security_endpoint_reports_the_plane_without_tokens() {
+        let runtime = runtime();
+        let router = router(Arc::clone(&runtime), Some("secret"));
+        {
+            let mut runtime = runtime.write();
+            runtime
+                .apply(|config| {
+                    config.clients.push(crate::config::ClientConfig {
+                        name: "laptop".into(),
+                        token: "super-secret-token".into(),
+                        enabled: true,
+                        allowed_models: vec!["gpt-*".into()],
+                        allowed_providers: vec![],
+                        max_rpm: Some(60),
+                        max_tpm: None,
+                        max_concurrency: Some(2),
+                    });
+                })
+                .expect("client config should apply");
+        }
+
+        let response = router.handle(authed("GET", "/security", b"", "secret"));
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).expect("utf8");
+
+        assert!(body.contains("laptop"), "{body}");
+        assert!(body.contains("gpt-*"), "{body}");
+        assert!(body.contains("\"client_auth_required\": true"), "{body}");
+        assert!(
+            !body.contains("super-secret-token"),
+            "the admin API must never expose a client token: {body}"
+        );
+        assert!(body.contains("\"source\": \"default\""), "{body}");
     }
 
     #[test]

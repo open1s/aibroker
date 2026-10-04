@@ -351,9 +351,7 @@ impl ProxyService {
                     .rejected_policy
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 metrics.record_denial(&decision.reason);
-                if let Some(client) = client {
-                    client.record_policy_denial();
-                }
+                registry.record_edge_denial(DenyReason::ModelForbidden, client.as_deref());
                 warn!(
                     model = ctx.model.as_deref().unwrap_or("-"),
                     reason = %decision.reason,
@@ -376,6 +374,7 @@ impl ProxyService {
                     .rejected_policy
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 metrics.record_denial("policy_error");
+                registry.record_edge_denial(DenyReason::PolicyError, client.as_deref());
                 return self
                     .refuse(
                         session,

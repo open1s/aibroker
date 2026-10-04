@@ -240,6 +240,78 @@ Each key tracks, per provider: enabled flag, weight, model allow-list, RPM/TPM
 windows, concurrency, EWMA latency, health score, circuit state and cooldown
 level, plus request, token, retry and rate-limit counters.
 
+## Who may use it, and what may leave
+
+Balancing decides *which* key serves a request. Two more layers decide whether
+the request should leave the machine at all — the part that matters when the
+broker sits between your source code and a third-party API.
+
+**Clients** authenticate the caller. Without any `[[clients]]` the proxy is
+open, which is the right default for one person on their own laptop. Add them
+and every request needs a token:
+
+```toml
+[[clients]]
+name = "laptop"
+token = "file:/run/secrets/laptop-token"   # or env:NAME, or a literal
+allowed_models = ["gpt-4o", "claude-3-5-*"]  # empty = any
+allowed_providers = ["openai"]
+max_rpm = 120
+max_concurrency = 4
+```
+
+A client token is compared in constant time, never logged, never echoed in a
+refusal, and never returned by the admin API. `file:` keeps it out of the
+environment, where `ps` and every child process can read it.
+
+**Policy** decides the rest, in [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/),
+evaluated in-process by [regorus](https://github.com/microsoft/regorus). Every
+request that is about to be forwarded is described to the policy as `input`,
+and the policy answers `data.llm.authz.allow`:
+
+```rego
+package llm.authz
+
+import rego.v1
+
+default allow := false
+
+# Authenticated clients, within their configured scope.
+allow if {
+	input.client.name
+	input.auth.ok
+	input.budget.allowed
+	input.client.model_allowed
+	input.client.provider_allowed
+}
+
+# A data-security rule the config cannot express: long prompts stay on-prem.
+allow if {
+	input.client.name == "laptop"
+	input.request.estimated_tokens <= 4000
+	input.route.providers[_] == "on-prem"
+}
+
+reason := "prompts over 4000 tokens must stay on-prem" if {
+	input.request.estimated_tokens > 4000
+}
+```
+
+Point `[policy] files = ["policy.rego"]` at it. [policy.example.rego](policy.example.rego)
+documents every fact the policy can see and includes worked examples; a test
+compiles it with the real engine, so it cannot silently rot.
+
+What this buys you:
+
+- a request for a model or provider a client is not cleared for is refused
+  **before the body is uploaded**, so the content never reaches anyone;
+- policy is data, not code: review it in a pull request, diff it, hand it to
+  whoever owns the data-classification rules;
+- a policy that fails to evaluate **refuses** the request rather than forwarding
+  it — a broken policy is never an open door;
+- `GET /admin/security` shows the live configuration (client scopes, budgets,
+  denial counts by reason, which policy is loaded) without exposing a token.
+
 ## Admin API
 
 The control plane can add credentials, so it **fails closed**: with no

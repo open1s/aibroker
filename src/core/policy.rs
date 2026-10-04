@@ -845,6 +845,60 @@ reason := "streaming is not permitted" if input.request.stream
     }
 
     #[test]
+    fn the_shipped_example_policy_compiles_and_behaves() {
+        // `policy.example.rego` is documentation, and documentation rots. This
+        // compiles the real file with the real engine, so a change to the
+        // builtins or a typo in an example is caught here.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.rego");
+        let policy = PolicyEngine::from_file(&path).expect("the example policy must compile");
+
+        // Its rules 1 and 2 mirror the default policy.
+        let empty: Vec<String> = Vec::new();
+        let providers = strings(&["openai"]);
+
+        let unauthenticated = facts(
+            None,
+            true,
+            &empty,
+            &empty,
+            Some("gpt-4o"),
+            &providers,
+            false,
+            true,
+        );
+        assert!(policy.check(&unauthenticated).unwrap().allowed);
+
+        let models = strings(&["gpt-*"]);
+        let client_providers = strings(&["openai"]);
+        let admitted = facts(
+            Some("laptop"),
+            true,
+            &models,
+            &client_providers,
+            Some("gpt-4o"),
+            &providers,
+            true,
+            true,
+        );
+        assert!(policy.check(&admitted).unwrap().allowed);
+
+        // And it explains a model refusal in words.
+        let refused = facts(
+            Some("laptop"),
+            true,
+            &models,
+            &client_providers,
+            Some("claude-3"),
+            &providers,
+            true,
+            true,
+        );
+        let decision = policy.check(&refused).unwrap();
+        assert!(decision.is_denied());
+        assert_eq!(decision.reason, "this client may not use that model");
+    }
+
+    #[test]
     fn a_disabled_policy_config_uses_the_builtin() {
         let config = PolicyConfig {
             enabled: false,

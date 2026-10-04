@@ -495,9 +495,17 @@ impl ClientRegistry {
         self.denials.lock().clone()
     }
 
-    /// Record a denial the policy decided, which the registry did not see.
-    pub fn record_policy_denial(&self, reason: DenyReason) {
+    /// Record a denial the policy decided at the edge.
+    ///
+    /// The policy runs after `authenticate`, so the registry never sees these;
+    /// without this the admin view and the metric would under-report exactly
+    /// the denials an operator cares about (a client reaching for a model it is
+    /// not cleared for).
+    pub fn record_edge_denial(&self, reason: DenyReason, client: Option<&ClientAccess>) {
         self.count(reason);
+        if let Some(client) = client {
+            client.record_denied();
+        }
     }
 
     /// Find a client by name, for the admin API.
@@ -778,6 +786,23 @@ mod tests {
             registry.denials().get(&DenyReason::RateLimited),
             Some(&1),
             "and visible in aggregate"
+        );
+    }
+
+    #[test]
+    fn an_edge_denial_is_counted_against_the_client_and_the_registry() {
+        // The policy runs after `authenticate`, so these denials would be
+        // invisible without an explicit record.
+        let registry = registry(vec![client("a", "tok")]);
+        let ClientDecision::Allowed(access) = registry.authenticate(Some("tok")) else {
+            panic!("should be admitted");
+        };
+        registry.record_edge_denial(DenyReason::ModelForbidden, Some(&access));
+
+        assert_eq!(registry.statuses()[0].denied, 1);
+        assert_eq!(
+            registry.denials().get(&DenyReason::ModelForbidden),
+            Some(&1)
         );
     }
 

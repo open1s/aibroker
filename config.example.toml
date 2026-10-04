@@ -196,3 +196,60 @@ token = "env:LLM_BROKER_ADMIN_TOKEN"
 # Write key changes back to this file.
 persist = true
 # allow_insecure = true    # only for a loopback-only, trusted machine
+
+# ---------------------------------------------------------------------------
+# Client access control
+# ---------------------------------------------------------------------------
+# Who may use the proxy. Without any [[clients]] the proxy is open: anything
+# that can reach the port can spend your keys. Define clients to require a
+# token and to scope what each one may send.
+#
+# The token identifies the caller. It is compared in constant time and is never
+# logged, never echoed in a refusal, and never returned by the admin API.
+# `file:` keeps it out of the environment, which is visible to `ps` and to
+# child processes; Kubernetes and Docker secrets mount naturally this way.
+
+# [[clients]]
+# name = "laptop"
+# token = "env:LLM_BROKER_CLIENT_TOKEN"
+# # token = "file:/run/secrets/laptop-token"
+# enabled = true
+#
+# # Egress scope. Empty means "any". Patterns accept * and ?.
+# allowed_models = ["gpt-4o", "gpt-4o-mini", "claude-3-5-*"]
+# allowed_providers = ["openai"]
+#
+# # Optional per-client budgets, independent of the key pools.
+# max_rpm = 120
+# max_tpm = 200000
+# max_concurrency = 4
+#
+# # A second client with a narrower scope.
+# [[clients]]
+# name = "batch-job"
+# token = "file:/run/secrets/batch-token"
+# allowed_models = ["gpt-4o-mini"]
+# max_rpm = 30
+
+# ---------------------------------------------------------------------------
+# Egress policy (Rego)
+# ---------------------------------------------------------------------------
+# Every request that is about to leave the machine is decided by a Rego policy,
+# so "may this client send this model to this provider" is reviewable by
+# someone who does not write Rust. Both `glob.match` and `regex.match` are
+# available. With no policy configured the built-in default applies, which is:
+# an open proxy stays open; an authenticated client is held to its allow-lists
+# and its budget.
+#
+# A policy failure refuses the request rather than forwarding it.
+
+[policy]
+enabled = true
+# files = ["policy.rego"]     # loaded in order; see policy.example.rego
+# inline = """
+# package llm.authz
+# import rego.v1
+# default allow := false
+# allow if input.request.estimated_tokens <= 4000
+# reason := "prompts over 4000 tokens are not permitted" if input.request.estimated_tokens > 4000
+# """
