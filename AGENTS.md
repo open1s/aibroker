@@ -131,8 +131,11 @@ not, add the test.
 6. **Admin auth fails closed.** No token and no `allow_insecure` means refuse,
    with a constant-time comparison.
 7. **Secrets never appear in admin responses.** `/admin/keys` and `/admin/status`
-   expose state, never `key`. `/admin/config` is the documented exception and is
-   token-gated.
+   expose state, never `key`. `/admin/config` used to be the documented
+   exception; it now redacts too. `Config::to_toml` is the **display** path and
+   redacts every credential value; `Config::to_toml_with_secrets(true)` is for
+   writing the file back and is the only caller that keeps them. Redacting in
+   `to_toml` rather than at each endpoint means a new endpoint cannot forget.
 
 ## Data security (what may leave the machine)
 

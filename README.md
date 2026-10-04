@@ -493,6 +493,31 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 `mode = "separate"` moves the whole control plane to its own listener
 (`admin.host`/`admin.port`) so it is unreachable from the proxy port at all.
 
+## Credentials in config dumps
+
+`--dump-config` and `GET /admin/config` exist so an operator can see the
+effective configuration, but the document contains every live API key. Both
+print **`<redacted>`** in place of each credential, and leave the structure —
+providers, models, clients, budgets, routes — intact:
+
+```toml
+[[providers.api_keys]]
+id = "k1"
+key = "<redacted>"
+```
+
+An `env:NAME` or `file:/path` reference is shown as itself: that is not the
+secret, and knowing which reference is configured is the point of the dump.
+
+The real values are printed only when asked for explicitly, and the flag says so:
+
+```bash
+aibroker --config config.toml --dump-config --dump-config-reveal-secrets
+```
+
+Writing the file back to disk (the admin API's `persist`) always keeps the real
+values, or a reload would lose them.
+
 ## Metrics
 
 `GET /metrics` returns Prometheus text:

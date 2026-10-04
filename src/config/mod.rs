@@ -511,6 +511,53 @@ impl Default for AdminConfig {
 // Secret resolution
 // ---------------------------------------------------------------------------
 
+/// The placeholder written in place of a credential.
+pub const REDACTED_SECRET: &str = "<redacted>";
+
+/// Replace credential values in a serialised config.
+///
+/// Works line by line on the key name rather than on a parsed document, because
+/// the values are exactly what must not be inspected. A key that holds a
+/// reference (`env:NAME`, `file:/path`) is left alone: it is not the secret, and
+/// seeing which reference is configured is the point of dumping the config.
+///
+/// Recognised keys: `token`, `key`, and `api_key` wherever they appear, which
+/// covers `[[clients]] token`, `[[providers.api_keys]] key` and `[admin] token`.
+pub fn redact_secrets_in_toml(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        match trimmed.split_once('=') {
+            Some((key, value)) if is_credential_key(key.trim()) => {
+                // The serialised value still carries its quotes; the reference
+                // check has to see the text inside them.
+                let value = value.trim().trim_matches('"');
+                // A reference is not a secret: `env:`/`file:` say where the real
+                // value lives, and which reference is configured is worth seeing
+                // in a dump.
+                if value.starts_with("env:") || value.starts_with("file:") {
+                    out.push_str(line);
+                } else {
+                    out.push_str(indent);
+                    out.push_str(key.trim());
+                    out.push_str(" = \"");
+                    out.push_str(REDACTED_SECRET);
+                    out.push('"');
+                }
+            }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether a config key holds a credential value.
+fn is_credential_key(key: &str) -> bool {
+    matches!(key, "token" | "key" | "api_key" | "password" | "secret")
+}
+
 /// Resolve a secret reference.
 ///
 /// - `env:NAME` reads the process environment;
@@ -585,15 +632,35 @@ impl Config {
     }
 
     /// Serialize the current document, used for admin-driven persistence.
+    /// Serialise for **display**.
+    ///
+    /// Every credential is replaced with a placeholder. This is the function
+    /// behind `--dump-config` and `GET /admin/config`, and it used to return the
+    /// document verbatim -- so a single token-gated request printed every live
+    /// API key the broker held. Redacting here rather than at each call site
+    /// means a new endpoint cannot forget to.
+    ///
+    /// Use [`Config::to_toml_with_secrets`] when the real values are required,
+    /// which is only ever for writing the file back to disk.
     pub fn to_toml(&self) -> Result<String> {
-        toml::to_string_pretty(self)
-            .map_err(|e| LlmBrokerError::InvalidConfig(format!("cannot serialize config: {e}")))
+        self.to_toml_with_secrets(false)
+    }
+
+    /// Serialise the document, optionally including real credentials.
+    pub fn to_toml_with_secrets(&self, include_secrets: bool) -> Result<String> {
+        let mut body = toml::to_string_pretty(self)
+            .map_err(|e| LlmBrokerError::InvalidConfig(format!("cannot serialize config: {e}")))?;
+        if !include_secrets {
+            body = redact_secrets_in_toml(&body);
+        }
+        Ok(body)
     }
 
     /// Write the current document back to `path` atomically.
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let body = self.to_toml()?;
+        // The file must keep the real secrets, or a reload would lose them.
+        let body = self.to_toml_with_secrets(true)?;
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, body).map_err(|e| {
             LlmBrokerError::InvalidConfig(format!("cannot write {}: {e}", tmp.display()))
@@ -783,5 +850,153 @@ impl LoadedConfig {
         let path = path.as_ref().to_path_buf();
         let config = Config::from_file(&path)?;
         Ok(Self { config, path })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal config; `Config` has no `Default` because every field is
+    /// required to be considered.
+    fn base_config() -> Config {
+        Config {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 11436,
+                threads: None,
+                daemon: false,
+                pid_file: None,
+                user: None,
+                group: None,
+                connect_timeout_ms: 2_000,
+                idle_timeout_ms: None,
+                read_timeout_ms: None,
+                write_timeout_ms: None,
+                max_retries: 3,
+                graceful_shutdown_secs: DEFAULT_GRACE_PERIOD_SECS,
+            },
+            proxy_type: None,
+            providers: Vec::new(),
+            routes: Vec::new(),
+            default_route: None,
+            load_balancing: LoadBalancingConfig::default(),
+            health: HealthConfig::default(),
+            observability: ObservabilityConfig::default(),
+            admin: AdminConfig::default(),
+            clients: Vec::new(),
+            policy: PolicyConfig::default(),
+            dump: DumpSection::default(),
+        }
+    }
+
+    fn provider_with_key(secret: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: "p".into(),
+            base_url: Some("http://127.0.0.1".into()),
+            path_prefix: None,
+            auth: None,
+            auth_query_param: None,
+            default_models: vec!["m".into()],
+            max_rpm: None,
+            max_tpm: None,
+            max_concurrency: None,
+            api_keys: vec![ApiKeyConfig {
+                id: "k1".into(),
+                key: secret.into(),
+                enabled: true,
+                models: vec!["m".into()],
+                weight: 1,
+                max_rpm: None,
+                max_tpm: None,
+                max_concurrency: None,
+                model_map: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn serialising_for_display_redacts_every_credential() {
+        // `GET /admin/config` and `--dump-config` both go through `to_toml`, so
+        // a regression here leaks every key the broker holds in one request.
+        let mut config = base_config();
+        config
+            .providers
+            .push(provider_with_key("nvapi-super-secret-value"));
+        config.admin.token = Some("admin-super-secret".into());
+        config.clients.push(ClientConfig {
+            name: "laptop".into(),
+            token: "client-super-secret".into(),
+            enabled: true,
+            allowed_models: vec![],
+            allowed_providers: vec![],
+            max_rpm: None,
+            max_tpm: None,
+            max_concurrency: None,
+        });
+
+        let shown = config.to_toml().expect("serialize");
+        for secret in [
+            "nvapi-super-secret-value",
+            "admin-super-secret",
+            "client-super-secret",
+        ] {
+            assert!(!shown.contains(secret), "leaked {secret}:\n{shown}");
+        }
+        assert!(shown.contains(REDACTED_SECRET), "{shown}");
+        // The structure stays visible; that is what the dump is for.
+        assert!(shown.contains("laptop"), "{shown}");
+        assert!(shown.contains("k1"), "{shown}");
+    }
+
+    #[test]
+    fn persistence_keeps_the_real_credentials() {
+        // Redacting on the way to disk would lose the keys on the next reload.
+        let mut config = base_config();
+        config
+            .providers
+            .push(provider_with_key("nvapi-super-secret-value"));
+
+        let written = config.to_toml_with_secrets(true).expect("serialize");
+        assert!(written.contains("nvapi-super-secret-value"), "{written}");
+        assert!(!written.contains(REDACTED_SECRET), "{written}");
+    }
+
+    #[test]
+    fn a_secret_reference_is_shown_rather_than_redacted() {
+        // `env:NAME` and `file:/path` are not the secret; seeing which reference
+        // is configured is exactly what a config dump is for.
+        for reference in ["env:MY_ADMIN_TOKEN", "file:/run/secrets/admin"] {
+            let mut config = base_config();
+            config.admin.token = Some(reference.into());
+            let shown = config.to_toml().unwrap();
+            // Match the assignment, not the bare text: `admin_token` in another
+            // key's *name* would otherwise satisfy the assertion by accident.
+            assert!(
+                shown.contains(&format!("token = \"{reference}\"")),
+                "{shown}"
+            );
+            assert!(!shown.contains(REDACTED_SECRET), "{shown}");
+        }
+    }
+
+    #[test]
+    fn the_redactor_leaves_unrelated_keys_alone() {
+        let body = "[server]\nport = 11436\nmodel = \"gpt-4o\"\nkey = \"secret\"\n";
+        let redacted = redact_secrets_in_toml(body);
+        assert!(redacted.contains("port = 11436"), "{redacted}");
+        assert!(redacted.contains("model = \"gpt-4o\""), "{redacted}");
+        assert!(redacted.contains("key = \"<redacted>\""), "{redacted}");
+        assert!(!redacted.contains("\"secret\""), "{redacted}");
+    }
+
+    #[test]
+    fn every_credential_spelling_is_recognised() {
+        for key in ["token", "key", "api_key", "password", "secret"] {
+            assert!(is_credential_key(key), "{key} should be redacted");
+        }
+        for key in ["port", "model", "host", "strategy", "path", "name"] {
+            assert!(!is_credential_key(key), "{key} should not be redacted");
+        }
     }
 }

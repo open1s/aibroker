@@ -23,7 +23,17 @@ struct Args {
     #[arg(long)]
     check: bool,
 
-    /// Print the effective configuration (including secrets) and exit.
+    /// Include real credentials in `--dump-config` output.
+    ///
+    /// Off by default: the dump is for review and pasting into a bug report, and
+    /// every credential is replaced with `<redacted>`.
+    #[arg(long)]
+    dump_config_reveal_secrets: bool,
+
+    /// Print the effective configuration and exit.
+    ///
+    /// Credentials are replaced with `<redacted>` unless
+    /// `--dump-config-reveal-secrets` is also given..
     #[arg(long)]
     dump_config: bool,
 
@@ -115,7 +125,12 @@ fn main() {
     }
 
     if args.dump_config {
-        match config.to_toml() {
+        if args.dump_config_reveal_secrets {
+            eprintln!(
+                "warning: --dump-config-reveal-secrets prints every credential in clear text"
+            );
+        }
+        match config.to_toml_with_secrets(args.dump_config_reveal_secrets) {
             Ok(toml) => println!("{toml}"),
             Err(error) => {
                 eprintln!("failed to serialize config: {error}");
