@@ -47,16 +47,7 @@ impl Redactor {
     pub fn new(rules: &[(String, String)]) -> Result<Self, String> {
         let mut compiled = Vec::with_capacity(rules.len());
         for (pattern, replacement) in rules {
-            let regex = Regex::new(pattern)
-                .map_err(|e| format!("invalid redaction pattern `{pattern}`: {e}"))?;
-            // A pattern that can match an empty string would replace at every
-            // position and destroy the dump.
-            if regex.is_match("") {
-                return Err(format!(
-                    "redaction pattern `{pattern}` matches the empty string, which would \
-                     rewrite the whole dump"
-                ));
-            }
+            let regex = compile_pattern(pattern)?;
             compiled.push(RedactionRule {
                 pattern: pattern.clone(),
                 replacement: if replacement.trim().is_empty() {
@@ -124,6 +115,24 @@ impl Redactor {
     }
 }
 
+/// Compile a user-supplied regex, rejecting the pathological cases.
+///
+/// Shared with the content guard so both features agree on what a usable
+/// pattern is, and so both fail at startup rather than on the first request.
+///
+/// A pattern that can match the empty string is rejected: for redaction it
+/// would rewrite an entire dump, and for scanning it would "detect" every
+/// request ever made, which is worse than useless in a security control.
+pub fn compile_pattern(pattern: &str) -> Result<Regex, String> {
+    let regex = Regex::new(pattern).map_err(|e| format!("invalid pattern `{pattern}`: {e}"))?;
+    if regex.is_match("") {
+        return Err(format!(
+            "pattern `{pattern}` matches empty, so it matches everything"
+        ));
+    }
+    Ok(regex)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,7 +187,7 @@ mod tests {
         // The whole point: an operator learns at startup, not when the traffic
         // is already being logged unredacted.
         let error = Redactor::new(&pairs(&[("(unclosed", "")])).unwrap_err();
-        assert!(error.contains("invalid redaction pattern"), "{error}");
+        assert!(error.contains("invalid pattern"), "{error}");
         assert!(error.contains("(unclosed"), "{error}");
     }
 
@@ -186,7 +195,9 @@ mod tests {
     fn a_pattern_matching_the_empty_string_is_rejected() {
         // `a*` matches "" and would insert the mask between every character.
         let error = Redactor::new(&pairs(&[("a*", "")])).unwrap_err();
-        assert!(error.contains("empty string"), "{error}");
+        assert!(error.contains("matches everything"), "{error}");
+        // The pattern is named, so an operator can find it.
+        assert!(error.contains("a*"), "{error}");
     }
 
     #[test]

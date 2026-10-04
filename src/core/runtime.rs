@@ -13,6 +13,7 @@ use parking_lot::RwLock;
 
 use crate::config::{Config, LoadedConfig};
 use crate::core::broker::Broker;
+use crate::core::content::{ContentGuard, GuardAction};
 use crate::core::key_state::{CooldownPolicy, HealthTuning, KeySnapshot, KeyState};
 use crate::core::metrics::Registry;
 use crate::core::policy::PolicyEngine;
@@ -34,6 +35,8 @@ pub struct Runtime {
     policy: Arc<PolicyEngine>,
     /// Candidate policy evaluated on live traffic but never enforced.
     shadow_policy: Option<Arc<PolicyEngine>>,
+    /// Inspection of request content before it is forwarded.
+    content_guard: Option<Arc<ContentGuard>>,
     config_path: Option<PathBuf>,
 }
 
@@ -48,6 +51,7 @@ impl Runtime {
         let clients = Arc::new(ClientRegistry::from_config(&config.clients)?);
         let policy = Arc::new(PolicyEngine::from_config(&config.policy)?);
         let shadow_policy = PolicyEngine::from_dry_run(&config.policy)?.map(Arc::new);
+        let content_guard = build_content_guard(&config.content_guard)?.map(Arc::new);
         Ok(Self {
             config,
             broker,
@@ -55,6 +59,7 @@ impl Runtime {
             clients,
             policy,
             shadow_policy,
+            content_guard,
             config_path,
         })
     }
@@ -85,6 +90,11 @@ impl Runtime {
     /// The compiled egress policy.
     pub fn policy(&self) -> &Arc<PolicyEngine> {
         &self.policy
+    }
+
+    /// The content guard, when one is configured.
+    pub fn content_guard(&self) -> Option<&Arc<ContentGuard>> {
+        self.content_guard.as_ref()
     }
 
     /// The shadow policy, when one is configured for evaluation only.
@@ -136,6 +146,7 @@ impl Runtime {
         let clients = Arc::new(ClientRegistry::from_config(&candidate.clients)?);
         let policy = Arc::new(PolicyEngine::from_config(&candidate.policy)?);
         let shadow_policy = PolicyEngine::from_dry_run(&candidate.policy)?.map(Arc::new);
+        let content_guard = build_content_guard(&candidate.content_guard)?.map(Arc::new);
         restore_state(&broker, &previous);
 
         self.config = candidate;
@@ -143,6 +154,7 @@ impl Runtime {
         self.clients = clients;
         self.policy = policy;
         self.shadow_policy = shadow_policy;
+        self.content_guard = content_guard;
         self.metrics
             .config_reloads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -173,12 +185,14 @@ impl Runtime {
         let clients = Arc::new(ClientRegistry::from_config(&config.clients)?);
         let policy = Arc::new(PolicyEngine::from_config(&config.policy)?);
         let shadow_policy = PolicyEngine::from_dry_run(&config.policy)?.map(Arc::new);
+        let content_guard = build_content_guard(&config.content_guard)?.map(Arc::new);
         restore_state(&broker, &previous);
         self.config = config;
         self.broker = broker;
         self.clients = clients;
         self.policy = policy;
         self.shadow_policy = shadow_policy;
+        self.content_guard = content_guard;
         self.metrics
             .config_reloads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -215,6 +229,39 @@ fn restore_state(broker: &Broker, snapshot: &HashMap<(String, String), KeySnapsh
 
 /// Shared, lock-protected runtime.
 pub type SharedRuntime = Arc<RwLock<Runtime>>;
+
+/// Compile the content guard from config.
+///
+/// An unknown `action` is a configuration error rather than a silent fallback:
+/// defaulting a misspelled `deny` to `report` would leave the operator
+/// believing traffic is being blocked when it is only being counted.
+fn build_content_guard(config: &crate::config::ContentGuardConfig) -> Result<Option<ContentGuard>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let action = match config.action.as_deref() {
+        Some(value) => GuardAction::parse(value).ok_or_else(|| {
+            LlmBrokerError::InvalidConfig(format!(
+                "content_guard.action `{value}` is not `report` or `deny`"
+            ))
+        })?,
+        None => GuardAction::Report,
+    };
+    if config.patterns.is_empty() {
+        return Err(LlmBrokerError::InvalidConfig(
+            "content_guard is enabled but lists no patterns, so it would inspect nothing"
+                .to_string(),
+        ));
+    }
+    let rules: Vec<(String, String)> = config
+        .patterns
+        .iter()
+        .map(|p| (p.name.clone(), p.pattern.clone()))
+        .collect();
+    let guard = ContentGuard::new(&rules, &config.allow, action)
+        .map_err(|e| LlmBrokerError::InvalidConfig(format!("content_guard is unusable: {e}")))?;
+    Ok(Some(guard))
+}
 
 /// Wrap a runtime for sharing between the proxy and admin threads.
 pub fn shared(runtime: Runtime) -> SharedRuntime {
@@ -293,6 +340,7 @@ mod tests {
             clients: Vec::new(),
             policy: Default::default(),
             dump: Default::default(),
+            content_guard: Default::default(),
         }
     }
 

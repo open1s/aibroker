@@ -299,3 +299,38 @@ enabled = true
 # allow if input.request.estimated_tokens <= 4000
 # reason := "prompts over 4000 tokens would be refused" if input.request.estimated_tokens > 4000
 # """
+
+# ---------------------------------------------------------------------------
+# Content guard: what must not appear inside a prompt
+# ---------------------------------------------------------------------------
+# Metadata checks (which client, which model, which provider) cannot see an API
+# key pasted into a prompt or a customer's email in a diff. This scans the
+# request body itself, before it is forwarded.
+#
+# `report` only counts and logs findings; `deny` refuses the request with 403.
+# Start with `report`: a content scanner should be watched against real traffic
+# before it is allowed to refuse anything.
+#
+# A finding names the rule, never the matched text -- a security log that
+# repeats the secret becomes the leak.
+#
+# [content_guard]
+# enabled = true
+# action = "report"
+# allow = ["EXAMPLE", "example\\.com"]   # bodies matching any of these are skipped
+#
+# [[content_guard.patterns]]
+# name = "aws-key"
+# pattern = "AKIA[0-9A-Z]{16}"
+#
+# [[content_guard.patterns]]
+# name = "private-key"
+# pattern = "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+#
+# [[content_guard.patterns]]
+# name = "github-token"
+# pattern = "ghp_[A-Za-z0-9]{20,}"
+#
+# [[content_guard.patterns]]
+# name = "email"
+# pattern = "[\\w.+-]+@[\\w-]+\\.[\\w.]+"

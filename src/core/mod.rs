@@ -8,6 +8,7 @@
 pub mod api;
 pub mod auth;
 pub mod broker;
+pub mod content;
 pub mod key_state;
 pub mod metrics;
 pub mod policy;
@@ -19,6 +20,7 @@ pub mod strategy;
 
 pub use api::ApiFormat;
 pub use broker::{Broker, RouteError, SelectedKey};
+pub use content::{ContentGuard, Finding, GuardAction};
 pub use key_state::{CooldownPolicy, HealthState, HealthTuning, KeyState, Outcome, TokenUsage};
 pub use policy::{PolicyDecision, PolicyEngine, PolicySource, RequestFacts};
 pub use pool::{KeyPool, KeyStatus, SelectError};

@@ -846,6 +846,7 @@ mod tests {
             clients: Vec::new(),
             policy: Default::default(),
             dump: Default::default(),
+            content_guard: Default::default(),
         };
         shared(Runtime::new(config, None).unwrap())
     }

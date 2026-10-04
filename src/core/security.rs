@@ -48,6 +48,8 @@ pub enum DenyReason {
     TooManyInFlight,
     /// The policy engine failed; traffic is refused rather than forwarded.
     PolicyError,
+    /// The request body matched a configured content rule.
+    ContentForbidden,
 }
 
 impl DenyReason {
@@ -61,6 +63,7 @@ impl DenyReason {
             DenyReason::RateLimited => "rate_limited",
             DenyReason::TooManyInFlight => "too_many_in_flight",
             DenyReason::PolicyError => "policy_error",
+            DenyReason::ContentForbidden => "content_forbidden",
         }
     }
 
@@ -73,6 +76,7 @@ impl DenyReason {
             | DenyReason::ProviderForbidden => 403,
             DenyReason::RateLimited | DenyReason::TooManyInFlight => 429,
             DenyReason::PolicyError => 500,
+            DenyReason::ContentForbidden => 403,
         }
     }
 
@@ -95,6 +99,7 @@ impl DenyReason {
             DenyReason::RateLimited => "client request budget exhausted",
             DenyReason::TooManyInFlight => "client concurrency budget exhausted",
             DenyReason::PolicyError => "the egress policy could not be evaluated",
+            DenyReason::ContentForbidden => "the request body matched a content rule",
         }
     }
 

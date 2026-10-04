@@ -485,6 +485,16 @@ impl ProxyService {
             header.insert_header("WWW-Authenticate", "Bearer realm=\"LLM Broker\"")?;
         }
         session.set_keepalive(None);
+
+        // Discard whatever the client has already sent. A refusal can happen
+        // after pingora has begun reading the request body, and anything still
+        // in flight would otherwise keep streaming to the upstream -- which is
+        // how a "blocked" request could still deliver its body. Draining first
+        // is also what makes the connection reusable.
+        if let Err(error) = session.drain_request_body().await {
+            debug!("could not drain the request body after a refusal: {error}");
+        }
+
         session
             .write_response_header(Box::new(header), false)
             .await?;
@@ -723,6 +733,8 @@ impl ProxyHttp for ProxyService {
     where
         Self::CTX: Send + Sync,
     {
+        let guard = self.runtime.read().content_guard().map(Arc::clone);
+
         // Record the model for logging, metrics and token estimation. It does
         // not drive routing: the upstream was already chosen before this filter
         // ran (see `resolve_early_model`).
@@ -756,6 +768,62 @@ impl ProxyHttp for ProxyService {
                 // The endpoint usually settles the dialect, but a payload whose
                 // shape contradicts it wins: the provider reads the body.
                 ctx.api_format = detect_format(ApiFormat::from_path(&path), Some(&payload));
+            }
+
+            // Inspect the content itself: an API key pasted into a prompt, a
+            // customer's email, an ID number. This is the only check that looks
+            // at what is actually about to leave the building.
+            //
+            // The verdict is reduced to owned data before anything is awaited:
+            // holding the guard across `.await` makes this future non-`Send`,
+            // and pingora requires `Send`.
+            let verdict = guard.as_ref().and_then(|guard| {
+                guard
+                    .scan(ctx.body.bytes())
+                    .map(|finding| (guard.action(), finding))
+            });
+            if let Some((action, finding)) = verdict {
+                self.runtime
+                    .read()
+                    .metrics()
+                    .content_findings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                warn!(
+                    target: "llm_broker::content",
+                    model = ctx.model.as_deref().unwrap_or("-"),
+                    action = action.as_str(),
+                    // Names the rule, never the match: a security log that
+                    // repeats the secret becomes the leak.
+                    finding = %finding.describe(),
+                    "request content matched a guard pattern"
+                );
+
+                if action == crate::core::content::GuardAction::Deny {
+                    // Neutralise the chunk *and* refuse.
+                    //
+                    // Returning `Err` is not sufficient: measured over repeated
+                    // runs, the body sometimes reached the provider anyway
+                    // (pingora streams the chunk it just handed to the filter).
+                    // Emptying it makes the leak impossible regardless of which
+                    // path forwards it, and `refuse` drains the remainder.
+                    if let Some(chunk) = body.as_mut() {
+                        chunk.clear();
+                    }
+                    let detail = format!(
+                        "the request body matched the `{}` content rule",
+                        finding.rule
+                    );
+                    return self
+                        .refuse(
+                            session,
+                            ctx,
+                            DenyReason::ContentForbidden,
+                            None,
+                            Some(&detail),
+                        )
+                        .await;
+                }
             }
         }
         let _ = end_of_stream;
@@ -1409,6 +1477,7 @@ mod tests {
             admin: Default::default(),
             clients: Vec::new(),
             dump: Default::default(),
+            content_guard: Default::default(),
             policy: Default::default(),
         }
     }

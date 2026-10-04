@@ -63,6 +63,41 @@ pub struct Config {
     /// Request/response dumping for LLM debugging.
     #[serde(default)]
     pub dump: DumpSection,
+
+    /// Inspection of request *content* before it is forwarded.
+    #[serde(default)]
+    pub content_guard: ContentGuardConfig,
+}
+
+/// `[content_guard]` — what must not appear inside a prompt.
+///
+/// Metadata checks (which client, which model, which provider) cannot see an API
+/// key pasted into a prompt or a customer's email in a diff. This section lists
+/// the shapes worth catching, and what to do when one appears.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContentGuardConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `report` (default) only counts and logs findings; `deny` refuses the
+    /// request with 403 before the body is forwarded.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Named patterns, applied in order. The first match is reported.
+    #[serde(default)]
+    pub patterns: Vec<ContentPattern>,
+    /// Bodies matching any of these are skipped entirely, so a documentation
+    /// example or a test fixture does not train people to ignore the guard.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+/// One named content pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentPattern {
+    /// Stable name, used in logs and metrics and never replaced by the match.
+    pub name: String,
+    /// The regex.
+    pub pattern: String,
 }
 
 /// `[dump]` — the debug dump, and what to hide inside it.
@@ -890,6 +925,7 @@ mod tests {
             clients: Vec::new(),
             policy: PolicyConfig::default(),
             dump: DumpSection::default(),
+            content_guard: ContentGuardConfig::default(),
         }
     }
 

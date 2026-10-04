@@ -530,6 +530,42 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 `mode = "separate"` moves the whole control plane to its own listener
 (`admin.host`/`admin.port`) so it is unreachable from the proxy port at all.
 
+## What is *inside* the prompt
+
+Every check above looks at metadata: who is calling, which model, which
+provider, how many tokens. None of them can see an API key pasted into a prompt,
+a customer's email in a diff, or a private key in a file about to be summarised.
+`[content_guard]` scans the request body itself:
+
+```toml
+[content_guard]
+enabled = true
+action = "report"          # report (default) | deny
+allow = ["EXAMPLE"]        # bodies matching these are skipped
+
+[[content_guard.patterns]]
+name = "aws-key"
+pattern = "AKIA[0-9A-Z]{16}"
+
+[[content_guard.patterns]]
+name = "private-key"
+pattern = "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+```
+
+- **`report` is the default**, and it is the honest one: a content scanner needs
+  to be watched against real traffic before it is allowed to refuse anything. It
+  counts findings (`llm_broker_content_findings_total`) and logs the rule.
+- **`deny` refuses with 403 before the body reaches the provider.** Measured: with
+  a matching body the upstream sees nothing, and `0` occurrences of the secret.
+- **A finding names the rule, never the match.** A security log that repeats the
+  secret becomes the leak.
+- **An allow-list runs first**, so a documentation example or a test fixture does
+  not train people to ignore the guard.
+- **Enable it without patterns and the broker refuses to start** — looking like
+  protection while inspecting nothing is worse than being off.
+- A body larger than the scan limit (`server.request_scan_limit`, 256 KiB) is
+  reported as `body-over-scan-limit` rather than silently passing.
+
 ## Credentials in config dumps
 
 `--dump-config` and `GET /admin/config` exist so an operator can see the

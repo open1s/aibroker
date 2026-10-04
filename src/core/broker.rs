@@ -491,6 +491,7 @@ mod tests {
             clients: Vec::new(),
             policy: Default::default(),
             dump: Default::default(),
+            content_guard: Default::default(),
         }
     }
 

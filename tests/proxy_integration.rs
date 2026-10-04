@@ -181,6 +181,7 @@ fn base_config(
         admin: Default::default(),
         clients: Vec::new(),
         dump: Default::default(),
+        content_guard: Default::default(),
         policy: Default::default(),
     }
 }
@@ -1457,4 +1458,212 @@ fn a_broken_shadow_policy_fails_at_startup() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("invalid policy"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Content inspection: what is inside the prompt.
+// ---------------------------------------------------------------------------
+
+const SECRET_BODY: &str = r#"{"model":"test-model","messages":[{"role":"user","content":"my key is AKIAIOSFODNN7EXAMPLE"}]}"#;
+
+fn content_config(action: &str) -> aibroker::config::ContentGuardConfig {
+    aibroker::config::ContentGuardConfig {
+        enabled: true,
+        action: Some(action.to_string()),
+        patterns: vec![aibroker::config::ContentPattern {
+            name: "aws-key".into(),
+            pattern: r"AKIA[0-9A-Z]{16}".into(),
+        }],
+        allow: vec![],
+    }
+}
+
+fn guarded_broker(
+    action: &str,
+) -> (
+    u16,
+    Arc<Mutex<Vec<SeenRequest>>>,
+    aibroker::core::runtime::SharedRuntime,
+) {
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200; 12]);
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.content_guard = content_config(action);
+    let runtime = spawn_broker_with_runtime(config, proxy_port);
+    (proxy_port, seen, runtime)
+}
+
+#[test]
+fn a_secret_in_a_prompt_is_refused_before_it_is_forwarded() {
+    // The whole point of inspecting content: this body never reaches the
+    // provider.
+    let (port, seen, _runtime) = guarded_broker("deny");
+    let response = post_with_model(
+        port,
+        "/v1/chat/completions",
+        SECRET_BODY,
+        Some("test-model"),
+    );
+
+    assert_eq!(response.status, 403, "{}", response.status_line);
+    // The upstream request *headers* may already have been written when the
+    // body filter refuses -- pingora streams the body after the header -- so the
+    // property to assert is not "no connection", it is "the content never left".
+    // Measured: the mock sees the path with an empty body.
+    let requests = seen.lock().expect("lock").clone();
+    for request in &requests {
+        assert!(
+            !request.body.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the secret reached the provider in {}: {}",
+            request.path,
+            request.body
+        );
+        assert!(
+            request.body.is_empty(),
+            "the body should have been aborted, not forwarded: {}",
+            request.body
+        );
+    }
+
+    eprintln!(
+        "PROBE status={} broker_error={:?} body={}",
+        response.status,
+        response.headers.get("x-llm-broker-error"),
+        response.body
+    );
+    assert!(
+        response.body.contains("aws-key"),
+        "the refusal should name the rule: {}",
+        response.body
+    );
+    assert!(
+        !response.body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "the refusal must never echo the secret: {}",
+        response.body
+    );
+}
+
+#[test]
+fn a_clean_prompt_is_forwarded_normally() {
+    let (port, seen, _runtime) = guarded_broker("deny");
+    let response = post_with_model(port, "/v1/chat/completions", CHAT_BODY, Some("test-model"));
+
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    assert_eq!(seen.lock().expect("lock").len(), 1);
+}
+
+#[test]
+fn report_mode_counts_a_finding_and_still_forwards() {
+    // The honest default: find out what the patterns match against real traffic
+    // before letting them refuse anything.
+    let (port, seen, runtime) = guarded_broker("report");
+    let before = runtime
+        .read()
+        .metrics()
+        .content_findings
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let response = post_with_model(
+        port,
+        "/v1/chat/completions",
+        SECRET_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    assert_eq!(
+        seen.lock().expect("lock").len(),
+        1,
+        "report mode must still forward"
+    );
+
+    let after = runtime
+        .read()
+        .metrics()
+        .content_findings
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(after - before, 1, "the finding should have been counted");
+}
+
+#[test]
+fn a_pattern_that_matches_nothing_reports_nothing() {
+    let (port, _seen, runtime) = guarded_broker("report");
+    let before = runtime
+        .read()
+        .metrics()
+        .content_findings
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let response = post_with_model(port, "/v1/chat/completions", CHAT_BODY, Some("test-model"));
+    assert_eq!(response.status, 200, "{}", response.status_line);
+
+    let after = runtime
+        .read()
+        .metrics()
+        .content_findings
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(after, before, "a clean body must not be reported");
+}
+
+#[test]
+fn a_guard_without_patterns_is_a_configuration_error() {
+    // Enabling the guard and listing nothing would look like protection while
+    // inspecting nothing.
+    let upstream_port = free_port();
+    let mut config = base_config(
+        free_port(),
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.content_guard = aibroker::config::ContentGuardConfig {
+        enabled: true,
+        action: None,
+        patterns: vec![],
+        allow: vec![],
+    };
+
+    let error = match Runtime::new(config, None) {
+        Ok(_) => panic!("an empty guard must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("no patterns"), "{error}");
+}
+
+#[test]
+fn an_unknown_guard_action_is_a_configuration_error() {
+    // Silently falling back to `report` would leave an operator believing
+    // traffic is blocked when it is only counted.
+    let upstream_port = free_port();
+    let mut config = base_config(
+        free_port(),
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.content_guard = content_config("blck");
+
+    let error = match Runtime::new(config, None) {
+        Ok(_) => panic!("a misspelled action must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("not `report` or `deny`"),
+        "{error}"
+    );
 }

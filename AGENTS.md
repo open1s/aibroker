@@ -75,6 +75,7 @@ src/
     security.rs            Client tokens, egress scopes, per-client budgets
     policy.rs              Rego egress policy (regorus); builds policy facts
     api.rs                 API dialect classification; ?model= parsing
+    content.rs             Prompt-body scanning: secrets and PII before egress
     key_state.rs           Per-key health, cooldown, limits, counters, KeyGuard
     ratelimit.rs           Sliding-window RPM/TPM limiter
     pool.rs                KeyPool: availability gate + strategy dispatch
@@ -160,6 +161,22 @@ uploaded, and the client's in-flight slot is released in `logging`.
   regression test asserts both halves -- requests served, and the counter moved
   -- since asserting only the status would pass even if the shadow engine were
   never called.
+- **Content inspection is opt-in per pattern, and `report` is the default.**
+  There is no attempt to guess what "sensitive" means; an operator lists the
+  shapes they care about, and watches them in `report` mode before switching to
+  `deny`. Enabling the guard with no patterns is a startup error rather than a
+  no-op, because that looks like protection while inspecting nothing.
+- **A "blocked" request must not have been forwarded.** The content guard
+  (`core/content.rs`, `[content_guard]`) refuses a body containing a configured
+  pattern. Returning `Err` from `request_body_filter` is **not** sufficient:
+  measured over repeated runs, the chunk pingora had just handed to the filter
+  still reached the provider sometimes, so the guard reported 403 while the data
+  left. The refusal now empties the chunk *and* drains the remainder, which is
+  what makes the guarantee real. Any future "refuse mid-stream" control needs the
+  same treatment, plus a test that asserts the upstream saw no secret -- asserting
+  the status code alone passes while the data escapes.
+- **A finding never carries the match.** It names the rule and the field. A
+  security log that repeats the secret becomes the leak.
 - **A policy failure refuses the request.** A broker that forwards traffic when
   its policy engine is broken is worse than one that returns 500. An invalid
   policy fails at `Runtime::new`, not on the first request.
