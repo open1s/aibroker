@@ -179,6 +179,8 @@ fn base_config(
         health: Default::default(),
         observability: Default::default(),
         admin: Default::default(),
+        clients: Vec::new(),
+        policy: Default::default(),
     }
 }
 
@@ -276,7 +278,86 @@ struct HttpResponse {
     body: String,
 }
 
-/// `post`, optionally announcing the model in `x-llm-model`.
+/// POST with an optional client credential, to exercise the edge check.
+fn post_as_client(
+    port: u16,
+    path: &str,
+    body: &str,
+    model: Option<&str>,
+    token: Option<&str>,
+) -> HttpResponse {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to broker");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+
+    let model_header = match model {
+        Some(model) => format!("x-llm-model: {model}\r\n"),
+        None => String::new(),
+    };
+    let auth_header = match token {
+        Some(token) => format!("Authorization: Bearer {token}\r\n"),
+        None => String::new(),
+    };
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n{model_header}{auth_header}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write request");
+    stream.flush().ok();
+
+    let mut buffered: Vec<u8> = Vec::new();
+    let header_end = loop {
+        if let Some(position) = find_subslice(&buffered, b"\r\n\r\n") {
+            break position;
+        }
+        let mut chunk = [0u8; 4096];
+        let read = stream.read(&mut chunk).expect("read response");
+        if read == 0 {
+            break buffered.len();
+        }
+        buffered.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&buffered[..header_end]).to_string();
+    let status_line = head.lines().next().unwrap_or_default().to_string();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let mut response_body = buffered[header_end + 4..].to_vec();
+
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    while response_body.len() < content_length {
+        let mut chunk = [0u8; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => response_body.extend_from_slice(&chunk[..read]),
+        }
+    }
+
+    let mut headers = HashMap::new();
+    for line in head.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    HttpResponse {
+        status,
+        status_line,
+        headers,
+        body: String::from_utf8_lossy(&response_body).to_string(),
+    }
+}
+
 fn post_with_model(port: u16, path: &str, body: &str, model: Option<&str>) -> HttpResponse {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to broker");
     stream
@@ -773,4 +854,264 @@ fn a_rate_limited_key_is_skipped_by_the_next_request() {
         first_key, third_key,
         "the cooled-down key must not be picked again immediately"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Data security: who may send what, proven over the wire.
+// ---------------------------------------------------------------------------
+
+fn client_config(
+    name: &str,
+    token: &str,
+    models: &[&str],
+    providers: &[&str],
+) -> aibroker::config::ClientConfig {
+    aibroker::config::ClientConfig {
+        name: name.into(),
+        token: token.into(),
+        enabled: true,
+        allowed_models: models.iter().map(|m| (*m).to_string()).collect(),
+        allowed_providers: providers.iter().map(|p| (*p).to_string()).collect(),
+        max_rpm: None,
+        max_tpm: None,
+        max_concurrency: None,
+    }
+}
+
+/// A broker with clients configured and one healthy upstream.
+fn secured_broker(
+    clients: Vec<aibroker::config::ClientConfig>,
+) -> (u16, Arc<Mutex<Vec<SeenRequest>>>) {
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200, 200, 200, 200, 200, 200, 200, 200]);
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.clients = clients;
+    spawn_broker(config, proxy_port);
+    (proxy_port, seen)
+}
+
+#[test]
+fn a_request_without_a_client_token_is_refused_before_it_is_forwarded() {
+    let (port, seen) = secured_broker(vec![client_config("laptop", "tok-good", &[], &[])]);
+    let response = post_as_client(
+        port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+        None,
+    );
+
+    assert_eq!(response.status, 401, "{}", response.status_line);
+    assert_eq!(
+        response.headers.get("www-authenticate").map(String::as_str),
+        Some("Bearer realm=\"LLM Broker\""),
+        "a client needs to know how to authenticate"
+    );
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "an unauthenticated request must never reach the provider"
+    );
+}
+
+#[test]
+fn an_unknown_client_token_is_refused_without_reaching_the_provider() {
+    let (port, seen) = secured_broker(vec![client_config("laptop", "tok-good", &[], &[])]);
+    let response = post_as_client(
+        port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+        Some("tok-guessed"),
+    );
+
+    assert_eq!(response.status, 401, "{}", response.status_line);
+    assert!(
+        !response.body.contains("tok-guessed"),
+        "the refusal must not echo the presented token"
+    );
+    assert!(seen.lock().expect("lock").is_empty());
+}
+
+#[test]
+fn a_permitted_client_is_proxied_normally() {
+    let (port, seen) = secured_broker(vec![client_config("laptop", "tok-good", &["test-*"], &[])]);
+    let response = post_as_client(
+        port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+        Some("tok-good"),
+    );
+
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    assert_eq!(
+        seen.lock().expect("lock").len(),
+        1,
+        "the request should have been forwarded exactly once"
+    );
+}
+
+#[test]
+fn a_model_outside_the_client_allow_list_never_leaves_the_machine() {
+    // The whole point: content for a forbidden model must not be uploaded.
+    let (port, seen) = secured_broker(vec![client_config(
+        "laptop",
+        "tok-good",
+        &["claude-*"],
+        &[],
+    )]);
+    let response = post_as_client(
+        port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+        Some("tok-good"),
+    );
+
+    assert_eq!(response.status, 403, "{}", response.status_line);
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "a forbidden model must not be forwarded"
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-llm-broker-error")
+            .map(String::as_str),
+        Some("model_forbidden")
+    );
+}
+
+#[test]
+fn two_clients_get_their_own_rules() {
+    let (port, _seen) = secured_broker(vec![
+        client_config("restricted", "tok-a", &["claude-*"], &[]),
+        client_config("allowed", "tok-b", &["test-*"], &[]),
+    ]);
+
+    let restricted = post_as_client(
+        port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+        Some("tok-a"),
+    );
+    assert_eq!(restricted.status, 403, "{}", restricted.status_line);
+
+    let allowed = post_as_client(
+        port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+        Some("tok-b"),
+    );
+    assert_eq!(
+        allowed.status, 200,
+        "client B's rules must not be affected by client A: {}",
+        allowed.status_line
+    );
+}
+
+#[test]
+fn an_open_proxy_needs_no_token() {
+    // The single-user default must keep working: no clients configured.
+    let (port, seen) = secured_broker(vec![]);
+    let response = post_as_client(
+        port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+        None,
+    );
+
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    assert_eq!(seen.lock().expect("lock").len(), 1);
+}
+
+#[test]
+fn a_policy_denial_is_enforced_and_explained() {
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200]);
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    // A policy that refuses this specific model, and says why.
+    config.policy = aibroker::config::PolicyConfig {
+        enabled: true,
+        files: vec![],
+        inline: r#"package llm.authz
+import rego.v1
+default allow := false
+allow if input.request.model != "test-model"
+reason := "test-model is not permitted by policy" if input.request.model == "test-model"
+"#
+        .to_string(),
+        inline_name: "test.rego".to_string(),
+    };
+    spawn_broker(config, proxy_port);
+
+    let response = post_as_client(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+        None,
+    );
+
+    assert_eq!(response.status, 403, "{}", response.status_line);
+    assert!(
+        response
+            .body
+            .contains("test-model is not permitted by policy"),
+        "the policy's own reason should reach the caller: {}",
+        response.body
+    );
+    assert!(seen.lock().expect("lock").is_empty());
+}
+
+#[test]
+fn a_broken_policy_refuses_traffic_instead_of_forwarding_it() {
+    // Fail closed: a policy that cannot be evaluated must not become an
+    // open door. `Runtime::new` rejects an invalid policy outright, so this
+    // asserts the refusal at construction time.
+    let upstream_port = free_port();
+    let mut config = base_config(
+        free_port(),
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.policy = aibroker::config::PolicyConfig {
+        enabled: true,
+        files: vec![],
+        inline: "package llm.authz\nthis is not valid rego\n".to_string(),
+        inline_name: "broken.rego".to_string(),
+    };
+
+    let error = match Runtime::new(config, None) {
+        Ok(_) => panic!("a broken policy must fail the runtime"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid policy"), "{error}");
 }

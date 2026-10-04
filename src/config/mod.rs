@@ -50,6 +50,72 @@ pub struct Config {
 
     #[serde(default)]
     pub admin: AdminConfig,
+
+    /// Callers allowed to use the proxy. Empty means "no client
+    /// authentication", which is the single-user default.
+    #[serde(default)]
+    pub clients: Vec<ClientConfig>,
+
+    /// Egress policy, written in Rego.
+    #[serde(default)]
+    pub policy: PolicyConfig,
+}
+
+/// A caller of the proxy.
+///
+/// The token identifies the caller; the allow-lists are the rules the built-in
+/// policy applies. Both are exposed to a custom Rego policy as `input.client`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientConfig {
+    pub name: String,
+    /// `env:NAME`, `file:/path`, or a literal token.
+    pub token: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Model patterns (`gpt-*`); empty means any model.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    /// Provider patterns; empty means any provider.
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tpm: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+}
+
+/// Rego policy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyConfig {
+    /// When false, the built-in default policy decides.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Rego files, in load order.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Inline Rego, for a policy too small to be worth a file.
+    #[serde(default)]
+    pub inline: String,
+    /// Name given to the inline policy in error messages.
+    #[serde(default = "default_inline_name")]
+    pub inline_name: String,
+}
+
+fn default_inline_name() -> String {
+    "inline.rego".to_string()
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            files: Vec::new(),
+            inline: String::new(),
+            inline_name: default_inline_name(),
+        }
+    }
 }
 
 /// Downstream listener settings.
@@ -428,16 +494,44 @@ impl Default for AdminConfig {
 // Secret resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve `env:NAME` references against the process environment.
+/// Resolve a secret reference.
+///
+/// - `env:NAME` reads the process environment;
+/// - `file:/path` reads the first line of a file, which is how container and
+///   Kubernetes deployments usually mount a secret without putting it in the
+///   environment (visible to `ps`, `/proc`, crash dumps and child processes);
+/// - anything else is a literal value.
+///
+/// The file form trims only the trailing newline, so a secret that ends in a
+/// space is preserved.
 pub fn resolve_secret(value: &str) -> Result<String> {
-    let Some(name) = value.strip_prefix("env:") else {
-        return Ok(value.to_string());
-    };
-    std::env::var(name).map_err(|_| {
-        LlmBrokerError::InvalidConfig(format!(
-            "secret `env:{name}` is set in the config but the environment variable is missing"
-        ))
-    })
+    if let Some(name) = value.strip_prefix("env:") {
+        return std::env::var(name).map_err(|_| {
+            LlmBrokerError::InvalidConfig(format!(
+                "secret `env:{name}` is set in the config but the environment variable is missing"
+            ))
+        });
+    }
+
+    if let Some(path) = value.strip_prefix("file:") {
+        if path.is_empty() {
+            return Err(LlmBrokerError::InvalidConfig(
+                "secret `file:` is missing a path".to_string(),
+            ));
+        }
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            LlmBrokerError::InvalidConfig(format!("cannot read secret file `{path}`: {e}"))
+        })?;
+        let secret = contents.strip_suffix('\n').unwrap_or(&contents);
+        if secret.is_empty() {
+            return Err(LlmBrokerError::InvalidConfig(format!(
+                "secret file `{path}` is empty"
+            )));
+        }
+        return Ok(secret.to_string());
+    }
+
+    Ok(value.to_string())
 }
 
 impl AdminConfig {

@@ -9,13 +9,17 @@ pub mod auth;
 pub mod broker;
 pub mod key_state;
 pub mod metrics;
+pub mod policy;
 pub mod pool;
 pub mod ratelimit;
 pub mod runtime;
+pub mod security;
 pub mod strategy;
 
 pub use broker::{Broker, RouteError, SelectedKey};
 pub use key_state::{CooldownPolicy, HealthState, HealthTuning, KeyState, Outcome, TokenUsage};
+pub use policy::{PolicyDecision, PolicyEngine, PolicySource, RequestFacts};
 pub use pool::{KeyPool, KeyStatus, SelectError};
 pub use runtime::{Runtime, SharedRuntime};
+pub use security::{ClientAccess, ClientDecision, ClientRegistry, ClientStatus, DenyReason};
 pub use strategy::Strategy;

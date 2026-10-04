@@ -812,6 +812,8 @@ mod tests {
             health: Default::default(),
             observability: Default::default(),
             admin: Default::default(),
+            clients: Vec::new(),
+            policy: Default::default(),
         };
         shared(Runtime::new(config, None).unwrap())
     }

@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::core::key_state::{KeyGuard, KeyState, TokenUsage};
+
+use crate::core::security::ClientAccess;
 use crate::proxy::body::UsageAccumulator;
 use crate::proxy::dump::{Dump, DumpConfig};
 use crate::proxy::pingora_backend::BodyBuffer;
@@ -48,6 +50,10 @@ pub struct RequestContext {
     pub client_gone: bool,
     /// Request/response dump state, present only when diagnostics are on.
     pub dump: Option<Dump>,
+    /// The authenticated client whose in-flight slot this request holds.
+    pub client_hold: Option<Arc<ClientAccess>>,
+    /// Whether the edge check (authentication + policy) has run.
+    pub edge_checked: bool,
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -85,6 +91,8 @@ impl Default for RequestContext {
             settled: false,
             client_gone: false,
             dump: None,
+            client_hold: None,
+            edge_checked: false,
         }
     }
 }

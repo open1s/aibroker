@@ -15,6 +15,8 @@ use crate::config::{Config, LoadedConfig};
 use crate::core::broker::Broker;
 use crate::core::key_state::{CooldownPolicy, HealthTuning, KeySnapshot, KeyState};
 use crate::core::metrics::Registry;
+use crate::core::policy::PolicyEngine;
+use crate::core::security::ClientRegistry;
 use crate::core::strategy::Strategy;
 use crate::error::{LlmBrokerError, Result};
 
@@ -23,6 +25,13 @@ pub struct Runtime {
     config: Config,
     broker: Broker,
     metrics: Arc<Registry>,
+    /// Authenticated callers. Empty means the proxy is open.
+    ///
+    /// `Arc` so a request can hold its in-flight slot after the runtime lock is
+    /// released.
+    clients: Arc<ClientRegistry>,
+    /// Egress policy, evaluated per request.
+    policy: Arc<PolicyEngine>,
     config_path: Option<PathBuf>,
 }
 
@@ -34,10 +43,14 @@ impl Runtime {
     pub fn new(config: Config, config_path: Option<PathBuf>) -> Result<Self> {
         config.validate_secrets()?;
         let broker = Broker::from_config(&config)?;
+        let clients = Arc::new(ClientRegistry::from_config(&config.clients)?);
+        let policy = Arc::new(PolicyEngine::from_config(&config.policy)?);
         Ok(Self {
             config,
             broker,
             metrics: Arc::new(Registry::new()),
+            clients,
+            policy,
             config_path,
         })
     }
@@ -58,6 +71,21 @@ impl Runtime {
 
     pub fn metrics(&self) -> &Arc<Registry> {
         &self.metrics
+    }
+
+    /// Authenticated callers.
+    pub fn clients(&self) -> &Arc<ClientRegistry> {
+        &self.clients
+    }
+
+    /// The compiled egress policy.
+    pub fn policy(&self) -> &Arc<PolicyEngine> {
+        &self.policy
+    }
+
+    /// Whether the proxy requires a client token.
+    pub fn requires_client_auth(&self) -> bool {
+        self.clients.is_configured()
     }
 
     pub fn config_path(&self) -> Option<&std::path::Path> {
@@ -96,10 +124,16 @@ impl Runtime {
         candidate.validate_secrets()?;
 
         let broker = Broker::from_config(&candidate)?;
+        // Compile the security plane before committing, so a policy with a
+        // syntax error cannot replace a working one.
+        let clients = Arc::new(ClientRegistry::from_config(&candidate.clients)?);
+        let policy = Arc::new(PolicyEngine::from_config(&candidate.policy)?);
         restore_state(&broker, &previous);
 
         self.config = candidate;
         self.broker = broker;
+        self.clients = clients;
+        self.policy = policy;
         self.metrics
             .config_reloads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -127,9 +161,13 @@ impl Runtime {
         config.validate_secrets()?;
         let previous = self.snapshot_state();
         let broker = Broker::from_config(&config)?;
+        let clients = Arc::new(ClientRegistry::from_config(&config.clients)?);
+        let policy = Arc::new(PolicyEngine::from_config(&config.policy)?);
         restore_state(&broker, &previous);
         self.config = config;
         self.broker = broker;
+        self.clients = clients;
+        self.policy = policy;
         self.metrics
             .config_reloads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -241,6 +279,8 @@ mod tests {
             health: Default::default(),
             observability: Default::default(),
             admin: Default::default(),
+            clients: Vec::new(),
+            policy: Default::default(),
         }
     }
 

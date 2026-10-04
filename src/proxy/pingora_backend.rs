@@ -23,7 +23,9 @@ use url::Url;
 use crate::config::{AdminMode, Config};
 use crate::core::key_state::{Outcome, TokenUsage};
 use crate::core::metrics::estimate_cost_micros;
+use crate::core::policy::build_facts;
 use crate::core::runtime::{Runtime, SharedRuntime, shared};
+use crate::core::security::{ClientDecision, DenyReason, presented_token};
 use crate::core::strategy::parse_retry_after;
 use crate::proxy::admin::{AdminCredentials, AdminRequest, AdminResponse, AdminRouter};
 use crate::proxy::body::{
@@ -246,6 +248,191 @@ impl ProxyService {
         runtime
             .broker()
             .select(model, &ctx.excluded, ctx.estimated_tokens)
+    }
+
+    /// Authenticate the caller and apply the egress policy, once, before the
+    /// request body is streamed upstream.
+    ///
+    /// When clients are configured a missing or unknown token is refused here,
+    /// so disallowed content is never forwarded. When the request is admitted,
+    /// the in-flight slot is held by `ctx.client_guard_id` until the response
+    /// is logged.
+    ///
+    /// Returns `Ok(())` to proxy, or `Err` once a refusal has been written.
+    #[allow(clippy::too_many_arguments)]
+    async fn enforce_client_access(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+    ) -> pingora::Result<()> {
+        let (registry, policy, providers, metrics, requires_auth) = {
+            let runtime = self.runtime.read();
+            (
+                Arc::clone(runtime.clients()),
+                Arc::clone(runtime.policy()),
+                runtime.broker().route_candidates(ctx.model.as_deref()),
+                Arc::clone(runtime.metrics()),
+                runtime.requires_client_auth(),
+            )
+        };
+        let _ = requires_auth;
+
+        let header = session.req_header();
+        let authorization = header
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        let api_key = header
+            .headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok());
+        let token = presented_token(authorization, api_key);
+
+        // Which client, if any.
+        let client = match registry.authenticate(token) {
+            ClientDecision::Allowed(client) => Some(client),
+            ClientDecision::Open => None,
+            ClientDecision::Denied(denied) => {
+                let is_auth = matches!(
+                    denied.reason,
+                    DenyReason::MissingCredential | DenyReason::UnknownCredential
+                );
+                if is_auth {
+                    metrics
+                        .rejected_client_auth
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    metrics
+                        .rejected_policy
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                metrics.record_denial(denied.reason.as_str());
+                if denied.reason.is_security_event() {
+                    warn!(
+                        reason = denied.reason.as_str(),
+                        path = %session.req_header().uri.path(),
+                        "refused a request at the edge"
+                    );
+                }
+                return self
+                    .refuse(session, ctx, denied.reason, denied.retry_after, None)
+                    .await;
+            }
+        };
+
+        // The policy decides on top of authentication.
+        let scheme = if api_key.is_some() {
+            "api-key"
+        } else if authorization.is_some() {
+            "bearer"
+        } else {
+            "none"
+        };
+        let facts = build_facts(
+            client.as_deref(),
+            client.is_some() || !registry.is_configured(),
+            scheme,
+            ctx.model.as_deref(),
+            session.req_header().uri.path(),
+            session.req_header().method.as_str(),
+            // The body has not been read yet, so neither the streaming flag
+            // nor an accurate token estimate exists; the policy sees the
+            // header-derived estimate from the path/headers only.
+            false,
+            ctx.estimated_tokens,
+            &providers,
+            None,
+            true,
+        );
+        match policy.check(&facts) {
+            Ok(decision) if decision.allowed => {}
+            Ok(decision) => {
+                metrics
+                    .rejected_policy
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics.record_denial(&decision.reason);
+                if let Some(client) = client {
+                    client.record_policy_denial();
+                }
+                warn!(
+                    model = ctx.model.as_deref().unwrap_or("-"),
+                    reason = %decision.reason,
+                    "refused a request by policy"
+                );
+                return self
+                    .refuse(
+                        session,
+                        ctx,
+                        DenyReason::ModelForbidden,
+                        None,
+                        Some(&decision.reason),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                // A broken policy must never forward traffic.
+                tracing::error!("policy evaluation failed, refusing the request: {error}");
+                metrics
+                    .rejected_policy
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics.record_denial("policy_error");
+                return self
+                    .refuse(
+                        session,
+                        ctx,
+                        DenyReason::PolicyError,
+                        None,
+                        Some("policy evaluation failed"),
+                    )
+                    .await;
+            }
+        }
+
+        // Hold the client's in-flight slot for the whole request.
+        if let Some(client) = client {
+            client.begin();
+            ctx.client_hold = Some(client.clone());
+        }
+        Ok(())
+    }
+
+    /// Write a refusal and stop the request.
+    async fn refuse(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        reason: DenyReason,
+        retry_after: Option<Duration>,
+        detail: Option<&str>,
+    ) -> pingora::Result<()> {
+        let status = reason.status();
+        let body = serde_json::json!({
+            "error": {
+                "message": detail.unwrap_or_else(|| reason.message()),
+                "type": "llm_broker_refusal",
+                "reason": reason.as_str(),
+            }
+        })
+        .to_string();
+
+        let mut header = ResponseHeader::build(status, None)?;
+        header.insert_header("Content-Type", "application/json")?;
+        header.insert_header("Content-Length", body.len().to_string())?;
+        header.insert_header("Cache-Control", "no-store")?;
+        header.insert_header("X-LLM-Broker-Error", reason.as_str())?;
+        if let Some(wait) = retry_after {
+            header.insert_header("Retry-After", wait.as_secs().max(1).to_string())?;
+        }
+        if status == 401 {
+            header.insert_header("WWW-Authenticate", "Bearer realm=\"LLM Broker\"")?;
+        }
+        session.set_keepalive(None);
+        session
+            .write_response_header(Box::new(header), false)
+            .await?;
+        session.write_response_body(Some(body.into()), true).await?;
+        ctx.settled = true;
+        Ok(())
     }
 
     fn settle(&self, ctx: &mut RequestContext, outcome: Outcome) {
@@ -505,6 +692,14 @@ impl ProxyHttp for ProxyService {
         // streamed (see `resolve_early_model`).
         self.resolve_early_model(session, ctx);
 
+        // Authenticate the caller and apply the egress policy before any body
+        // is forwarded. A refusal here means disallowed content never leaves
+        // the machine. This runs once per request, not per retry.
+        if ctx.attempts == 0 && !ctx.edge_checked {
+            self.enforce_client_access(session, ctx).await?;
+            ctx.edge_checked = true;
+        }
+
         let mut selection = self.select(ctx, ctx.model.as_deref());
         if let Err(error) = &selection
             && let Some(wait) = error.retry_after()
@@ -760,6 +955,12 @@ impl ProxyHttp for ProxyService {
         ctx: &mut Self::CTX,
         _client_reused: bool,
     ) -> Box<pingora::Error> {
+        // A refusal written at the edge is already a complete response; do not
+        // treat it as an upstream failure or let pingora retry it.
+        if ctx.settled && ctx.guard.is_none() && !ctx.response_started {
+            return error;
+        }
+
         let etype = error.etype().clone();
         warn!(
             "upstream error: {error} (peer: {peer}, key: {}, attempt: {})",
@@ -820,6 +1021,10 @@ impl ProxyHttp for ProxyService {
     ) where
         Self::CTX: Send + Sync,
     {
+        // Release the authenticated client's concurrency slot exactly once.
+        if let Some(client) = ctx.client_hold.take() {
+            client.end();
+        }
         let outcome = match ctx.upstream_status {
             Some(status) if (200..300).contains(&status) => Outcome::Success,
             Some(429) => Outcome::RateLimited { retry_after: None },
@@ -1079,6 +1284,8 @@ mod tests {
             health: Default::default(),
             observability: Default::default(),
             admin: Default::default(),
+            clients: Vec::new(),
+            policy: Default::default(),
         }
     }
 

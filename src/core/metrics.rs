@@ -58,6 +58,9 @@ pub struct Registry {
     pub keys_exhausted: AtomicU64,
     pub rejected_no_key: AtomicU64,
     pub rejected_admin_auth: AtomicU64,
+    /// Requests refused by client authentication or the egress policy.
+    pub rejected_client_auth: AtomicU64,
+    pub rejected_policy: AtomicU64,
     pub requests_in_flight: AtomicU64,
     pub config_reloads: AtomicU64,
     pub tokens_in_total: AtomicU64,
@@ -67,6 +70,8 @@ pub struct Registry {
     keys: Mutex<BTreeMap<String, Arc<KeyMetrics>>>,
     /// Per `"provider/model"` counters.
     models: Mutex<BTreeMap<String, Arc<KeyMetrics>>>,
+    /// Client denials by reason (`missing_credential`, `model_forbidden`, ...).
+    client_denials: Mutex<BTreeMap<String, u64>>,
     started_at: std::time::Instant,
 }
 
@@ -88,6 +93,9 @@ impl Registry {
             keys_exhausted: AtomicU64::new(0),
             rejected_no_key: AtomicU64::new(0),
             rejected_admin_auth: AtomicU64::new(0),
+            rejected_client_auth: AtomicU64::new(0),
+            rejected_policy: AtomicU64::new(0),
+            client_denials: Mutex::new(BTreeMap::new()),
             requests_in_flight: AtomicU64::new(0),
             config_reloads: AtomicU64::new(0),
             tokens_in_total: AtomicU64::new(0),
@@ -220,6 +228,27 @@ impl Registry {
         }
     }
 
+    /// Record a refused request against its reason.
+    ///
+    /// The reason is a fixed set in [`crate::core::security::DenyReason`], so
+    /// the label cardinality is bounded.
+    pub fn record_denial(&self, reason: &str) {
+        *self
+            .client_denials
+            .lock()
+            .expect("metrics mutex poisoned")
+            .entry(reason.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// Denial counts by reason.
+    pub fn client_denials(&self) -> BTreeMap<String, u64> {
+        self.client_denials
+            .lock()
+            .expect("metrics mutex poisoned")
+            .clone()
+    }
+
     /// Render Prometheus text format.
     pub fn render_prometheus(&self) -> String {
         let mut out = String::with_capacity(8 * 1024);
@@ -292,6 +321,36 @@ impl Registry {
             "Admin API requests rejected for a bad token.",
             self.rejected_admin_auth.load(Ordering::Relaxed)
         );
+        counter!(
+            "llm_broker_client_auth_failures_total",
+            "Proxy requests rejected for a missing or unknown client token.",
+            self.rejected_client_auth.load(Ordering::Relaxed)
+        );
+        counter!(
+            "llm_broker_policy_denials_total",
+            "Requests refused by the egress policy (model, provider or budget).",
+            self.rejected_policy.load(Ordering::Relaxed)
+        );
+        let denials = self.client_denials();
+        if !denials.is_empty() {
+            out.push_str(
+                "# HELP llm_broker_client_denials_total Client requests refused, by reason.\n",
+            );
+            out.push_str("# TYPE llm_broker_client_denials_total counter\n");
+            for (reason, count) in denials {
+                // Reasons come from a fixed enum, so no label escaping is
+                // needed; assert that rather than trusting it silently.
+                debug_assert!(
+                    reason
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                    "unexpected characters in a denial reason: {reason}"
+                );
+                out.push_str(&format!(
+                    "llm_broker_client_denials_total{{reason=\"{reason}\"}} {count}\n"
+                ));
+            }
+        }
         counter!(
             "llm_broker_config_reloads_total",
             "Successful configuration reloads.",
