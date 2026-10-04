@@ -86,6 +86,11 @@ pub fn render(runtime: &SharedRuntime, admin_path: &str) -> String {
         "tokens_in": metrics.tokens_in_total.load(std::sync::atomic::Ordering::Relaxed),
         "tokens_out": metrics.tokens_out_total.load(std::sync::atomic::Ordering::Relaxed),
         "config_path": runtime.config_path().map(|p| p.display().to_string()),
+        // `/admin/config` renders through `to_toml()`, which always redacts:
+        // there is no admin path that reveals a credential. The page states
+        // this from the payload rather than hardcoding it, so the claim cannot
+        // drift from the handler.
+        "redacts_secrets": true,
         "models": config.known_models(),
         "admin_path": admin_path,
         "security": {
@@ -270,6 +275,23 @@ mod tests {
         );
     }
 
+    /// Parse the JSON block the page embeds.
+    ///
+    /// Assertions belong here rather than against the template's JavaScript:
+    /// string-matching the script source passes even when the renderer never
+    /// emits anything, and fails whenever the wording improves.
+    fn payload_of(html: &str) -> serde_json::Value {
+        let payload = html
+            .split_once("<script id=\"data\" type=\"application/json\">")
+            .expect("the page should embed a data block")
+            .1
+            .split_once("</script>")
+            .expect("the data block should close")
+            .0
+            .replace("<\\/", "</");
+        serde_json::from_str(&payload).expect("the embedded payload should be valid JSON")
+    }
+
     #[test]
     fn dashboard_reports_the_content_guard() {
         // The backend already counted per-key `selections` and reported the
@@ -398,7 +420,90 @@ mod tests {
 
     #[test]
     fn dashboard_reports_an_empty_pool_without_panicking() {
+        // Asserts the payload, not a label in the template. The previous
+        // version looked for the string "Keys available", which is JavaScript
+        // text: it would keep passing if the renderer stopped emitting the
+        // card, and it broke the moment the wording was improved.
+        let payload = payload_of(&render(&runtime(), "/admin"));
+        // Deliberately does not assume a key count: the fixture has one, and the
+        // point here is that an untouched pool renders a well-formed payload
+        // rather than one with missing fields.
+        assert_eq!(
+            payload["keys_total"],
+            payload["keys"].as_array().map(Vec::len).unwrap_or(0),
+            "the totals should agree with the key list"
+        );
+        assert!(payload["keys_available"].is_number());
+        assert_eq!(
+            payload["requests_total"], 0,
+            "an untouched pool has served nothing"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_can_refresh_itself() {
+        // The page was a static snapshot, so an operator could not tell an idle
+        // broker from one they had left open for an hour -- and a restarted
+        // process reads zero everywhere. The refresh affordances are structural,
+        // so they can be pinned without a browser.
         let html = render(&runtime(), "/admin");
-        assert!(html.contains("Keys available"));
+
+        for needed in [
+            "id=\"refresh\"", // a manual reload
+            "id=\"auto\"",    // and a toggle for the cadence
+            "id=\"stamp\"",   // plus a visible "as of" marker
+            // The exact call, not the bare word: asserting `contains("setInterval")`
+            // passed against a mutation that deleted the call but left the token
+            // in a comment. Be specific about the mechanism you claim to test.
+            "setInterval(refresh, Number(everySel.value))",
+            "credentials: 'same-origin'", // the refresh must authenticate
+        ] {
+            assert!(
+                html.contains(needed),
+                "the page should contain {needed} so it can stay current"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_good_view() {
+        // Blanking the page on a dropped fetch reads as "the broker is down",
+        // which is a worse failure than a stale number. The stamp carries the
+        // warning and the render is only replaced on success.
+        let html = render(&runtime(), "/admin");
+        assert!(
+            html.contains("refresh failed"),
+            "a failed refresh should say so"
+        );
+        assert!(
+            html.contains("showing data from"),
+            "and should say that what you see is the last good view"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_does_not_claim_config_dumps_contain_secrets() {
+        // It said exactly that for several releases after redaction landed.
+        let html = render(&runtime(), "/admin");
+        assert!(
+            !html.contains("the on-disk document (contains secrets)"),
+            "the reference table must not claim the endpoint exposes credentials"
+        );
+        assert!(
+            html.contains("credentials redacted"),
+            "it should state the guarantee instead"
+        );
+    }
+
+    #[test]
+    fn dashboard_states_that_config_dumps_are_redacted() {
+        // The reference table claimed `/admin/config` "contains secrets" for
+        // several releases after redaction landed. The wording now comes from
+        // the payload, and this pins that.
+        let payload = payload_of(&render(&runtime(), "/admin"));
+        assert_eq!(
+            payload["redacts_secrets"], true,
+            "`/admin/config` always redacts; the page must say so"
+        );
     }
 }

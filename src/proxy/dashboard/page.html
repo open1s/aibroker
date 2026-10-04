@@ -6,203 +6,342 @@
 <meta name="robots" content="noindex, nofollow">
 <title>LLM Broker</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --line: color-mix(in srgb, currentColor 16%, transparent);
+    --line-soft: color-mix(in srgb, currentColor 10%, transparent);
+    --tint: color-mix(in srgb, currentColor 7%, transparent);
+  }
   * { box-sizing: border-box; }
   body { margin: 0; padding: 24px; font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
   h1 { font-size: 18px; margin: 0 0 4px; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; opacity: .6; margin: 28px 0 8px; }
-  .sub { opacity: .6; margin-bottom: 20px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
-  .card { border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; padding: 10px 12px; }
-  .card .label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .07em; opacity: .55;
+       margin: 30px 0 10px; font-weight: 600; }
+  .sub { opacity: .6; margin-bottom: 16px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .muted { opacity: .55; }
+
+  /* The refresh bar: the page used to be a static snapshot, so an operator could
+     not tell an idle broker from a page they had left open for an hour. */
+  .bar-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+             padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px;
+             background: var(--tint); margin-bottom: 4px; }
+  .bar-top .spacer { flex: 1; }
+  .bar-top label { font-size: 12px; opacity: .7; }
+  button { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px;
+           border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--tint); }
+  button:disabled { opacity: .5; cursor: default; }
+  .stale { color: #9a6700; font-weight: 600; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 10px; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .card .label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; }
   .card .value { font-size: 20px; font-variant-numeric: tabular-nums; }
+  .card .hint { font-size: 11px; opacity: .55; }
+
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); white-space: nowrap; }
-  th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; font-weight: 600; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line-soft); }
+  th { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; font-weight: 600; }
   td.num, th.num { text-align: right; }
-  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 12px; border: 1px solid currentColor; }
+  tbody tr:hover { background: var(--tint); }
+
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11.5px;
+          border: 1px solid currentColor; white-space: nowrap; }
   .ok { color: #0a7d33; }
   .warn { color: #9a6700; }
   .bad { color: #c1272d; }
   .off { opacity: .5; }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .muted { opacity: .55; }
-  /* A share bar, so an uneven pool is visible at a glance rather than by
-     comparing two numbers across rows. */
-  .bar { display: inline-block; width: 64px; height: 8px; border-radius: 4px; vertical-align: middle;
-         background: color-mix(in srgb, currentColor 15%, transparent); overflow: hidden; }
-  .bar .fill { display: block; height: 100%; background: currentColor; opacity: .65; }
+
+  .bar { display: inline-block; width: 56px; height: 7px; border-radius: 4px; vertical-align: middle;
+         background: var(--line); overflow: hidden; margin-right: 6px; }
+  .bar .fill { display: block; height: 100%; background: currentColor; opacity: .6; }
+
+  /* Reference material, demoted so it does not compete with live state. */
+  details { margin-top: 30px; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; }
+  details summary { cursor: pointer; font-size: 12px; text-transform: uppercase;
+                    letter-spacing: .07em; opacity: .55; padding: 8px 0; font-weight: 600; }
+  details table { margin-bottom: 10px; }
+  details th { width: 240px; text-transform: none; letter-spacing: 0; font-size: 12.5px; opacity: .85; }
+
+  @media (max-width: 700px) {
+    body { padding: 14px; }
+    .scroll { overflow-x: auto; }
+  }
 </style>
 </head>
 <body data-admin-path="@ADMIN_PATH@">
 <h1>LLM Broker</h1>
 <div class="sub">Read-only view. State changes go through the JSON admin API.</div>
-<div id="app">Loading…</div>
-<noscript><p class="muted">JavaScript is disabled: the JSON endpoints below still work.</p></noscript>
-<h2>JSON API</h2>
+
+<div class="bar-top">
+  <button id="refresh" title="Reload now">Refresh</button>
+  <label><input type="checkbox" id="auto" checked> auto</label>
+  <label for="every">every</label>
+  <select id="every">
+    <option value="2000">2s</option>
+    <option value="5000" selected>5s</option>
+    <option value="15000">15s</option>
+    <option value="60000">1m</option>
+  </select>
+  <span class="spacer"></span>
+  <span id="stamp" class="muted">loading…</span>
+</div>
+
+<div id="app"><noscript><p class="muted">JavaScript is disabled: the JSON
+endpoints listed at the bottom still work.</p></noscript><p class="muted">Loading…</p></div>
+
+<details>
+<summary>JSON API</summary>
 <table><tbody>
 <tr><th><code>@ADMIN_PATH@/status</code></th><td class="muted">GET &mdash; providers, key counts, in-flight, strategy</td></tr>
 <tr><th><code>@ADMIN_PATH@/keys</code></th><td class="muted">GET &mdash; per-key state, never the secret</td></tr>
+<tr><th><code>@ADMIN_PATH@/security</code></th><td class="muted">GET &mdash; clients, scopes, budgets, content rules</td></tr>
 <tr><th><code>@ADMIN_PATH@/models</code></th><td class="muted">GET &mdash; models the config declares</td></tr>
 <tr><th><code>@ADMIN_PATH@/routes</code></th><td class="muted">GET &mdash; the compiled routing table</td></tr>
-<tr><th><code>@ADMIN_PATH@/config</code></th><td class="muted">GET &mdash; the on-disk document (contains secrets)</td></tr>
+<tr><th><code>@ADMIN_PATH@/config</code></th><td class="muted">GET &mdash; the on-disk document, <span id="cfg-redaction">credentials redacted</span>. <code>--dump-config-reveal-secrets</code> is a CLI flag and does not affect this endpoint.</td></tr>
 <tr><th><code>@ADMIN_PATH@/config/strategy</code></th><td class="muted">GET, PUT &mdash; read or change the selection strategy</td></tr>
 <tr><th><code>@ADMIN_PATH@/metrics</code></th><td class="muted">GET &mdash; Prometheus text</td></tr>
-<tr><th><code>metrics</code> (proxy port)</th><td class="muted">GET <code>/metrics</code></td></tr>
+<tr><th><code>metrics</code> (proxy port)</th><td class="muted">GET <code>metrics</code></td></tr>
 </tbody></table>
 <p class="muted">Mutating routes (add/patch/delete/enable/disable/reset a key,
-<code>config/reload</code>) are documented in the README and require the same
-token.</p>
+<code>config/reload</code>) are documented in the README and require the same token.</p>
+</details>
+
 <script id="data" type="application/json">@PAYLOAD@</script>
 <script>
-const d = JSON.parse(document.getElementById('data').textContent);
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num = (n) => (n === null || n === undefined) ? '—' : Number(n).toLocaleString();
-const secs = (s) => s === null || s === undefined ? '—' : (s >= 60 ? Math.round(s/60) + 'm' : s + 's');
-
-function card(label, value, cls) {
-  return `<div class="card"><div class="label">${esc(label)}</div>` +
-         `<div class="value ${cls || ''}">${esc(value)}</div></div>`;
-}
-
-function keyRow(k) {
-  const cooling = k.cooldown_secs !== null && k.cooldown_secs !== undefined;
-  let state = cooling ? 'cooling ' + secs(k.cooldown_secs) : k.state;
-  let cls = !k.enabled || cooling ? 'off' : (k.state === 'closed' ? 'ok' : 'warn');
-  const rpm = k.max_rpm ? `${num(k.rpm)} / ${num(k.max_rpm)}` : num(k.rpm);
-  const tpm = k.max_tpm ? `${num(k.tpm)} / ${num(k.max_tpm)}` : num(k.tpm);
-  return `<tr class="${!k.enabled ? 'off' : ''}">
-    <td>${esc(k.provider)}</td>
-    <td><code>${esc(k.id)}</code></td>
-    <td><span class="pill ${cls}">${esc(k.enabled ? state : 'disabled')}</span></td>
-    <td class="num">${(k.health * 100).toFixed(0)}%</td>
-    <td class="num">${k.latency_ms === null ? '—' : Math.round(k.latency_ms) + 'ms'}</td>
-    <td class="num">${num(k.in_flight)}</td>
-    <td class="num">${rpm}</td>
-    <td class="num">${tpm}</td>
-    <td class="num">${num(k.successes)} / ${num(k.failures)}</td>
-    <td class="num">${k.rate_limited ? '<span class="warn">' + num(k.rate_limited) + '</span>' : '0'}</td>
-    <td class="num">${num(k.tokens_in)} / ${num(k.tokens_out)}</td>
-    <td class="num">${bar(share(k))}</td>
-  </tr>`;
-}
-
-const healthy = d.keys.filter((k) => k.enabled && (k.cooldown_secs === null || k.cooldown_secs === undefined)).length;
-
-// Share of this run's traffic each key actually served. A pool can be "healthy"
-// and still be sending everything to one key -- that was true of two strategies
-// once -- so the distribution has to be visible, not inferable.
-const totalSelections = d.keys.reduce((sum, k) => sum + (k.selections || 0), 0);
-const share = (k) => totalSelections > 0 ? (k.selections || 0) / totalSelections : 0;
-const bar = (fraction) => {
-  const pct = Math.round(fraction * 100);
-  return `<span class="bar"><span class="fill" style="width:${pct}%"></span></span> ${pct}%`;
+const secs = (s) => {
+  if (s === null || s === undefined) return '—';
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+  return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
 };
-let html = '';
-html += '<h2>Overview</h2><div class="cards">';
-html += card('Keys available', healthy + ' / ' + d.keys_total, healthy === 0 ? 'bad' : 'ok');
-html += card('In flight', num(d.requests_in_flight));
-html += card('Requests', num(d.requests_total));
-html += card('Key rotations', num(d.rotations));
-html += card('Upstream failures', num(d.failures), d.failures ? 'warn' : '');
-html += card('Pool exhausted', num(d.exhausted), d.exhausted ? 'warn' : '');
-html += card('Tokens in', num(d.tokens_in));
-html += card('Tokens out', num(d.tokens_out));
-html += card('Uptime', Math.floor(d.uptime_seconds / 60) + 'm');
-html += '</div>';
 
-html += '<h2>Configuration</h2>';
-html += '<table><tbody>';
-html += `<tr><th>Strategy</th><td><code>${esc(d.strategy)}</code>${d.fallbacks.length ? ' → ' + d.fallbacks.map(esc).join(' → ') : ''}</td></tr>`;
-html += `<tr><th>Config file</th><td><code>${esc(d.config_path || '(none — admin API only)')}</code></td></tr>`;
-html += `<tr><th>Models</th><td>${d.models.length ? d.models.map((m) => '<code>' + esc(m) + '</code>').join(' ') : '<span class="muted">none declared</span>'}</td></tr>`;
-html += `<tr><th>Routes</th><td>${d.routes.length ? d.routes.map((r) => '<code>' + esc(r.pattern) + '</code> → ' + esc(r.providers.join(', '))).join('<br>') : '<span class="muted">none</span>'}</td></tr>`;
-html += '</tbody></table>';
+function card(label, value, cls, hint) {
+  return '<div class="card"><div class="label">' + esc(label) + '</div>' +
+         '<div class="value ' + (cls || '') + '">' + esc(value) + '</div>' +
+         (hint ? '<div class="hint">' + esc(hint) + '</div>' : '') + '</div>';
+}
 
-html += '<h2>Who may send what</h2>';
-const sec = d.security || {};
-const clients = sec.clients || [];
-// The two states are exclusive: a closed proxy lists its clients, an open one
-// says so. The wording lives here once, but `security.open_warning` in the
-// payload is what the renderer and its tests agree on.
-if (sec.client_auth_required === true) {
-  const denialRows = Object.entries(sec.denials || {});
-  html += '<div class="cards">';
-  html += card('Clients', num(clients.length), 'ok');
-  html += card('Egress policy', sec.policy_source === 'rego' ? 'Rego' : 'built-in default', 'ok');
-  const guard = sec.content_guard;
-  html += card(
-    'Prompt content',
-    guard ? (guard.action === 'deny' ? 'blocking' : 'reporting') : 'not inspected',
-    guard ? (guard.action === 'deny' ? 'ok' : 'warn') : 'warn'
-  );
-  html += card('Refused', num(denialRows.reduce((a, [, n]) => a + n, 0)), denialRows.length ? 'warn' : '');
-  html += '</div>';
-  if (denialRows.length) {
-    html += '<p class="muted">Refused by reason: ' +
-      denialRows.map(([r, n]) => `<code>${esc(r)}</code> ${num(n)}`).join(' · ') + '</p>';
+function render(d) {
+  const keys = d.keys || [];
+  const totalSelections = keys.reduce((s, k) => s + (k.selections || 0), 0);
+  const share = (k) => totalSelections > 0 ? (k.selections || 0) / totalSelections : 0;
+  const bar = (f) => {
+    const pct = Math.round(f * 100);
+    return '<span class="bar"><span class="fill" style="width:' + pct + '%"></span></span> ' + pct + '%';
+  };
+
+  const healthy = keys.filter((k) => k.enabled && (k.cooldown_secs === null || k.cooldown_secs === undefined)).length;
+  // A restarted process legitimately reads zero everywhere. Saying so beats
+  // leaving an operator to wonder whether the page or the broker is broken.
+  const idle = (d.requests_total | 0) === 0;
+
+  let html = '';
+
+  if (d.security && d.security.open_warning && d.security.client_auth_required !== true) {
+    html += '<p class="warn">' + esc(d.security.open_warning) + '</p>';
   }
-} else {
-  html += `<p class="warn">${esc(sec.open_warning)}</p>`;
-}
-if (sec.content_guard && (sec.content_guard.rules || []).length) {
-  html += `<p class="muted">Content rules: ${sec.content_guard.rules.map((r) => '<code>' + esc(r) + '</code>').join(' ')}</p>`;
-} else {
-  html += '<p class="warn">No content rules: prompt bodies are forwarded without inspection.</p>';
-}
-if (sec.policy_from) {
-  html += `<p class="muted">Policy loaded from <code>${esc(sec.policy_from)}</code>.</p>`;
-}
-if (sec.client_auth_required === true && clients.length) {
-  html += '<table><thead><tr><th>Client</th><th>Models</th><th>Providers</th><th class="num">RPM</th><th class="num">TPM</th><th class="num">In flight</th><th class="num">Admitted</th><th class="num">Refused</th></tr></thead><tbody>';
-  html += clients.map((c) => `<tr class="${c.enabled ? '' : 'off'}">
-    <td>${esc(c.name)}${c.enabled ? '' : ' <span class="pill off">disabled</span>'}</td>
-    <td>${(c.allowed_models || []).length ? c.allowed_models.map((m) => '<code>' + esc(m) + '</code>').join(' ') : '<span class="muted">any</span>'}</td>
-    <td>${(c.allowed_providers || []).length ? c.allowed_providers.map((p) => '<code>' + esc(p) + '</code>').join(' ') : '<span class="muted">any</span>'}</td>
-    <td class="num">${c.max_rpm ? num(c.rpm) + ' / ' + num(c.max_rpm) : num(c.rpm)}</td>
-    <td class="num">${c.max_tpm ? num(c.tpm) + ' / ' + num(c.max_tpm) : num(c.tpm)}</td>
-    <td class="num">${c.max_concurrency ? num(c.in_flight) + ' / ' + num(c.max_concurrency) : num(c.in_flight)}</td>
-    <td class="num">${num(c.admitted)}</td>
-    <td class="num">${c.denied ? '<span class="warn">' + num(c.denied) + '</span>' : '0'}</td>
-  </tr>`).join('');
-  html += '</tbody></table>';
-}
+  if (idle) {
+    html += '<p class="muted">No requests since this process started' +
+            (d.uptime_seconds ? ' (' + esc(secs(Math.floor(d.uptime_seconds))) + ' ago)' : '') +
+            '. Counters are per-process and reset on restart.</p>';
+  }
 
-html += '<h2>Load balance</h2>';
-if (!d.keys.length) {
-  html += '<p class="muted">No keys configured.</p>';
-} else if (totalSelections === 0) {
-  html += '<p class="muted">No traffic yet, so there is nothing to distribute.</p>';
-} else {
-  const shares = d.keys.map(share);
-  const max = shares.length ? Math.max(...shares) : 0;
-  const min = shares.length ? Math.min(...shares) : 0;
-  // A healthy pool spreads within a couple of keys' worth of an even split.
-  // The threshold is deliberately loose: this is a "something is wrong" light,
-  // not a precision instrument.
-  const even = 1 / d.keys.length;
-  const spread = max - min;
-  const verdict = spread > even * 1.5
-    ? ['warn', 'uneven -- one key is serving most of the traffic']
-    : ['ok', 'spreading across the pool'];
-  html += '<div class="cards">';
-  html += card('Strategy', d.strategy, '');
-  html += card('Traffic seen', num(totalSelections));
-  html += card('Most-used key', Math.round(max * 100) + '%', verdict[0]);
-  html += card('Least-used key', Math.round(min * 100) + '%', verdict[0]);
+  html += '<h2>Overview</h2><div class="cards">';
+  html += card('Keys usable', healthy + ' / ' + d.keys_total, healthy === 0 ? 'bad' : 'ok',
+               healthy < d.keys_total ? (d.keys_total - healthy) + ' cooling or disabled' : '');
+  html += card('In flight', num(d.requests_in_flight));
+  html += card('Requests', num(d.requests_total));
+  html += card('Key rotations', num(d.rotations), d.rotations ? 'warn' : '');
+  html += card('Upstream failures', num(d.failures), d.failures ? 'warn' : '');
+  html += card('Pool exhausted', num(d.exhausted), d.exhausted ? 'warn' : '');
+  html += card('Tokens in', num(d.tokens_in));
+  html += card('Tokens out', num(d.tokens_out));
+  html += card('Uptime', secs(Math.floor(d.uptime_seconds || 0)));
   html += '</div>';
-  html += `<p class="muted">${esc(verdict[1])}. <code>fallback</code> is expected to pin: it is ordered failover, not a spreader.</p>`;
+
+  html += '<h2>Configuration</h2><div class="scroll"><table><tbody>';
+  html += '<tr><th>Strategy</th><td><code>' + esc(d.strategy) + '</code>' +
+          ((d.fallbacks || []).length ? ' → ' + d.fallbacks.map(esc).join(' → ') : '') + '</td></tr>';
+  html += '<tr><th>Config file</th><td><code>' + esc(d.config_path || '(none — admin API only)') + '</code></td></tr>';
+  html += '<tr><th>Models</th><td>' + ((d.models || []).length
+            ? d.models.map((m) => '<code>' + esc(m) + '</code>').join(' ')
+            : '<span class="muted">none declared</span>') + '</td></tr>';
+  html += '<tr><th>Routes</th><td>' + ((d.routes || []).length
+            ? d.routes.map((r) => '<code>' + esc(r.pattern) + '</code> → ' + esc((r.providers || []).join(', '))).join('<br>')
+            : '<span class="muted">none</span>') + '</td></tr>';
+  html += '</tbody></table></div>';
+
+  html += '<h2>Who may send what</h2>';
+  const sec = d.security || {};
+  const clients = sec.clients || [];
+  if (sec.client_auth_required === true) {
+    const denials = Object.entries(sec.denials || {});
+    const guard = sec.content_guard;
+    html += '<div class="cards">';
+    html += card('Clients', num(clients.length), 'ok');
+    html += card('Egress policy', sec.policy_source === 'rego' ? 'Rego' : 'built-in default', 'ok');
+    html += card('Prompt content',
+                 guard ? (guard.action === 'deny' ? 'blocking' : 'reporting') : 'not inspected',
+                 guard ? (guard.action === 'deny' ? 'ok' : 'warn') : 'bad',
+                 guard ? ((guard.rules || []).length + ' rules') : 'no rules configured');
+    html += card('Refused', num(denials.reduce((a, [, n]) => a + n, 0)), denials.length ? 'warn' : '');
+    html += '</div>';
+    if (denials.length) {
+      html += '<p class="muted">Refused by reason: ' +
+        denials.map(([r, n]) => '<code>' + esc(r) + '</code> ' + num(n)).join(' · ') + '</p>';
+    }
+    if (guard && (guard.rules || []).length) {
+      html += '<p class="muted">Content rules: ' + guard.rules.map((r) => '<code>' + esc(r) + '</code>').join(' ') + '</p>';
+    } else {
+      html += '<p class="warn">No content rules: prompt bodies are forwarded without inspection.</p>';
+    }
+    if (sec.policy_from) html += '<p class="muted">Policy loaded from <code>' + esc(sec.policy_from) + '</code>.</p>';
+    if (clients.length) {
+      html += '<div class="scroll"><table><thead><tr><th>Client</th><th>Models</th><th>Providers</th>' +
+              '<th class="num">RPM</th><th class="num">TPM</th><th class="num">In flight</th>' +
+              '<th class="num">Admitted</th><th class="num">Refused</th></tr></thead><tbody>';
+      html += clients.map((c) => '<tr class="' + (c.enabled ? '' : 'off') + '">' +
+        '<td>' + esc(c.name) + (c.enabled ? '' : ' <span class="pill off">disabled</span>') + '</td>' +
+        '<td>' + ((c.allowed_models || []).length ? c.allowed_models.map((m) => '<code>' + esc(m) + '</code>').join(' ') : '<span class="muted">any</span>') + '</td>' +
+        '<td>' + ((c.allowed_providers || []).length ? c.allowed_providers.map((p) => '<code>' + esc(p) + '</code>').join(' ') : '<span class="muted">any</span>') + '</td>' +
+        '<td class="num">' + (c.max_rpm ? num(c.rpm) + ' / ' + num(c.max_rpm) : num(c.rpm)) + '</td>' +
+        '<td class="num">' + (c.max_tpm ? num(c.tpm) + ' / ' + num(c.max_tpm) : num(c.tpm)) + '</td>' +
+        '<td class="num">' + (c.max_concurrency ? num(c.in_flight) + ' / ' + num(c.max_concurrency) : num(c.in_flight)) + '</td>' +
+        '<td class="num">' + num(c.admitted) + '</td>' +
+        '<td class="num">' + (c.denied ? '<span class="warn">' + num(c.denied) + '</span>' : '0') + '</td>' +
+        '</tr>').join('');
+      html += '</tbody></table></div>';
+    }
+  } else {
+    html += '<p class="warn">' + esc(sec.open_warning || 'Client authentication is off: any local process can spend these keys.') + '</p>';
+  }
+
+  html += '<h2>Load balance</h2>';
+  if (!keys.length) {
+    html += '<p class="muted">No keys configured.</p>';
+  } else if (totalSelections === 0) {
+    html += '<p class="muted">No traffic yet, so there is nothing to distribute. This is per-process.</p>';
+  } else {
+    const shares = keys.map(share);
+    const max = Math.max(...shares);
+    const min = Math.min(...shares);
+    const even = 1 / keys.length;
+    const uneven = max - min > even * 1.5;
+    html += '<div class="cards">';
+    html += card('Strategy', d.strategy);
+    html += card('Traffic seen', num(totalSelections), '', 'across ' + keys.length + ' keys');
+    html += card('Most-used key', Math.round(max * 100) + '%', uneven ? 'warn' : 'ok');
+    html += card('Least-used key', Math.round(min * 100) + '%', uneven ? 'warn' : 'ok');
+    html += '</div>';
+    html += '<p class="muted">' + (uneven
+      ? 'Uneven: one key is serving most of the traffic.'
+      : 'Spreading across the pool.') +
+      ' <code>fallback</code> is expected to pin: it is ordered failover, not a spreader.</p>';
+  }
+
+  html += '<h2>Providers</h2><div class="scroll"><table><thead><tr><th>Name</th><th>Endpoint</th><th>Auth</th>' +
+          '<th>Strategy</th><th class="num">Keys</th><th class="num">Available</th><th class="num">In flight</th>' +
+          '</tr></thead><tbody>';
+  html += (d.providers || []).map((p) => '<tr><td>' + esc(p.name) + '</td>' +
+    '<td><code>' + esc(p.base_url) + '</code></td><td>' + esc(p.auth) + '</td>' +
+    '<td>' + esc(p.strategy) + '</td><td class="num">' + num(p.keys) + '</td>' +
+    '<td class="num">' + (p.available < p.keys ? '<span class="warn">' + num(p.available) + '</span>' : num(p.available)) + '</td>' +
+    '<td class="num">' + num(p.in_flight) + '</td></tr>').join('');
+  html += '</tbody></table></div>';
+
+  html += '<h2>Keys</h2><div class="scroll"><table><thead><tr><th>Provider</th><th>Key</th><th>State</th>' +
+          '<th class="num">Health</th><th class="num">Latency</th><th class="num">In flight</th>' +
+          '<th class="num">RPM</th><th class="num">TPM</th><th class="num">OK / Fail</th>' +
+          '<th class="num">429s</th><th class="num">Tokens in / out</th><th class="num">Share</th></tr></thead><tbody>';
+  html += keys.map((k) => {
+    const cooling = k.cooldown_secs !== null && k.cooldown_secs !== undefined;
+    const label = !k.enabled ? 'disabled' : (cooling ? 'cooling ' + secs(k.cooldown_secs) : k.state);
+    const cls = !k.enabled || cooling ? 'off' : (k.state === 'closed' ? 'ok' : 'warn');
+    const hp = (k.health === null || k.health === undefined) ? null : k.health * 100;
+    const hcls = hp === null ? '' : (hp >= 70 ? '' : hp >= 30 ? 'warn' : 'bad');
+    return '<tr class="' + (k.enabled ? '' : 'off') + '">' +
+      '<td>' + esc(k.provider) + '</td>' +
+      '<td><code>' + esc(k.id) + '</code></td>' +
+      '<td><span class="pill ' + cls + '">' + esc(label) + '</span></td>' +
+      '<td class="num ' + hcls + '">' + (hp === null ? '—' : hp.toFixed(0) + '%') + '</td>' +
+      '<td class="num">' + (k.latency_ms === null || k.latency_ms === undefined ? '—' : Math.round(k.latency_ms) + 'ms') + '</td>' +
+      '<td class="num">' + num(k.in_flight) + '</td>' +
+      '<td class="num">' + (k.max_rpm ? num(k.rpm) + ' / ' + num(k.max_rpm) : num(k.rpm)) + '</td>' +
+      '<td class="num">' + (k.max_tpm ? num(k.tpm) + ' / ' + num(k.max_tpm) : num(k.tpm)) + '</td>' +
+      '<td class="num">' + num(k.successes) + ' / ' + (k.failures ? '<span class="warn">' + num(k.failures) + '</span>' : '0') + '</td>' +
+      '<td class="num">' + (k.rate_limited ? '<span class="warn">' + num(k.rate_limited) + '</span>' : '0') + '</td>' +
+      '<td class="num">' + num(k.tokens_in) + ' / ' + num(k.tokens_out) + '</td>' +
+      '<td class="num">' + bar(share(k)) + '</td>' +
+      '</tr>';
+  }).join('');
+  html += '</tbody></table></div>';
+
+  return html;
 }
 
-html += '<h2>Providers</h2><table><thead><tr><th>Name</th><th>Endpoint</th><th>Auth</th><th>Strategy</th><th class="num">Keys</th><th class="num">Available</th><th class="num">In flight</th></tr></thead><tbody>';
-html += d.providers.map((p) => `<tr><td>${esc(p.name)}</td><td><code>${esc(p.base_url)}</code></td><td>${esc(p.auth)}</td><td>${esc(p.strategy)}</td><td class="num">${num(p.keys)}</td><td class="num">${num(p.available)}</td><td class="num">${num(p.in_flight)}</td></tr>`).join('');
-html += '</tbody></table>';
+const app = document.getElementById('app');
+const stamp = document.getElementById('stamp');
+const refreshBtn = document.getElementById('refresh');
+const autoBox = document.getElementById('auto');
+const everySel = document.getElementById('every');
+const initial = JSON.parse(document.getElementById('data').textContent);
 
-html += '<h2>Keys</h2><table><thead><tr><th>Provider</th><th>Key</th><th>State</th><th class="num">Health</th><th class="num">Latency</th><th class="num">In flight</th><th class="num">RPM</th><th class="num">TPM</th><th class="num">OK / Fail</th><th class="num">429s</th><th class="num">Tokens in / out</th><th class="num">Share</th></tr></thead><tbody>';
-html += d.keys.map(keyRow).join('');
-html += '</tbody></table>';
+// The reference table used to claim this endpoint "contains secrets", which
+// stopped being true when config dumps gained redaction. Take the wording from
+// the payload so it cannot drift from the handler again.
+document.getElementById('cfg-redaction').textContent =
+  (initial.redacts_secrets === false) ? 'includes secrets' : 'credentials redacted';
 
-document.getElementById('app').outerHTML = html;
+let timer = null;
+let failures = 0;
+
+function paint(d) {
+  app.innerHTML = render(d);
+  const at = new Date().toLocaleTimeString();
+  stamp.className = failures ? 'stale' : 'muted';
+  stamp.textContent = failures
+    ? 'last updated ' + at + ' — ' + failures + ' failed refresh' + (failures === 1 ? '' : 'es')
+    : 'updated ' + at;
+}
+
+async function refresh() {
+  try {
+    // Re-fetch this page and read the payload it embeds, so one code path
+    // produces both the first paint and every refresh.
+    const res = await fetch(location.pathname, { credentials: 'same-origin', cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+    const node = doc.getElementById('data');
+    if (!node) throw new Error('no payload in response');
+    paint(JSON.parse(node.textContent));
+    failures = 0;
+  } catch (e) {
+    // A failed refresh must not wipe the last good view: a blank page reads as
+    // "the broker is down" when it may only be a token prompt.
+    failures += 1;
+    const at = new Date().toLocaleTimeString();
+    stamp.className = 'stale';
+    stamp.textContent = 'refresh failed (' + (e && e.message ? e.message : e) + ') — showing data from ' + at;
+  }
+}
+
+function schedule() {
+  if (timer) clearInterval(timer);
+  if (autoBox.checked) timer = setInterval(refresh, Number(everySel.value));
+}
+
+refreshBtn.addEventListener('click', refresh);
+autoBox.addEventListener('change', schedule);
+everySel.addEventListener('change', schedule);
+
+// Paint immediately from the embedded payload, then keep it current.
+paint(initial);
+schedule();
 </script>
 </body>
 </html>
