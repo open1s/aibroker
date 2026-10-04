@@ -3,6 +3,10 @@
 #   cp config.example.toml config.toml
 #   cargo run -- --config config.toml --check
 #
+# NEVER commit a config file that contains a literal secret. Local configs are
+# gitignored for that reason; prefer `env:NAME` references so the repository
+# only ever holds a variable name.
+#
 # Every section below is optional except `[[providers]]`. Existing 1.x configs
 # keep working: the only fields that were ever required are `server.host`,
 # `server.port` and one provider with one key.

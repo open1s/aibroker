@@ -155,3 +155,9 @@ streak and starts lifting the score back toward `1.0`.
 - New config fields need a `#[serde(default)]` and a sensible default so
   existing configs keep loading.
 - Keep `clippy --all-targets` clean; CI treats warnings as failures.
+- **Never commit a literal secret.** `config.toml`, `test-real-config.toml`
+  and `*.log` are gitignored; `config.example.toml` uses `env:NAME` for every
+  credential. Before every push, run
+  `git grep -nE "nvapi-|sk-[A-Za-z0-9]{20,}"` over the tree and confirm it is
+  empty. A secret that reaches a public remote must be rotated, not just
+  deleted: it stays in the object store until the history is rewritten.
