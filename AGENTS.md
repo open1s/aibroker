@@ -22,6 +22,26 @@ cargo run -- --config config.toml
 cargo run -- --config config.toml --check   # validate config and env secrets
 ```
 
+**Toolchain is pinned in `rust-toolchain.toml`** (currently 1.99.0) and CI
+installs that same channel. Do not switch CI back to
+`dtolnay/rust-toolchain@stable`: it floats, so a Rust release can turn the
+build red with no source change. Rust 1.99 deprecating `Atomic::fetch_update`
+in favour of `try_update` did exactly that, and `-D warnings` turned the
+deprecation into a failure.
+
+Bumping the pin is a deliberate change:
+
+```bash
+# 1. install and select the new channel (mise manages the toolchains here)
+mise install rust@<version>
+# 2. update channel in rust-toolchain.toml and the two `toolchain:` values
+#    in .github/workflows/ci.yml
+# 3. fix fallout, then prove it on that toolchain
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
 Sandbox note: the DSH file sandbox blocks writes to the global mise cargo
 registry, so a plain `cargo build` can fail while *downloading*. Everything is
 fetched already; prefer `--offline`. For a genuinely new dependency, either
