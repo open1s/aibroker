@@ -27,6 +27,11 @@
   .off { opacity: .5; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .muted { opacity: .55; }
+  /* A share bar, so an uneven pool is visible at a glance rather than by
+     comparing two numbers across rows. */
+  .bar { display: inline-block; width: 64px; height: 8px; border-radius: 4px; vertical-align: middle;
+         background: color-mix(in srgb, currentColor 15%, transparent); overflow: hidden; }
+  .bar .fill { display: block; height: 100%; background: currentColor; opacity: .65; }
 </style>
 </head>
 <body data-admin-path="@ADMIN_PATH@">
@@ -78,10 +83,21 @@ function keyRow(k) {
     <td class="num">${num(k.successes)} / ${num(k.failures)}</td>
     <td class="num">${k.rate_limited ? '<span class="warn">' + num(k.rate_limited) + '</span>' : '0'}</td>
     <td class="num">${num(k.tokens_in)} / ${num(k.tokens_out)}</td>
+    <td class="num">${bar(share(k))}</td>
   </tr>`;
 }
 
 const healthy = d.keys.filter((k) => k.enabled && (k.cooldown_secs === null || k.cooldown_secs === undefined)).length;
+
+// Share of this run's traffic each key actually served. A pool can be "healthy"
+// and still be sending everything to one key -- that was true of two strategies
+// once -- so the distribution has to be visible, not inferable.
+const totalSelections = d.keys.reduce((sum, k) => sum + (k.selections || 0), 0);
+const share = (k) => totalSelections > 0 ? (k.selections || 0) / totalSelections : 0;
+const bar = (fraction) => {
+  const pct = Math.round(fraction * 100);
+  return `<span class="bar"><span class="fill" style="width:${pct}%"></span></span> ${pct}%`;
+};
 let html = '';
 html += '<h2>Overview</h2><div class="cards">';
 html += card('Keys available', healthy + ' / ' + d.keys_total, healthy === 0 ? 'bad' : 'ok');
@@ -114,6 +130,12 @@ if (sec.client_auth_required === true) {
   html += '<div class="cards">';
   html += card('Clients', num(clients.length), 'ok');
   html += card('Egress policy', sec.policy_source === 'rego' ? 'Rego' : 'built-in default', 'ok');
+  const guard = sec.content_guard;
+  html += card(
+    'Prompt content',
+    guard ? (guard.action === 'deny' ? 'blocking' : 'reporting') : 'not inspected',
+    guard ? (guard.action === 'deny' ? 'ok' : 'warn') : 'warn'
+  );
   html += card('Refused', num(denialRows.reduce((a, [, n]) => a + n, 0)), denialRows.length ? 'warn' : '');
   html += '</div>';
   if (denialRows.length) {
@@ -122,6 +144,11 @@ if (sec.client_auth_required === true) {
   }
 } else {
   html += `<p class="warn">${esc(sec.open_warning)}</p>`;
+}
+if (sec.content_guard && (sec.content_guard.rules || []).length) {
+  html += `<p class="muted">Content rules: ${sec.content_guard.rules.map((r) => '<code>' + esc(r) + '</code>').join(' ')}</p>`;
+} else {
+  html += '<p class="warn">No content rules: prompt bodies are forwarded without inspection.</p>';
 }
 if (sec.policy_from) {
   html += `<p class="muted">Policy loaded from <code>${esc(sec.policy_from)}</code>.</p>`;
@@ -141,11 +168,37 @@ if (sec.client_auth_required === true && clients.length) {
   html += '</tbody></table>';
 }
 
+html += '<h2>Load balance</h2>';
+if (!d.keys.length) {
+  html += '<p class="muted">No keys configured.</p>';
+} else if (totalSelections === 0) {
+  html += '<p class="muted">No traffic yet, so there is nothing to distribute.</p>';
+} else {
+  const shares = d.keys.map(share);
+  const max = shares.length ? Math.max(...shares) : 0;
+  const min = shares.length ? Math.min(...shares) : 0;
+  // A healthy pool spreads within a couple of keys' worth of an even split.
+  // The threshold is deliberately loose: this is a "something is wrong" light,
+  // not a precision instrument.
+  const even = 1 / d.keys.length;
+  const spread = max - min;
+  const verdict = spread > even * 1.5
+    ? ['warn', 'uneven -- one key is serving most of the traffic']
+    : ['ok', 'spreading across the pool'];
+  html += '<div class="cards">';
+  html += card('Strategy', d.strategy, '');
+  html += card('Traffic seen', num(totalSelections));
+  html += card('Most-used key', Math.round(max * 100) + '%', verdict[0]);
+  html += card('Least-used key', Math.round(min * 100) + '%', verdict[0]);
+  html += '</div>';
+  html += `<p class="muted">${esc(verdict[1])}. <code>fallback</code> is expected to pin: it is ordered failover, not a spreader.</p>`;
+}
+
 html += '<h2>Providers</h2><table><thead><tr><th>Name</th><th>Endpoint</th><th>Auth</th><th>Strategy</th><th class="num">Keys</th><th class="num">Available</th><th class="num">In flight</th></tr></thead><tbody>';
 html += d.providers.map((p) => `<tr><td>${esc(p.name)}</td><td><code>${esc(p.base_url)}</code></td><td>${esc(p.auth)}</td><td>${esc(p.strategy)}</td><td class="num">${num(p.keys)}</td><td class="num">${num(p.available)}</td><td class="num">${num(p.in_flight)}</td></tr>`).join('');
 html += '</tbody></table>';
 
-html += '<h2>Keys</h2><table><thead><tr><th>Provider</th><th>Key</th><th>State</th><th class="num">Health</th><th class="num">Latency</th><th class="num">In flight</th><th class="num">RPM</th><th class="num">TPM</th><th class="num">OK / Fail</th><th class="num">429s</th><th class="num">Tokens in / out</th></tr></thead><tbody>';
+html += '<h2>Keys</h2><table><thead><tr><th>Provider</th><th>Key</th><th>State</th><th class="num">Health</th><th class="num">Latency</th><th class="num">In flight</th><th class="num">RPM</th><th class="num">TPM</th><th class="num">OK / Fail</th><th class="num">429s</th><th class="num">Tokens in / out</th><th class="num">Share</th></tr></thead><tbody>';
 html += d.keys.map(keyRow).join('');
 html += '</tbody></table>';
 

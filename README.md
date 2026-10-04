@@ -86,8 +86,12 @@ unchanged: no code, no SDK, no wrapper script.
 
 Then watch it work:
 
-- <http://127.0.0.1:11436/admin> — read-only dashboard (key health, cooldowns,
-  RPM/TPM against limits, token counters, routing table);
+- <http://127.0.0.1:11436/admin> — read-only dashboard: key health, cooldowns,
+  RPM/TPM against limits, token counters, the routing table, each key's **share
+  of traffic** (so an uneven pool is visible rather than inferred — two
+  strategies once sent everything to one key while every key looked healthy),
+  and the security posture: whether client authentication is on, the clients and
+  their scopes, and whether prompt content is being inspected;
 - <http://127.0.0.1:11436/metrics> — Prometheus;
 - `--dump-request --dump-response` — the full exchange, one line per event,
   credentials redacted, which is how you debug an integration;

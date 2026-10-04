@@ -186,6 +186,25 @@ uploaded, and the client's in-flight slot is released in `logging`.
 - **Empty `[[clients]]` means open**, which keeps the single-user setup
   working. Do not change that default silently.
 
+## The dashboard must answer "is it working?"
+
+The dashboard is the only view most operators will look at, so anything that
+decides behaviour should be visible there. Two things were collected by the
+backend and never rendered:
+
+- **per-key `selections`** — the backend counted how much traffic each key
+  served, and the page did not show it. A pool can be perfectly "healthy" and
+  still send everything to one key; that was true of two strategies once, and a
+  share column is what would have shown it immediately.
+- **the content guard** — whether prompts are inspected, in which mode, and with
+  which rules. Silence about an absent guard is how it stays absent, so the page
+  says "No content rules: prompt bodies are forwarded without inspection."
+
+Test the *payload*, not the template's JavaScript. A test that greps the HTML
+for a message can pass by matching the script source rather than the rendered
+state — that happened once with the open-proxy warning, which is why the state
+is a payload value and the assertions parse the JSON block.
+
 ## Load balancing strategies
 
 | Strategy | Behaviour |

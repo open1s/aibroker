@@ -108,6 +108,12 @@ pub fn render(runtime: &SharedRuntime, admin_path: &str) -> String {
                 .into_iter()
                 .map(|(reason, count)| (reason.as_str().to_string(), count))
                 .collect::<std::collections::BTreeMap<_, _>>(),
+            "content_guard": runtime.content_guard().map(|guard| {
+                serde_json::json!({
+                    "action": guard.action().as_str(),
+                    "rules": guard.rule_names().collect::<Vec<_>>(),
+                })
+            }),
             "policy_source": match runtime.policy().source() {
                 crate::core::policy::PolicySource::Default => "default",
                 crate::core::policy::PolicySource::Rego => "rego",
@@ -261,6 +267,77 @@ mod tests {
         assert!(
             html.contains("\"open_warning\":null"),
             "the open-proxy warning must be cleared when clients are configured"
+        );
+    }
+
+    #[test]
+    fn dashboard_reports_the_content_guard() {
+        // The backend already counted per-key `selections` and reported the
+        // guard config; neither reached the page, so an operator could not see
+        // whether traffic was spread or whether prompts were inspected.
+        let runtime = runtime();
+        {
+            let mut runtime = runtime.write();
+            runtime
+                .apply(|config| {
+                    config.content_guard = crate::config::ContentGuardConfig {
+                        enabled: true,
+                        action: Some("deny".to_string()),
+                        patterns: vec![crate::config::ContentPattern {
+                            name: "aws-key".into(),
+                            pattern: r"AKIA[0-9A-Z]{16}".into(),
+                        }],
+                        allow: vec![],
+                    };
+                })
+                .expect("apply");
+        }
+
+        let html = render(&runtime, "/admin");
+        assert!(
+            html.contains("\"content_guard\""),
+            "the payload should carry the guard"
+        );
+        // Parse rather than string-match: the payload is compact JSON and the
+        // spacing is not part of the contract.
+        let payload = html
+            .split_once("<script id=\"data\" type=\"application/json\">")
+            .expect("data block")
+            .1
+            .split_once("</script>")
+            .expect("data block end")
+            .0
+            .replace("<\\/", "</");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid payload");
+        assert_eq!(
+            parsed["security"]["content_guard"]["action"], "deny",
+            "the action should be reported"
+        );
+        assert_eq!(
+            parsed["security"]["content_guard"]["rules"][0], "aws-key",
+            "rule names should be listed"
+        );
+        assert!(
+            html.contains("Load balance"),
+            "the page should have a load-balance section"
+        );
+        assert!(
+            html.contains("Share"),
+            "and a per-key share column, which is how imbalance becomes visible"
+        );
+    }
+
+    #[test]
+    fn dashboard_reports_a_missing_content_guard_as_a_warning() {
+        // Silence about an absent guard is how it stays absent.
+        let html = render(&runtime(), "/admin");
+        assert!(
+            html.contains("No content rules"),
+            "the page should say that prompts are not inspected"
+        );
+        assert!(
+            html.contains("\"content_guard\":null"),
+            "the payload should be explicit about it"
         );
     }
 
