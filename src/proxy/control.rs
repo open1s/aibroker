@@ -65,6 +65,11 @@ pub async fn write_response(session: &mut Session, response: AdminResponse) -> p
     header.insert_header("Content-Type", response.content_type)?;
     header.insert_header("Content-Length", response.body.len().to_string())?;
     header.insert_header("Cache-Control", "no-store")?;
+    if let Some(challenge) = response.challenge {
+        header.insert_header("WWW-Authenticate", challenge)?;
+    }
+    // The control plane is never somewhere to navigate away from.
+    header.insert_header("Referrer-Policy", "no-referrer")?;
     session.set_keepalive(None);
     session
         .write_response_header(Box::new(header), response.body.is_empty())

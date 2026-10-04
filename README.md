@@ -180,9 +180,19 @@ the live strategy. It makes no external requests and holds no state of its own,
 so it is safe on an air-gapped host. Everything that *changes* state stays on
 the JSON API below, where the request is explicit.
 
+Open it in a browser and log in with **any username** and your admin token as
+the password — the dashboard answers an anonymous request with a `Basic`
+challenge, so the browser prompts for you:
+
+```
+path mode:      http://127.0.0.1:11436/admin
+separate mode:  http://127.0.0.1:11437/
+```
+
+A script keeps using the header form, which is never offered the `Basic`
+fallback (that would put a credential in a URL):
+
 ```bash
-# Path mode: browse http://127.0.0.1:11436/admin
-# Separate mode: browse http://127.0.0.1:11437/
 curl -H 'Authorization: Bearer <token>' http://127.0.0.1:11436/admin | less
 ```
 

@@ -23,6 +23,12 @@ pub struct AdminCredentials {
     pub bearer: Option<String>,
     /// `X-Admin-Token` value, if present.
     pub header_token: Option<String>,
+    /// `Authorization: Basic <base64>` decoded to `user:password`.
+    ///
+    /// A browser cannot attach a bearer token to a URL the user navigates to,
+    /// but it will answer a `Basic` challenge with a prompt. The password
+    /// carries the token and the username is ignored, so any name works.
+    pub basic: Option<String>,
 }
 
 impl AdminCredentials {
@@ -30,27 +36,86 @@ impl AdminCredentials {
         authorization: Option<&str>,
         admin_token: Option<&str>,
     ) -> AdminCredentials {
-        let bearer = authorization
-            .map(str::trim)
-            .and_then(|value| {
-                let (scheme, token) = value.split_once(' ')?;
-                scheme
-                    .eq_ignore_ascii_case("bearer")
-                    .then(|| token.trim().to_string())
-            })
-            .filter(|token| !token.is_empty());
+        let mut bearer = None;
+        let mut basic = None;
+
+        if let Some(value) = authorization.map(str::trim)
+            && let Some((scheme, rest)) = value.split_once(' ')
+        {
+            let rest = rest.trim();
+            if scheme.eq_ignore_ascii_case("bearer") && !rest.is_empty() {
+                bearer = Some(rest.to_string());
+            } else if scheme.eq_ignore_ascii_case("basic") {
+                basic = base64_decode(rest).and_then(|bytes| String::from_utf8(bytes).ok());
+            }
+        }
+
         AdminCredentials {
             bearer,
             header_token: admin_token
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(|v| v.to_string()),
+            basic,
         }
     }
 
+    /// The token this request presents, if any.
     fn provided(&self) -> Option<&str> {
-        self.header_token.as_deref().or(self.bearer.as_deref())
+        self.header_token
+            .as_deref()
+            .or(self.bearer.as_deref())
+            .or_else(|| {
+                // `user:password` — the password is the token.
+                self.basic
+                    .as_deref()
+                    .map(|pair| match pair.split_once(':') {
+                        Some((_, password)) => password,
+                        None => pair,
+                    })
+            })
     }
+
+    /// Whether the caller used the scheme a browser can answer.
+    fn is_basic(&self) -> bool {
+        self.basic.is_some() && self.bearer.is_none() && self.header_token.is_none()
+    }
+}
+
+/// Minimal standard-alphabet base64 decoder, for the Basic scheme only.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    const INVALID: u8 = 0xFF;
+    let mut table = [INVALID; 256];
+    for (index, byte) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        table[*byte as usize] = index as u8;
+    }
+
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        let value = table[byte as usize];
+        if value == INVALID {
+            return None;
+        }
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// An HTTP response produced by the control plane.
@@ -59,6 +124,9 @@ pub struct AdminResponse {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    /// When set, emitted as `WWW-Authenticate` so a browser shows its login
+    /// prompt instead of a bare error page.
+    pub challenge: Option<&'static str>,
 }
 
 impl AdminResponse {
@@ -70,6 +138,7 @@ impl AdminResponse {
             status,
             content_type: "application/json",
             body,
+            challenge: None,
         }
     }
 
@@ -85,6 +154,7 @@ impl AdminResponse {
             status,
             content_type,
             body: body.into(),
+            challenge: None,
         }
     }
 
@@ -93,6 +163,7 @@ impl AdminResponse {
             status: 204,
             content_type: "application/json",
             body: Vec::new(),
+            challenge: None,
         }
     }
 }
@@ -200,7 +271,7 @@ impl AdminRouter {
                         .metrics()
                         .rejected_admin_auth
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Err(AdminResponse::error(401, "invalid or missing admin token"))
+                    Err(self.unauthorized(credentials))
                 }
             }
             None if self.allow_insecure => Ok(()),
@@ -216,6 +287,20 @@ impl AdminRouter {
                 ))
             }
         }
+    }
+
+    /// A 401 that a browser can act on.
+    ///
+    /// The challenge is only sent when the caller already tried Basic, or sent
+    /// nothing at all: a browser then shows its login prompt, while a script
+    /// keeps getting clean JSON. A bearer-authenticated caller is never asked
+    /// to fall back to a scheme whose credential would sit in the URL bar.
+    fn unauthorized(&self, credentials: &AdminCredentials) -> AdminResponse {
+        let mut response = AdminResponse::error(401, "invalid or missing admin token");
+        if credentials.is_basic() || credentials.provided().is_none() {
+            response.challenge = Some("Basic realm=\"LLM Broker admin\", charset=\"UTF-8\"");
+        }
+        response
     }
 
     /// Handle one request.
@@ -758,6 +843,71 @@ mod tests {
         assert!(creds.bearer.is_none());
         let creds = AdminCredentials::from_headers(None, Some("hdr"));
         assert_eq!(creds.header_token.as_deref(), Some("hdr"));
+    }
+
+    #[test]
+    fn base64_decoder_handles_padding_and_rejects_junk() {
+        assert_eq!(base64_decode("dXNlcjp0b2tlbg==").unwrap(), b"user:token");
+        assert_eq!(base64_decode("dXNlcjp0b2tlbg").unwrap(), b"user:token");
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert!(base64_decode("not base64!").is_none());
+    }
+
+    #[test]
+    fn basic_credentials_carry_the_token_in_the_password() {
+        // "any:secret"
+        let value = "Basic YW55OnNlY3JldA==";
+        let creds = AdminCredentials::from_headers(Some(value), None);
+        assert_eq!(creds.provided(), Some("secret"));
+        assert!(creds.is_basic());
+    }
+
+    #[test]
+    fn basic_auth_authenticates_a_browser_style_request() {
+        let router = router(runtime(), Some("secret"));
+        let mut request = request("GET", "", b"");
+        request.credentials = AdminCredentials::from_headers(Some("Basic YW55OnNlY3JldA=="), None);
+        let response = router.handle(request);
+        assert_eq!(response.status, 200, "a browser login must be accepted");
+        assert!(
+            response.challenge.is_none(),
+            "no challenge once authenticated"
+        );
+    }
+
+    #[test]
+    fn a_wrong_basic_password_is_rejected_and_rechallenged() {
+        let router = router(runtime(), Some("secret"));
+        let mut request = request("GET", "", b"");
+        // "any:wrong"
+        request.credentials = AdminCredentials::from_headers(Some("Basic YW55Ondyb25n"), None);
+        let response = router.handle(request);
+        assert_eq!(response.status, 401);
+        assert!(
+            response.challenge.is_some(),
+            "a browser needs the challenge to prompt again"
+        );
+    }
+
+    #[test]
+    fn an_anonymous_request_is_challenged() {
+        let router = router(runtime(), Some("secret"));
+        let response = router.handle(request("GET", "", b""));
+        assert_eq!(response.status, 401);
+        assert!(
+            response.challenge.is_some(),
+            "a browser should get a prompt"
+        );
+    }
+
+    #[test]
+    fn a_bearer_caller_is_never_offered_basic() {
+        // A script that sent a bad bearer token should get JSON, not a prompt
+        // that would put its credential in a URL.
+        let router = router(runtime(), Some("secret"));
+        let response = router.handle(authed("GET", "", b"", "wrong"));
+        assert_eq!(response.status, 401);
+        assert!(response.challenge.is_none());
     }
 
     #[test]
