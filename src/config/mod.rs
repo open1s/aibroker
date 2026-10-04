@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use crate::error::{LlmBrokerError, Result};
 
 pub const DEFAULT_PROXY_PORT: u16 = 11436;
+/// Seconds a graceful shutdown waits for in-flight requests (see
+/// [`ServerConfig::graceful_shutdown_secs`]).
+pub const DEFAULT_GRACE_PERIOD_SECS: u64 = 30;
 pub const DEFAULT_ADMIN_PORT: u16 = 11437;
 
 /// Root configuration document.
@@ -90,6 +93,16 @@ pub struct ServerConfig {
     pub write_timeout_ms: Option<u64>,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    /// How long a graceful shutdown (`SIGTERM`) waits for in-flight requests
+    /// before tearing the runtimes down.
+    ///
+    /// pingora's default is 300s, and it implements the wait as a plain sleep
+    /// on the main thread. Ctrl+C does not interrupt it, so the process looks
+    /// wedged for five minutes and the operator keeps pressing Ctrl+C. LLM
+    /// requests can be long, hence a real wait rather than none, but a local
+    /// proxy does not need five minutes.
+    #[serde(default = "default_grace_period")]
+    pub graceful_shutdown_secs: u64,
 }
 
 /// A provider endpoint plus its key pool.
@@ -295,6 +308,9 @@ fn default_admin_port() -> u16 {
 }
 fn default_max_retries() -> usize {
     3
+}
+fn default_grace_period() -> u64 {
+    DEFAULT_GRACE_PERIOD_SECS
 }
 fn default_true() -> bool {
     true

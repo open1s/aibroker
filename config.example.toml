@@ -31,6 +31,11 @@ read_timeout_ms = 600_000
 # Total attempts per client request, including the first one. This is also the
 # budget for rotating onto another key after a 429/5xx.
 max_retries = 3
+# How long a graceful stop (SIGTERM, docker stop) waits for in-flight requests.
+# Ctrl+C exits immediately; any repeated signal exits unconditionally. pingora
+# defaults this to 300s and ignores further signals while it waits, which reads
+# as a hang, so the default here is much shorter.
+graceful_shutdown_secs = 30
 
 # ---------------------------------------------------------------------------
 # Providers and their key pools

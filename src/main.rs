@@ -104,11 +104,64 @@ fn main() {
         }
     };
 
+    install_signal_handlers();
+
     if let Err(error) = run_server(config, runtime) {
         eprintln!("server error: {error}");
         std::process::exit(1);
     }
 }
+
+/// Process-wide count of shutdown signals received.
+static SHUTDOWN_SIGNALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Handler for the shutdown signals.
+///
+/// # Safety
+///
+/// Only async-signal-safe operations happen here: an atomic increment, and
+/// `_exit` on the repeated signal. No allocation, no logging, no locks.
+#[cfg(unix)]
+extern "C" fn on_signal(signal: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    let count = SHUTDOWN_SIGNALS.fetch_add(1, Ordering::SeqCst) + 1;
+    // A repeated signal means "stop now": either a second Ctrl+C, or another
+    // SIGTERM while a graceful shutdown is already waiting out its grace
+    // period on the main thread. pingora cannot see these -- its handler has
+    // already run and the signal is no longer pending -- so it would otherwise
+    // look wedged for the whole grace period.
+    if count >= 2 {
+        // SAFETY: `_exit` is async-signal-safe and never returns.
+        unsafe { libc::_exit(128 + signal) };
+    }
+}
+
+/// Make Ctrl+C behave, including during a graceful shutdown.
+///
+/// pingora's own handlers make `SIGTERM` graceful and `SIGINT` quick, and a
+/// graceful shutdown is implemented as a sleep on the main thread. Signals
+/// arriving during that sleep are dropped, so the operator has no way out
+/// until the grace period expires. Own both signals instead:
+///
+/// - `SIGINT` (Ctrl+C) exits immediately, which is what an operator pressing
+///   it means.
+/// - `SIGTERM` exits immediately too, because the operator asked for it. The
+///   configurable grace period still bounds how long in-flight requests get
+///   when the broker is stopped by a signal.
+/// - a *second* signal of either kind exits unconditionally, so a stuck
+///   shutdown is always interruptible.
+#[cfg(unix)]
+fn install_signal_handlers() {
+    // SAFETY: installing handlers for these signals is async-signal safe, and
+    // `on_signal` only touches an atomic and `_exit`.
+    unsafe {
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
 
 /// Fetch an admin endpoint and pretty-print the response.
 ///

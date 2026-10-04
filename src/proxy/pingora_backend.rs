@@ -901,6 +901,11 @@ pub fn build_server_conf(config: &Config) -> pingora::server::configuration::Ser
     // pingora re-enters `upstream_peer` on every retry, which is exactly how
     // key rotation is implemented here.
     conf.max_retries = config.server.max_retries.max(1);
+    // pingora sleeps this on the main thread during a graceful shutdown and
+    // ignores further signals meanwhile, so pingora's 300s default makes
+    // Ctrl+C look broken. Bound it, and bound how long the runtimes get too.
+    conf.grace_period_seconds = Some(config.server.graceful_shutdown_secs);
+    conf.graceful_shutdown_timeout_seconds = Some(config.server.graceful_shutdown_secs);
     conf
 }
 
@@ -987,6 +992,7 @@ mod tests {
                 read_timeout_ms: None,
                 write_timeout_ms: None,
                 max_retries: 3,
+                graceful_shutdown_secs: crate::config::DEFAULT_GRACE_PERIOD_SECS,
             },
             proxy_type: None,
             providers: vec![ProviderConfig {
@@ -1203,6 +1209,22 @@ mod tests {
         assert_eq!(host_of("https://api.openai.com/v1"), "api.openai.com");
         assert_eq!(host_of("https://api.example.com:8443/x"), "api.example.com");
         assert_eq!(host_of("not a url"), "api.openai.com");
+    }
+
+    #[test]
+    fn server_conf_bounds_the_graceful_shutdown() {
+        // Regression: pingora defaults the grace period to 300s and sleeps it
+        // on the main thread, so SIGTERM looked like a hang.
+        let mut config = minimal_config();
+        assert_eq!(
+            config.server.graceful_shutdown_secs,
+            crate::config::DEFAULT_GRACE_PERIOD_SECS
+        );
+
+        config.server.graceful_shutdown_secs = 5;
+        let conf = build_server_conf(&config);
+        assert_eq!(conf.grace_period_seconds, Some(5));
+        assert_eq!(conf.graceful_shutdown_timeout_seconds, Some(5));
     }
 
     #[test]

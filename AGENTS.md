@@ -154,6 +154,20 @@ upstream `Retry-After` overrides the escalation for that key. The failure score
 is an exponential decay (`score *= 0.8` per failure) and a success clears the
 streak and starts lifting the score back toward `1.0`.
 
+## Signals
+
+`main.rs` owns `SIGINT` and `SIGTERM` instead of leaving them to pingora,
+because pingora's graceful shutdown is a `thread::sleep` on the main thread and
+signals arriving during that sleep are dropped: the process looked wedged for
+the entire grace period and the only escape was `kill -9`.
+
+- `SIGINT` exits immediately (an operator pressing Ctrl+C means now).
+- `SIGTERM` is graceful, bounded by `server.graceful_shutdown_secs`
+  (default 30s, not pingora's 300s).
+- A second signal of either kind calls `_exit`, so no shutdown can become
+  uninterruptible. The handler only touches an atomic and `_exit`; keep it
+  async-signal-safe.
+
 ## pingora constraints worth knowing
 
 - `upstream_peer` runs **before** the request body is streamed, and pingora

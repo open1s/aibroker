@@ -49,6 +49,7 @@ dependencies = [
  "clap",
  "dirs",
  "http",
+ "libc",
  "parking_lot",
  "pingora",
  "pingora-error",

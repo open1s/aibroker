@@ -480,6 +480,7 @@ mod tests {
                 read_timeout_ms: None,
                 write_timeout_ms: None,
                 max_retries: 3,
+                graceful_shutdown_secs: crate::config::DEFAULT_GRACE_PERIOD_SECS,
             },
             proxy_type: None,
             providers,

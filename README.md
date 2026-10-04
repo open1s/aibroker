@@ -262,6 +262,24 @@ Token counts come from the response `usage` object when it is present
 (OpenAI, Anthropic, Gemini and Ollama field names are recognised), which also
 feeds TPM accounting and optional cost estimates.
 
+## Stopping it
+
+`Ctrl+C` exits immediately. `SIGTERM` (what a supervisor or `docker stop`
+sends) is graceful: it stops accepting, lets in-flight requests finish, and
+tears the runtimes down. Because an LLM request can be long, that wait is
+bounded by `server.graceful_shutdown_secs`, which defaults to **30s** rather
+than pingora's 300s — a five-minute window where the process ignores further
+signals reads as a hang.
+
+Any repeated signal exits unconditionally, so a shutdown can always be
+interrupted:
+
+```bash
+Ctrl+C            # immediate
+docker stop       # SIGTERM: in-flight requests get up to graceful_shutdown_secs
+Ctrl+C Ctrl+C     # either way, the second signal kills it now
+```
+
 ## Testing against a live broker
 
 `tests/manual/` holds a black-box test harness that drives a real broker
