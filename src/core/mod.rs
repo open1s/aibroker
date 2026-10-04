@@ -5,6 +5,7 @@
 //! adapter over these types, which keeps the load-balancing logic testable
 //! without a network.
 
+pub mod api;
 pub mod auth;
 pub mod broker;
 pub mod key_state;
@@ -16,6 +17,7 @@ pub mod runtime;
 pub mod security;
 pub mod strategy;
 
+pub use api::ApiFormat;
 pub use broker::{Broker, RouteError, SelectedKey};
 pub use key_state::{CooldownPolicy, HealthState, HealthTuning, KeyState, Outcome, TokenUsage};
 pub use policy::{PolicyDecision, PolicyEngine, PolicySource, RequestFacts};

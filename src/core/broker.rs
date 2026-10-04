@@ -492,6 +492,7 @@ mod tests {
             admin: Default::default(),
             clients: Vec::new(),
             policy: Default::default(),
+            dump: Default::default(),
         }
     }
 

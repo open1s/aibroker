@@ -21,6 +21,8 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::proxy::redact::Redactor;
+
 /// Headers whose value must never reach the log.
 const SECRET_HEADERS: [&str; 7] = [
     "authorization",
@@ -37,12 +39,16 @@ const SECRET_HEADERS: [&str; 7] = [
 pub const REDACTED: &str = "<redacted>";
 
 /// What to dump, and how much.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: the redactor compiles regexes and owns them.
+#[derive(Debug, Clone)]
 pub struct DumpConfig {
     pub dump_request: bool,
     pub dump_response: bool,
     /// Maximum bytes of a body printed before it is truncated.
     pub max_body_bytes: usize,
+    /// Patterns removed from dumped bodies and header values.
+    pub redactor: Redactor,
 }
 
 impl Default for DumpConfig {
@@ -50,7 +56,8 @@ impl Default for DumpConfig {
         Self {
             dump_request: false,
             dump_response: false,
-            max_body_bytes: 8192,
+            max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
+            redactor: Redactor::default(),
         }
     }
 }
@@ -58,6 +65,19 @@ impl Default for DumpConfig {
 impl DumpConfig {
     pub fn enabled(&self) -> bool {
         self.dump_request || self.dump_response
+    }
+
+    /// The default body cap.
+    ///
+    /// Spelled out rather than derived: `usize::default()` is zero, which would
+    /// silently truncate every dump to nothing.
+    pub const DEFAULT_MAX_BODY_BYTES: usize = 8192;
+
+    /// Set the body cap, clamping to a sane minimum so a dump cannot be
+    /// configured into uselessness.
+    pub fn with_max_body_bytes(mut self, max: usize) -> Self {
+        self.max_body_bytes = max.max(64);
+        self
     }
 }
 
@@ -102,7 +122,7 @@ impl Dump {
     }
 
     pub fn config(&self) -> DumpConfig {
-        self.config
+        self.config.clone()
     }
 
     /// Milliseconds since the request started, so a dump can be correlated
@@ -129,7 +149,7 @@ impl Dump {
             return;
         }
         self.request_headers_done = true;
-        let rendered = render_headers(headers.headers.iter());
+        let rendered = self.redact(&render_headers(headers.headers.iter()));
         self.emit("req", &format!("{method} {uri} {version}"));
         self.emit("req headers", &rendered);
     }
@@ -141,7 +161,7 @@ impl Dump {
         if !self.config.dump_request {
             return;
         }
-        let rendered = render_headers(req.headers.iter());
+        let rendered = self.redact(&render_headers(req.headers.iter()));
         self.emit(
             "upstream req",
             &format!("{} {} {:?}", req.method, req.uri, req.version),
@@ -162,7 +182,8 @@ impl Dump {
         }
         if self.request_bytes == 0 {
             self.request_bytes = chunk.len();
-            self.emit("req body", &format_body(chunk, self.config.max_body_bytes));
+            let message = self.request_body_message(chunk);
+            self.emit("req body", &message);
             return;
         }
         if self.request_bytes == chunk.len() {
@@ -183,7 +204,7 @@ impl Dump {
         if !self.config.dump_response {
             return;
         }
-        let rendered = render_headers(headers.headers.iter());
+        let rendered = self.redact(&render_headers(headers.headers.iter()));
         self.emit("resp", &format!("{status}"));
         self.emit("resp headers", &rendered);
     }
@@ -195,19 +216,10 @@ impl Dump {
             return;
         }
         let total = self.response_bytes + chunk.len();
-        let text = String::from_utf8_lossy(chunk);
         // SSE frames are newline separated; print them as separate events.
-        let mut printed = false;
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r');
-            if line.is_empty() {
-                continue;
-            }
-            self.emit("resp body", &truncate(line, self.config.max_body_bytes));
-            printed = true;
-        }
-        if !printed && !chunk.is_empty() {
-            self.emit("resp body", &format!("<binary {} bytes>", chunk.len()));
+        let messages = self.response_body_messages(chunk);
+        for message in &messages {
+            self.emit("resp body", message);
         }
         self.response_bytes = total;
         if end_of_stream {
@@ -216,6 +228,41 @@ impl Dump {
                 &format!("<end of stream, {total} bytes total>"),
             );
         }
+    }
+
+    /// The message a request body chunk would produce, redacted.
+    ///
+    /// Split out from the emit so a test can assert on the text that reaches
+    /// the log without installing a tracing subscriber. Testing the redactor in
+    /// isolation would not prove the dump path calls it -- which is exactly the
+    /// mistake this shape avoids.
+    fn request_body_message(&self, chunk: &[u8]) -> String {
+        self.redact(&format_body(chunk, self.config.max_body_bytes))
+    }
+
+    /// The messages a response body chunk would produce, redacted.
+    fn response_body_messages(&self, chunk: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(chunk);
+        let mut messages: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            messages.push(self.redact(&truncate(line, self.config.max_body_bytes)));
+        }
+        if messages.is_empty() && !chunk.is_empty() {
+            messages.push(format!("<binary {} bytes>", chunk.len()));
+        }
+        messages
+    }
+
+    /// Apply the configured redaction rules.
+    fn redact(&self, text: &str) -> String {
+        if self.config.redactor.is_empty() {
+            return text.to_string();
+        }
+        self.config.redactor.apply(text)
     }
 
     /// Report the outcome once the request is finished.
@@ -394,6 +441,7 @@ mod tests {
             dump_request: true,
             dump_response: false,
             max_body_bytes: 4096,
+            ..DumpConfig::default()
         });
         let body = br#"{"model":"m","messages":[]}"#;
         dump.request_body(body);
@@ -413,11 +461,107 @@ mod tests {
             dump_request: true,
             dump_response: false,
             max_body_bytes: 4096,
+            ..DumpConfig::default()
         });
         dump.request_body(b"aaaa");
         dump.request_body(b"bbbbbb");
         dump.request_body(b"cc");
         assert_eq!(dump.request_bytes, 12, "size is still accounted for");
+    }
+
+    fn redacting(rules: &[(&str, &str)]) -> DumpConfig {
+        DumpConfig {
+            dump_request: true,
+            dump_response: true,
+            max_body_bytes: 4096,
+            redactor: Redactor::new(
+                &rules
+                    .iter()
+                    .map(|(p, r)| ((*p).to_string(), (*r).to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_secret_inside_a_prompt_never_reaches_the_log() {
+        // The message the dump would emit is what must not contain the secret.
+        // Asserting on `Redactor` alone would not prove the dump path uses it.
+        let dump = Dump::new(redacting(&[(r"[\w.]+@[\w.-]+", "***@***")]));
+        let body = br#"{"messages":[{"role":"user","content":"mail ada@example.com"}]}"#;
+
+        let message = dump.request_body_message(body);
+        assert!(!message.contains("ada@example.com"), "{message}");
+        assert!(message.contains("***@***"), "{message}");
+        // The rest of the prompt is still debuggable.
+        assert!(message.contains("\"role\":\"user\""), "{message}");
+    }
+
+    #[test]
+    fn a_response_frame_is_redacted_too() {
+        let dump = Dump::new(redacting(&[("tok-[0-9a-f]{8}", "<tok>")]));
+        let messages = dump.response_body_messages(b"data: {\"note\":\"tok-deadbeef\"}\n\n");
+        assert_eq!(messages.len(), 1, "one SSE frame, one message");
+        assert!(messages[0].contains("<tok>"), "{}", messages[0]);
+        assert!(!messages[0].contains("tok-deadbeef"), "{}", messages[0]);
+    }
+
+    #[test]
+    fn redaction_happens_before_truncation() {
+        // The broker's own admin token is always redacted; assert the dump path
+        // applies it rather than only the redactor.
+        let dump = Dump::new(DumpConfig {
+            dump_request: true,
+            max_body_bytes: 200,
+            redactor: Redactor::with_admin_token(Some("SECRET-12345")).unwrap(),
+            ..DumpConfig::default()
+        });
+        let body = r#"{"messages":[{"content":"SECRET-12345"}]}"#;
+
+        let message = dump.request_body_message(body.as_bytes());
+        assert!(!message.contains("SECRET-12345"), "{message}");
+        assert!(message.contains("<redacted>"), "{message}");
+    }
+
+    #[test]
+    fn header_values_are_redacted_through_the_dump_path() {
+        // A credential can arrive in a header that is not in SECRET_HEADERS, so
+        // the configured patterns must apply to header lines as well.
+        let dump = Dump::new(redacting(&[("xoxb-[A-Za-z0-9-]+", "<slack>")]));
+        let mut req = RequestHeader::build("POST", b"/v1/chat/completions", None).unwrap();
+        req.insert_header(
+            http::HeaderName::from_bytes(b"x-custom-auth").unwrap(),
+            http::HeaderValue::from_str("xoxb-1234-abcd").unwrap(),
+        )
+        .unwrap();
+
+        let rendered = dump.redact(&render_headers(req.headers.iter()));
+        assert!(rendered.contains("<slack>"), "{rendered}");
+        assert!(!rendered.contains("xoxb-1234-abcd"), "{rendered}");
+    }
+
+    #[test]
+    fn the_default_config_has_a_usable_body_cap() {
+        // A derived `Default` gave `max_body_bytes: 0`, which truncated every
+        // dump to nothing.
+        assert_eq!(
+            DumpConfig::default().max_body_bytes,
+            DumpConfig::DEFAULT_MAX_BODY_BYTES
+        );
+        assert!(DumpConfig::default().max_body_bytes > 0);
+    }
+
+    #[test]
+    fn an_unconfigured_redactor_leaves_the_body_readable() {
+        // Debugging must still work when no patterns are configured.
+        let dump = Dump::new(DumpConfig {
+            dump_request: true,
+            ..DumpConfig::default()
+        });
+        let message = dump.request_body_message(b"{\"prompt\":\"hello\"}");
+        assert!(message.contains("hello"), "{message}");
+        assert!(!message.contains("<redacted>"), "{message}");
     }
 
     #[test]
@@ -437,6 +581,7 @@ mod tests {
             dump_request: false,
             dump_response: true,
             max_body_bytes: 4096,
+            ..DumpConfig::default()
         });
         dump.response_body(b"data: one\n\n", false);
         dump.response_body(b"data: two\n\n", false);

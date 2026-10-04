@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::config::{AdminMode, Config};
+use crate::core::api::{ApiFormat, model_from_query};
 use crate::core::key_state::{Outcome, TokenUsage};
 use crate::core::metrics::estimate_cost_micros;
 use crate::core::policy::build_facts;
@@ -28,11 +29,10 @@ use crate::core::runtime::{Runtime, SharedRuntime, shared};
 use crate::core::security::{ClientDecision, DenyReason, presented_token};
 use crate::core::strategy::parse_retry_after;
 use crate::proxy::admin::{AdminCredentials, AdminRequest, AdminResponse, AdminRouter};
-use crate::proxy::body::{
-    DEFAULT_REQUEST_SCAN_LIMIT, estimate_request_tokens, extract_model, model_from_path,
-};
+use crate::proxy::body::{DEFAULT_REQUEST_SCAN_LIMIT, estimate_request_tokens, model_from_path};
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::dump::DumpConfig;
+use crate::proxy::payload::{Payload, detect_format};
 
 /// Upper bound on the pause before a retry, so a large upstream `Retry-After`
 /// cannot stall a client request behind the retry budget.
@@ -206,8 +206,16 @@ impl ProxyService {
     }
 
     /// Resolve the model from the request body, then the path.
-    fn resolve_model(&self, body: &[u8], path: &str) -> Option<String> {
-        extract_model(body).or_else(|| model_from_path(path))
+    ///
+    /// The body is parsed as JSON rather than scanned for `"model"`: a decoy
+    /// nested object (a tool schema, a metadata blob) would otherwise win over
+    /// the real top-level field and route the request to the wrong provider.
+    fn resolve_model(&self, payload: &Payload, path: &str) -> Option<String> {
+        payload
+            .model()
+            .map(str::to_string)
+            .or_else(|| extract_nested_model(payload.value()))
+            .or_else(|| model_from_path(path))
     }
 
     /// Resolve the model from information available before the request body is
@@ -227,6 +235,8 @@ impl ProxyService {
             return;
         }
         let header = session.req_header();
+        ctx.api_format = ApiFormat::from_path(header.uri.path());
+
         let from_header = header
             .headers
             .get("x-llm-model")
@@ -234,7 +244,13 @@ impl ProxyService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_string());
-        ctx.model = from_header.or_else(|| model_from_path(header.uri.path()));
+        ctx.model = from_header
+            // `?model=` exists for callers that cannot set a header, which is
+            // the common case for `/v1/responses`: its path carries no model and
+            // the body is not readable at this point.
+            .or_else(|| model_from_query(header.uri.query()))
+            // Providers that put the model in the path (`/v1/models/<m>:...`).
+            .or_else(|| model_from_path(header.uri.path()));
     }
 
     /// Record the outcome of an attempt exactly once.
@@ -511,6 +527,7 @@ impl ProxyService {
                 provider = %provider,
                 key = %key_id,
                 model = model.as_deref().unwrap_or("-"),
+                api = ctx.api_format.as_str(),
                 status,
                 attempts = ctx.attempts,
                 latency_ms = total_latency.as_millis() as u64,
@@ -617,7 +634,10 @@ impl ProxyHttp for ProxyService {
         let mut ctx = RequestContext::default();
         ctx.configure_usage_scan(self.settings.usage_tracking, self.settings.usage_scan_limit);
         if self.settings.dump.enabled() {
-            ctx.enable_dump(crate::proxy::dump::next_request_id(), self.settings.dump);
+            ctx.enable_dump(
+                crate::proxy::dump::next_request_id(),
+                self.settings.dump.clone(),
+            );
         }
         ctx
     }
@@ -687,11 +707,23 @@ impl ProxyHttp for ProxyService {
         {
             ctx.body.push(chunk, self.settings.request_scan_limit);
             if !ctx.body.is_empty() {
-                ctx.estimated_tokens = estimate_request_tokens(ctx.body.bytes());
-                if ctx.model.is_none() {
-                    let path = session.req_header().uri.path().to_string();
-                    ctx.model = self.resolve_model(ctx.body.bytes(), &path);
+                // One parse serves the model, the token estimate and the
+                // dialect, instead of scanning the body three times.
+                let payload = Payload::parse(ctx.body.bytes());
+                if let Some(cap) = payload.token_cap() {
+                    ctx.estimated_tokens = payload
+                        .estimated_prompt_tokens(ctx.body.bytes().len())
+                        .saturating_add(cap);
+                } else {
+                    ctx.estimated_tokens = estimate_request_tokens(ctx.body.bytes());
                 }
+                let path = session.req_header().uri.path().to_string();
+                if ctx.model.is_none() {
+                    ctx.model = self.resolve_model(&payload, &path);
+                }
+                // The endpoint usually settles the dialect, but a payload whose
+                // shape contradicts it wins: the provider reads the body.
+                ctx.api_format = detect_format(ApiFormat::from_path(&path), Some(&payload));
             }
         }
         let _ = end_of_stream;
@@ -710,6 +742,18 @@ impl ProxyHttp for ProxyService {
         // Resolve the model from the signals that exist before the body is
         // streamed (see `resolve_early_model`).
         self.resolve_early_model(session, ctx);
+
+        // The dialect is settled by now for anything that carries a body: the
+        // body filter has run and may have overridden the path-derived guess.
+        // Recording it in the request filter would count every request as
+        // `other`, because the body has not been read at that point.
+        if !ctx.format_recorded {
+            ctx.format_recorded = true;
+            self.runtime
+                .read()
+                .metrics()
+                .record_api_format(ctx.api_format.as_str());
+        }
 
         // Authenticate the caller and apply the egress policy before any body
         // is forwarded. A refusal here means disallowed content never leaves
@@ -1069,6 +1113,34 @@ impl ProxyHttp for ProxyService {
     }
 }
 
+/// The legacy nested-model fallback, for payloads that keep it off the top
+/// level.
+///
+/// The old scanner searched the whole document for any `model` key, which found
+/// these but also matched decoys. This walks the known shapes explicitly.
+fn extract_nested_model(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    for (container, key) in [("model_id", "model_id"), ("modelId", "modelId")] {
+        if let Some(found) = value
+            .get(container)
+            .and_then(|v| v.get(key))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(found.to_string());
+        }
+    }
+    // A single-element `instances` array (Vertex-style).
+    value
+        .get("instances")?
+        .as_array()?
+        .first()?
+        .get("model")?
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
 /// Rewrite the JSON `"model"` value in a request body.
 ///
 /// Only the first occurrence of the exact value is replaced, which is what
@@ -1304,6 +1376,7 @@ mod tests {
             observability: Default::default(),
             admin: Default::default(),
             clients: Vec::new(),
+            dump: Default::default(),
             policy: Default::default(),
         }
     }
@@ -1555,18 +1628,56 @@ mod tests {
     #[test]
     fn model_resolution_prefers_the_body_then_the_path() {
         let service = service();
+        let body = Payload::parse(br#"{"model":"gpt-4o"}"#);
         assert_eq!(
             service
-                .resolve_model(br#"{"model":"gpt-4o"}"#, "/v1/chat/completions")
+                .resolve_model(&body, "/v1/chat/completions")
                 .as_deref(),
             Some("gpt-4o")
         );
+
+        let empty = Payload::parse(b"");
         assert_eq!(
             service
-                .resolve_model(b"", "/v1/models/gemini-pro:generateContent")
+                .resolve_model(&empty, "/v1/models/gemini-pro:generateContent")
                 .as_deref(),
             Some("gemini-pro")
         );
-        assert_eq!(service.resolve_model(b"", "/v1/chat/completions"), None);
+        assert_eq!(service.resolve_model(&empty, "/v1/chat/completions"), None);
+    }
+
+    #[test]
+    fn a_nested_decoy_model_does_not_win_over_the_top_level_one() {
+        // `resolve_model` runs before the request is routed, so a decoy here
+        // means the wrong provider, or an upstream asked for a model that does
+        // not exist.
+        let service = service();
+        let body =
+            Payload::parse(br#"{"metadata":{"model":"decoy"},"messages":[],"model":"gpt-4o"}"#);
+        assert_eq!(
+            service
+                .resolve_model(&body, "/v1/chat/completions")
+                .as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn the_legacy_nested_shapes_still_resolve() {
+        let service = service();
+        let vertex = Payload::parse(br#"{"instances":[{"model":"gemini-pro"}]}"#);
+        assert_eq!(
+            service
+                .resolve_model(&vertex, "/v1/chat/completions")
+                .as_deref(),
+            Some("gemini-pro")
+        );
+        let azure = Payload::parse(br#"{"model_id":{"model_id":"my-deployment"}}"#);
+        assert_eq!(
+            service
+                .resolve_model(&azure, "/v1/chat/completions")
+                .as_deref(),
+            Some("my-deployment")
+        );
     }
 }

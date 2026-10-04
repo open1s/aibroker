@@ -59,6 +59,23 @@ pub struct Config {
     /// Egress policy, written in Rego.
     #[serde(default)]
     pub policy: PolicyConfig,
+
+    /// Request/response dumping for LLM debugging.
+    #[serde(default)]
+    pub dump: DumpSection,
+}
+
+/// `[dump]` — the debug dump, and what to hide inside it.
+///
+/// A dump is the one place prompt content reaches durable storage, so the
+/// redaction patterns belong in the config next to it rather than only on a
+/// command line that a shell history records.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DumpSection {
+    /// Patterns removed from dumped bodies and header values, each either
+    /// `PATTERN` or `PATTERN=REPLACEMENT`.
+    #[serde(default)]
+    pub redact: Vec<String>,
 }
 
 /// A caller of the proxy.

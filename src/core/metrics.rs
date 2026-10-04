@@ -72,6 +72,9 @@ pub struct Registry {
     models: Mutex<BTreeMap<String, Arc<KeyMetrics>>>,
     /// Client denials by reason (`missing_credential`, `model_forbidden`, ...).
     client_denials: Mutex<BTreeMap<String, u64>>,
+    /// Requests by API dialect (`chat_completions`, `responses`, ...), so an
+    /// operator can see which traffic shape is actually in use.
+    api_formats: Mutex<BTreeMap<String, u64>>,
     started_at: std::time::Instant,
 }
 
@@ -96,6 +99,7 @@ impl Registry {
             rejected_client_auth: AtomicU64::new(0),
             rejected_policy: AtomicU64::new(0),
             client_denials: Mutex::new(BTreeMap::new()),
+            api_formats: Mutex::new(BTreeMap::new()),
             requests_in_flight: AtomicU64::new(0),
             config_reloads: AtomicU64::new(0),
             tokens_in_total: AtomicU64::new(0),
@@ -241,6 +245,24 @@ impl Registry {
             .or_insert(0) += 1;
     }
 
+    /// Count a request against its API dialect.
+    pub fn record_api_format(&self, format: &str) {
+        *self
+            .api_formats
+            .lock()
+            .expect("metrics mutex poisoned")
+            .entry(format.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// Request counts by API dialect.
+    pub fn api_formats(&self) -> BTreeMap<String, u64> {
+        self.api_formats
+            .lock()
+            .expect("metrics mutex poisoned")
+            .clone()
+    }
+
     /// Denial counts by reason.
     pub fn client_denials(&self) -> BTreeMap<String, u64> {
         self.client_denials
@@ -331,6 +353,25 @@ impl Registry {
             "Requests refused by the egress policy (model, provider or budget).",
             self.rejected_policy.load(Ordering::Relaxed)
         );
+        let formats = self.api_formats();
+        if !formats.is_empty() {
+            out.push_str(
+                "# HELP llm_broker_requests_by_api_total Proxied requests, by OpenAI API dialect.\n",
+            );
+            out.push_str("# TYPE llm_broker_requests_by_api_total counter\n");
+            for (format, count) in formats {
+                debug_assert!(
+                    format
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                    "unexpected characters in an api format label: {format}"
+                );
+                out.push_str(&format!(
+                    "llm_broker_requests_by_api_total{{api=\"{format}\"}} {count}\n"
+                ));
+            }
+        }
+
         let denials = self.client_denials();
         if !denials.is_empty() {
             out.push_str(

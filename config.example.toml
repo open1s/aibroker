@@ -181,6 +181,31 @@ usage_scan_limit_bytes = 65_536
 # output_per_million = 10.0
 
 # ---------------------------------------------------------------------------
+# API dialects
+# ---------------------------------------------------------------------------
+# Both OpenAI dialects are proxied and both are forwarded untouched:
+#
+#   POST /v1/chat/completions   {"model":"gpt-4o","messages":[...]}
+#   POST /v1/responses          {"model":"gpt-4o","input":"...","max_output_tokens":64}
+#
+# The output-token cap and the `usage` field names are read per dialect, so
+# token accounting and TPM reservation work for either.
+#
+# The model must be declared *before* the body streams, because pingora picks
+# the upstream peer first. In precedence order:
+#
+#   1. the `x-llm-model` header (any dialect; what an SDK should set)
+#   2. a `?model=` query parameter, e.g. POST /v1/responses?model=gpt-4o
+#   3. the path, for providers that put the model there
+#      (/v1/models/<model>:generateContent)
+#
+# Without one of those the request is still proxied -- the body's own `model`
+# field is what the provider reads -- but the broker may choose a key that does
+# not declare that model, and per-model counters and policy see no model. This
+# is the same for both dialects; neither has ever had a body-derived model
+# before routing.
+
+# ---------------------------------------------------------------------------
 # Admin API
 # ---------------------------------------------------------------------------
 # The control plane can add, disable and delete credentials, so it refuses

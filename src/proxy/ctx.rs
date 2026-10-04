@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::core::key_state::{KeyGuard, KeyState, TokenUsage};
 
+use crate::core::api::ApiFormat;
 use crate::core::security::ClientAccess;
 use crate::proxy::body::UsageAccumulator;
 use crate::proxy::dump::{Dump, DumpConfig};
@@ -60,6 +61,10 @@ pub struct RequestContext {
     pub policy_reason: Option<String>,
     /// Whether the caller passed client authentication.
     pub authenticated: bool,
+    /// Which OpenAI API dialect this request speaks.
+    pub api_format: ApiFormat,
+    /// Whether the dialect has been counted, so a retry does not count twice.
+    pub format_recorded: bool,
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -102,6 +107,8 @@ impl Default for RequestContext {
             client_name: None,
             policy_reason: None,
             authenticated: false,
+            api_format: ApiFormat::Other,
+            format_recorded: false,
         }
     }
 }

@@ -53,6 +53,7 @@ dependencies = [
  "parking_lot",
  "pingora",
  "pingora-error",
+ "regex",
  "regorus",
  "serde",
  "serde_json",

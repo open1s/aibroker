@@ -6,6 +6,7 @@ use aibroker::config::Config;
 use aibroker::core::runtime::{Runtime, shared};
 use aibroker::proxy::dump::DumpConfig;
 use aibroker::proxy::pingora_backend::run_server;
+use aibroker::proxy::redact::Redactor;
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -42,6 +43,16 @@ struct Args {
     /// Maximum bytes of a body to print in a dump (default 8192).
     #[arg(long, value_name = "BYTES", default_value_t = 8192)]
     dump_max_bytes: usize,
+
+    /// Redact a pattern from dumped bodies and header values. Repeatable.
+    ///
+    /// Either `PATTERN` (replaced with `<redacted>`) or `PATTERN=REPLACEMENT`,
+    /// where the replacement may reference capture groups as `$1`. Patterns are
+    /// regexes, so quote anything your shell would interpret.
+    ///
+    /// Example: --redact 'ghp_[A-Za-z0-9]{20,}' --redact '([\w.]+)@([\w.-]+)=***@$2'
+    #[arg(long, value_name = "PATTERN[=REPLACEMENT]")]
+    redact: Vec<String>,
 
     /// Query a running broker's admin API and print the result, then exit.
     ///
@@ -124,10 +135,32 @@ fn main() {
 
     install_signal_handlers();
 
+    let redactor = match build_redactor(&config, &args) {
+        Ok(redactor) => redactor,
+        Err(error) => {
+            eprintln!("redaction pattern is unusable: {error}");
+            std::process::exit(1);
+        }
+    };
+
     if args.dump_request || args.dump_response {
         eprintln!(
-            "[dump] request={} response={} max_body_bytes={} (credentials are redacted; filter with RUST_LOG=info,llm_broker::dump=off)",
-            args.dump_request, args.dump_response, args.dump_max_bytes
+            "[dump] request={} response={} max_body_bytes={} redaction_patterns={} \
+             (filter with RUST_LOG=info,llm_broker::dump=off)",
+            args.dump_request,
+            args.dump_response,
+            args.dump_max_bytes,
+            redactor.len()
+        );
+    }
+    if (args.dump_request || args.dump_response) && redactor.is_empty() {
+        // Worth saying out loud: a dump is the one place prompt content reaches
+        // durable storage, and `-rw-r--r--` is the usual outcome of a shell
+        // redirect.
+        eprintln!(
+            "[dump] warning: no redaction patterns are configured, so prompt content is \
+             written to the log verbatim. Add --redact PATTERN (or `redact` under \
+             [dump] in the config) to mask secrets inside bodies."
         );
     }
 
@@ -135,11 +168,43 @@ fn main() {
         dump_request: args.dump_request,
         dump_response: args.dump_response,
         max_body_bytes: args.dump_max_bytes,
+        redactor,
     };
 
     if let Err(error) = run_server(config, runtime, dump) {
         eprintln!("server error: {error}");
         std::process::exit(1);
+    }
+}
+
+/// Compile the redaction rules from the config and the command line.
+///
+/// The admin token is always included: it is the broker's own credential, and
+/// it can legitimately appear in a dumped header or query string, so leaking it
+/// into a log we wrote would be our defect rather than the operator's.
+fn build_redactor(config: &Config, args: &Args) -> Result<Redactor, String> {
+    let mut rules: Vec<(String, String)> = Vec::new();
+    for pattern in &config.dump.redact {
+        rules.push(split_redaction(pattern));
+    }
+    for pattern in &args.redact {
+        rules.push(split_redaction(pattern));
+    }
+
+    let admin_token = config
+        .admin
+        .token
+        .as_deref()
+        .and_then(|token| aibroker::config::resolve_secret(token).ok());
+
+    Redactor::new(&rules)?.plus_admin_token(admin_token.as_deref())
+}
+
+/// Split `PATTERN=REPLACEMENT`, tolerating a replacement-less pattern.
+fn split_redaction(spec: &str) -> (String, String) {
+    match spec.split_once('=') {
+        Some((pattern, replacement)) => (pattern.to_string(), replacement.to_string()),
+        None => (spec.to_string(), String::new()),
     }
 }
 

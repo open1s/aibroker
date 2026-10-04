@@ -74,6 +74,7 @@ src/
   core/                    Framework-independent; no HTTP types
     security.rs            Client tokens, egress scopes, per-client budgets
     policy.rs              Rego egress policy (regorus); builds policy facts
+    api.rs                 API dialect classification; ?model= parsing
     key_state.rs           Per-key health, cooldown, limits, counters, KeyGuard
     ratelimit.rs           Sliding-window RPM/TPM limiter
     pool.rs                KeyPool: availability gate + strategy dispatch
@@ -88,7 +89,8 @@ src/
     dashboard.rs           Read-only status page served at the admin mount point
     dashboard/page.html    The page template (static asset, embedded via include_str!)
     control.rs             Control-plane listener for `admin.mode = "separate"`
-    body.rs                Model and `usage` extraction from bodies
+    body.rs                `usage` extraction; token estimation
+    payload.rs             JSON request parsing: model, token cap, dialect
 tests/proxy_integration.rs Real proxy + mock upstream over TCP
 ```
 
@@ -212,6 +214,29 @@ Rules for anything added here:
   retry buffer and reports a replay instead of reprinting, so the byte counters
   describe the client's request rather than how many times we sent it.
 - **Dumps are sensitive.** Content the upstream returns is printed verbatim.
+
+## API dialects
+
+`core/api.rs` classifies a request as Chat Completions, Responses or Other;
+`proxy/payload.rs` parses the body. Rules:
+
+- **The model must come from the path, the query or a header** — never the body,
+  for either dialect. pingora picks the peer before the body streams, so a
+  body-derived model only reaches logging, metrics and policy. Do not claim
+  otherwise in a test name: an integration test cannot prove body routing
+  because the code path does not exist.
+- **Parse the body as JSON.** The previous string scan for `"model"` matched a
+  decoy nested object (`{"metadata":{"model":"decoy"},"model":"gpt-4o"}`) and
+  used it as the model, which routes wrongly and forwards a name that is not a
+  model. Do not reintroduce a document-wide scan.
+- **Both dialects forward untouched.** Never rewrite the path, the body or the
+  model field: the upstream must see what the client sent.
+- **Per-dialect details**: token cap (`max_output_tokens` vs `max_tokens`) and
+  usage keys (`input_tokens`/`output_tokens` vs `prompt_tokens`/
+  `completion_tokens`). Adding a dialect means covering both.
+- The body filter parses the **first** chunk only. A body fragmented across
+  chunks falls back to the path-derived signals; that is a known bound, not an
+  accident.
 
 ## pingora constraints worth knowing
 

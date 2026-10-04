@@ -6,6 +6,8 @@ pub mod control;
 pub mod ctx;
 pub mod dashboard;
 pub mod dump;
+pub mod payload;
 pub mod pingora_backend;
+pub mod redact;
 
 pub use pingora_backend::{ProxyService, ProxySettings, build_server_conf, run_server};

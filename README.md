@@ -240,6 +240,71 @@ Each key tracks, per provider: enabled flag, weight, model allow-list, RPM/TPM
 windows, concurrency, EWMA latency, health score, circuit state and cooldown
 level, plus request, token, retry and rate-limit counters.
 
+## Both OpenAI API dialects
+
+The broker proxies **Chat Completions** and the newer **Responses** API. Point
+either client at the same port:
+
+| | endpoint |
+|---|---|
+| Chat Completions | `POST /v1/chat/completions` |
+| Responses | `POST /v1/responses` |
+
+```bash
+# Chat Completions — the model can also be declared in the body alone
+curl http://127.0.0.1:11436/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'x-llm-model: gpt-4o' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+
+# Responses
+curl http://127.0.0.1:11436/v1/responses \
+  -H 'Content-Type: application/json' -H 'x-llm-model: gpt-4o' \
+  -d '{"model":"gpt-4o","input":"hi","max_output_tokens":64}'
+```
+
+Both paths forward **untouched** — the broker never rewrites the endpoint, the
+body or the model field — so the upstream sees exactly what the client sent.
+
+Two details are handled per dialect: the output-token cap (`max_tokens` /
+`max_completion_tokens` versus `max_output_tokens`), so TPM is reserved
+correctly, and the `usage` object (`prompt_tokens`/`completion_tokens` versus
+`input_tokens`/`output_tokens`), so accounting is the same for both.
+
+### Declaring the model before the body
+
+pingora chooses the upstream and writes the request header **before** the body
+streams, and offers no way to put a peeked body back. The model therefore has to
+come from the URL or a header. Precedence:
+
+1. `x-llm-model` header — works for any dialect, and what an SDK should use via
+   `default_headers`;
+2. `?model=` query parameter — for a plain `curl` or a client that cannot set a
+   header: `POST /v1/responses?model=gpt-4o`;
+3. the path, for providers that put the model there
+   (`/v1/models/<model>:generateContent`).
+
+If none is present the request is still proxied (the body's own `model` field is
+what the provider reads), but the broker has less to route on: it may pick a key
+that does not declare that model, and its per-model counters and policy see no
+model. **Chat Completions and Responses are equal here** — the model has never
+been derivable from the body before routing, for either dialect.
+
+### Format detection
+
+The endpoint normally settles it, but the body wins when the two disagree, since
+the provider reads the body. A Responses payload posted to
+`/v1/chat/completions` — a gateway rewriting the path, say — is detected as
+Responses. The body is parsed as JSON with `serde_json` rather than scanned for
+`"model"`, because a decoy nested object would otherwise be picked up:
+
+```json
+{"metadata":{"model":"decoy"},"model":"gpt-4o"}   /* parsed: gpt-4o */
+```
+
+The detected dialect appears in the audit log as `api=` and in
+`llm_broker_requests_by_api_total{api=...}`, so you can see which shape is
+actually flowing.
+
 ## Who may use it, and what may leave
 
 Balancing decides *which* key serves a request. Two more layers decide whether

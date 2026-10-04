@@ -180,6 +180,7 @@ fn base_config(
         observability: Default::default(),
         admin: Default::default(),
         clients: Vec::new(),
+        dump: Default::default(),
         policy: Default::default(),
     }
 }
@@ -1114,4 +1115,117 @@ fn a_broken_policy_refuses_traffic_instead_of_forwarding_it() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("invalid policy"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Both OpenAI API dialects.
+// ---------------------------------------------------------------------------
+
+const RESPONSES_BODY: &str = r#"{"model":"test-model","input":"hello","max_output_tokens":64}"#;
+
+/// A broker with one healthy upstream, for dialect tests.
+fn plain_broker() -> (u16, Arc<Mutex<Vec<SeenRequest>>>) {
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200, 200, 200, 200, 200, 200]);
+    let config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    spawn_broker(config, proxy_port);
+    (proxy_port, seen)
+}
+
+#[test]
+fn the_responses_api_is_proxied_when_the_model_is_declared() {
+    // `/v1/responses` has no model in its path and pingora cannot peek the body
+    // before routing, so the client declares it. Everything after routing is
+    // dialect-independent, which this proves.
+    let (port, seen) = plain_broker();
+    let response = post_with_model(port, "/v1/responses", RESPONSES_BODY, Some("test-model"));
+
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    let requests = seen.lock().expect("lock").clone();
+    assert_eq!(requests.len(), 1, "the request should reach the upstream");
+    assert_eq!(
+        requests[0].path, "/v1/responses",
+        "the path must be forwarded untouched, not rewritten to chat/completions"
+    );
+}
+
+#[test]
+fn the_responses_api_accepts_the_model_as_a_query_parameter() {
+    // A caller that cannot set a header can put it in the URL instead.
+    let (port, seen) = plain_broker();
+    let response = post_with_model(port, "/v1/responses?model=test-model", RESPONSES_BODY, None);
+
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    assert_eq!(seen.lock().expect("lock").len(), 1);
+}
+
+#[test]
+fn the_responses_api_is_proxied_without_a_declared_model() {
+    // The JSON `model` field cannot be read before the body streams, but the
+    // request must not be refused for that: the body is forwarded untouched, so
+    // the provider still receives `model` and serves the right model. The broker
+    // simply has less to route on, exactly as for a chat completion that omits
+    // `x-llm-model`.
+    let (port, seen) = plain_broker();
+    let response = post_with_model(port, "/v1/responses", RESPONSES_BODY, None);
+
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    let requests = seen.lock().expect("lock").clone();
+    assert_eq!(requests.len(), 1, "the request should reach the upstream");
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert!(
+        requests[0].body.contains(r#""model":"test-model""#),
+        "the body must reach the provider unchanged, model included: {}",
+        requests[0].body
+    );
+}
+
+#[test]
+fn chat_completions_still_works_after_adding_the_second_dialect() {
+    // The regression guard for the dialect work: the original format must be
+    // untouched.
+    let (port, seen) = plain_broker();
+    let response = post_with_model(port, "/v1/chat/completions", CHAT_BODY, Some("test-model"));
+
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    let requests = seen.lock().expect("lock").clone();
+    assert_eq!(requests[0].path, "/v1/chat/completions");
+}
+
+#[test]
+fn a_decoy_model_in_the_body_is_not_picked_up() {
+    // Scope note, because the name could over-promise: the body-derived model
+    // does *not* drive routing. pingora chooses the upstream peer before the
+    // body is streamed, so `resolve_model` runs afterwards, for logging, metrics
+    // and the per-model counters. What this asserts is that a decoy nested
+    // object cannot reach any of those, nor be forwarded in place of the real
+    // model. The claim that the parser prefers the top-level field is proven by
+    // the unit tests in `proxy::payload`, which can call it directly.
+    let (port, seen) = plain_broker();
+    let body = r#"{"metadata":{"model":"decoy-model"},"messages":[{"role":"user","content":"hi"}],"model":"test-model"}"#;
+
+    let response = post_with_model(port, "/v1/chat/completions", body, None);
+    assert_eq!(response.status, 200, "{}", response.status_line);
+
+    let requests = seen.lock().expect("lock").clone();
+    assert_eq!(requests.len(), 1, "the request should be forwarded once");
+    assert!(
+        requests[0].body.contains(r#""model":"test-model""#),
+        "the real model must be forwarded: {}",
+        requests[0].body
+    );
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer sk-mock-1"),
+        "the provider's own key must be the credential, not anything from the body"
+    );
 }

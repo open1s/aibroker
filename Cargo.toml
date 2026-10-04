@@ -34,6 +34,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Policy engine: Rego for egress/access policy (see core/policy.rs)
 regorus = { version = "0.12", default-features = false, features = ["std", "arc", "glob", "regex"] }
 
+# Redaction patterns for --dump-* output. Already in the tree via regorus, so
+# this adds no new transitive dependency.
+regex = "1"
+
 # Utilities
 parking_lot = "0.12"
 # Restores the default SIGINT handler so Ctrl+C exits during pingora's

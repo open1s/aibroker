@@ -15,9 +15,6 @@ use crate::core::key_state::TokenUsage;
 /// pathological bodies rather than a typical allocation.
 pub const DEFAULT_REQUEST_SCAN_LIMIT: usize = 256 * 1024;
 
-/// Field names carrying the requested model, across provider dialects.
-const MODEL_KEYS: [&str; 3] = ["model", "model_id", "modelId"];
-
 /// Field names carrying prompt tokens, across provider dialects.
 const INPUT_TOKEN_KEYS: [&str; 5] = [
     "prompt_tokens",
@@ -38,71 +35,6 @@ const OUTPUT_TOKEN_KEYS: [&str; 5] = [
 
 /// Object names that carry usage, used as a cheap pre-filter.
 const USAGE_OBJECT_KEYS: [&str; 3] = ["usage", "usageMetadata", "prompt_eval_count"];
-
-/// Extract the requested model from a JSON request body.
-///
-/// The top-level `model` field wins; providers that nest the payload (Azure
-/// deployments, Gemini `generateContent`) are handled by the fallback scan.
-pub fn extract_model(body: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(body).ok()?;
-
-    // Scan for the first recognised model key anywhere in the document. For
-    // OpenAI-shaped payloads that is the top-level `model` field; for nested
-    // dialects (`model_id`, Gemini-style bodies) the same scan finds theirs.
-    for key in MODEL_KEYS {
-        let needle = format!("\"{key}\"");
-        if let Some(position) = text.find(&needle)
-            && let Some(value) = string_value_after(&text[position + needle.len()..])
-        {
-            return Some(value);
-        }
-    }
-    None
-}
-
-/// Parse `"value"` (with escapes) starting at `text`.
-fn string_value_after(text: &str) -> Option<String> {
-    let mut chars = text.char_indices();
-    // Expect optional whitespace, `:`, optional whitespace, then a quote.
-    loop {
-        match chars.next() {
-            Some((_, c)) if c.is_whitespace() => continue,
-            Some((_, ':')) => break,
-            _ => return None,
-        }
-    }
-    let mut out = String::new();
-    let mut started = false;
-    let mut escaped = false;
-    for (_, c) in chars {
-        if !started {
-            if c.is_whitespace() {
-                continue;
-            }
-            if c != '"' {
-                return None;
-            }
-            started = true;
-            continue;
-        }
-        if escaped {
-            out.push(match c {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                other => other,
-            });
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            '"' => return Some(out),
-            other => out.push(other),
-        }
-    }
-    None
-}
 
 /// Find a numeric field anywhere in `text`.
 fn number_field(text: &str, keys: &[&str]) -> Option<u64> {
@@ -342,10 +274,24 @@ pub fn estimate_request_tokens(body: &[u8]) -> u64 {
     let prompt = chars.div_ceil(4);
     let max_tokens = std::str::from_utf8(body)
         .ok()
-        .and_then(|text| number_field(text, &["max_tokens", "max_completion_tokens", "maxTokens"]))
+        .and_then(|text| number_field(text, &TOKEN_CAP_KEYS))
         .unwrap_or(512);
     prompt.saturating_add(max_tokens)
 }
+
+/// Token-cap field names across both OpenAI dialects.
+///
+/// `max_output_tokens` is the Responses API spelling; `max_tokens` and
+/// `max_completion_tokens` are Chat Completions. Reading only the chat names
+/// would make every Responses call reserve the 512-token fallback and
+/// under-count its TPM.
+const TOKEN_CAP_KEYS: [&str; 5] = [
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "maxTokens",
+    "maxOutputTokens",
+];
 
 /// Count of key/value pairs observed, used only for diagnostics.
 pub fn json_field_count(text: &str) -> BTreeMap<String, usize> {
@@ -367,46 +313,6 @@ pub fn json_field_count(text: &str) -> BTreeMap<String, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_model_from_top_level_field() {
-        let body = br#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
-        assert_eq!(extract_model(body).as_deref(), Some("gpt-4"));
-    }
-
-    #[test]
-    fn extract_model_ignores_whitespace_and_key_order() {
-        let body = br#"{ "stream": true,
-            "messages": [{"role": "user", "content": "hello"}],
-            "model" : "claude-3-5-sonnet" }"#;
-        assert_eq!(extract_model(body).as_deref(), Some("claude-3-5-sonnet"));
-    }
-
-    #[test]
-    fn extract_model_is_not_confused_by_a_model_field_inside_messages() {
-        let body =
-            br#"{"messages":[{"role":"user","content":"{\"model\":\"evil\"}"}],"model":"gpt-4o"}"#;
-        assert_eq!(extract_model(body).as_deref(), Some("gpt-4o"));
-    }
-
-    #[test]
-    fn extract_model_falls_back_to_nested_fields() {
-        let body = br#"{"contents":[{"parts":[{"text":"hi"}]}],"model_id":"gemini-pro"}"#;
-        assert_eq!(extract_model(body).as_deref(), Some("gemini-pro"));
-    }
-
-    #[test]
-    fn extract_model_returns_none_when_absent() {
-        assert_eq!(extract_model(br#"{"messages":[]}"#), None);
-        assert_eq!(extract_model(b"not json at all"), None);
-        assert_eq!(extract_model(&[0xff, 0xfe, 0x00]), None);
-    }
-
-    #[test]
-    fn extract_model_handles_escapes() {
-        let body = br#"{"model":"weird\\name"}"#;
-        assert_eq!(extract_model(body).as_deref(), Some("weird\\name"));
-    }
 
     #[test]
     fn parse_usage_reads_openai_shape() {
@@ -543,6 +449,46 @@ mod tests {
 
         let big_prompt = estimate_request_tokens(&vec![b'a'; 40_000]);
         assert!(big_prompt >= 10_000, "got {big_prompt}");
+    }
+
+    #[test]
+    fn estimate_request_tokens_understands_the_responses_dialect() {
+        // `max_output_tokens` is the Responses API spelling. Reading only the
+        // chat names would reserve the 512-token fallback and under-count TPM
+        // for every Responses call.
+        let responses = estimate_request_tokens(br#"{"model":"gpt-4o","max_output_tokens":4096}"#);
+        let chat = estimate_request_tokens(br#"{"model":"gpt-4o","max_tokens":4096}"#);
+        let completion =
+            estimate_request_tokens(br#"{"model":"gpt-4o","max_completion_tokens":4096}"#);
+
+        for (label, value) in [
+            ("max_output_tokens", responses),
+            ("max_tokens", chat),
+            ("max_completion_tokens", completion),
+        ] {
+            assert!(
+                (4096..4200).contains(&value),
+                "{label}: expected ~4096 + prompt, got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_response_body_usage_from_either_dialect_is_parsed() {
+        // Chat Completions.
+        let chat = parse_usage(
+            r#"{"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}"#,
+        )
+        .expect("chat usage");
+        assert_eq!((chat.input, chat.output), (11, 22));
+
+        // Responses: `input_tokens` / `output_tokens`, and a `total_tokens` that
+        // is not the sum of the two when reasoning tokens are involved.
+        let responses = parse_usage(
+            r#"{"usage":{"input_tokens":36,"output_tokens":24,"total_tokens":60,"output_tokens_details":{"reasoning_tokens":24}}}"#,
+        )
+        .expect("responses usage");
+        assert_eq!((responses.input, responses.output), (36, 24));
     }
 
     #[test]
