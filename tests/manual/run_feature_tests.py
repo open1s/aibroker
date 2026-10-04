@@ -434,13 +434,33 @@ def run_mock_profile() -> None:
 
 REAL_PROXY = 11536
 REAL_ADMIN_TOKEN = "test-admin-token-11536"
+# Tokens of brokers this harness may attach to with --port.
+ATTACH_TOKENS = {11536: "local-admin-token", 11636: MOCK_ADMIN_TOKEN}
 REAL_MODEL = "deepseek-ai/deepseek-v4.1-flash"
 RETIRED_MODEL = "minimaxai/minimax-m2.5"
 
 
-def run_real_profile() -> None:
+def run_real_profile(existing_port: int | None = None, admin_token: str | None = None) -> None:
+    """Test a real provider.
+
+    With `existing_port` the harness attaches to an already-running broker and
+    leaves it alone; otherwise it starts one from `test-real-config.toml`.
+    """
+    global REAL_PROXY, REAL_ADMIN_TOKEN
     config = os.path.join(ROOT, "test-real-config.toml")
     broker_log = os.path.join(ROOT, "broker-real.log")
+    broker: Broker | None = None
+    if existing_port is not None:
+        REAL_PROXY = existing_port
+        REAL_ADMIN_TOKEN = (
+            admin_token
+            or ATTACH_TOKENS.get(existing_port)
+            or REAL_ADMIN_TOKEN
+        )
+        if not wait_for_port(REAL_PROXY, timeout=2.0):
+            check(f"an existing broker is listening on {REAL_PROXY}", False, "nothing there")
+            return
+        check(f"attached to the broker already running on {REAL_PROXY}", True)
 
     result = subprocess.run(
         [BIN, "--config", config, "--check"], cwd=ROOT, capture_output=True, text=True
@@ -449,19 +469,20 @@ def run_real_profile() -> None:
     check("config --check does not print any secret",
           "nvapi-" not in result.stdout + result.stderr, result.stdout[:300])
 
-    if not port_free(REAL_PROXY):
-        check(f"port {REAL_PROXY} is free before start", False, "already in use")
-        return
-
-    broker = Broker(config, broker_log)
-    if not broker.start():
-        return
+    if existing_port is None:
+        if not port_free(REAL_PROXY):
+            check(f"port {REAL_PROXY} is free before start", False, "already in use")
+            return
+        broker = Broker(config, broker_log)
+        if not broker.start():
+            return
     try:
-        if not wait_for_port(REAL_PROXY):
+        if broker is not None and not wait_for_port(REAL_PROXY):
             check("broker starts on the copied config's port", False,
                   open(broker_log).read()[-2000:])
             return
-        check(f"broker starts on port {REAL_PROXY}", True)
+        if broker is not None:
+            check(f"broker starts on port {REAL_PROXY}", True)
 
         auth = {"Authorization": f"Bearer {REAL_ADMIN_TOKEN}"}
         status, _, raw = request(REAL_PROXY, "GET", "/admin/status", headers=auth)
@@ -519,27 +540,51 @@ def run_real_profile() -> None:
               status == 200, f"status={status} body={raw[:200]!r}")
 
         # A retired model must fail fast: NVIDIA answers 410 Gone and no other
-        # key can fix that, so exactly one attempt may be made.
-        _, _, raw = request(REAL_PROXY, "GET", "/admin/keys", headers=auth)
-        before = {k["id"]: k["selections"] for k in json_of(raw)["providers"]["nvidia"]}
-        started = time.time()
-        status, headers, raw = request(
-            REAL_PROXY, "POST", "/v1/chat/completions",
-            {"model": RETIRED_MODEL, "messages": [{"role": "user", "content": "hi"}]},
-            {"x-llm-model": RETIRED_MODEL},
-            timeout=30.0,
+        # key can fix that, so exactly one attempt may be made. Requires the
+        # model to be allow-listed for a key, so skip when it is not (the
+        # broker then refuses with 503 before any upstream call, which is the
+        # correct behaviour for an unconfigured model).
+        _, _, models_raw = request(REAL_PROXY, "GET", "/admin/keys", headers=auth)
+        allowed = any(
+            RETIRED_MODEL in k.get("models", [])
+            for keys in json_of(models_raw)["providers"].values()
+            for k in keys
         )
-        elapsed = time.time() - started
-        _, _, keys_raw = request(REAL_PROXY, "GET", "/admin/keys", headers=auth)
-        after = {k["id"]: k["selections"] for k in json_of(keys_raw)["providers"]["nvidia"]}
-        attempts = sum(after[k] - before[k] for k in before)
-        check("a retired model (410 Gone) is surfaced to the client", status == 410,
-              f"status={status} body={raw[:200]!r}")
-        check("a retired model fails fast instead of burning the whole key pool",
-              attempts == 1, f"attempts={attempts} elapsed={elapsed:.2f}s")
-        check("the client sees the provider's own explanation",
-              b"end of life" in raw or b"no longer available" in raw,
-              f"body={raw[:200]!r}")
+        if not allowed:
+            print(
+                f"[SKIP] 410 fail-fast: `{RETIRED_MODEL}` is not allow-listed in this\n"
+                f"       broker's config (run the harness in start mode, or add the\n"
+                f"       model to a key, to exercise it).",
+                flush=True,
+            )
+            _, _, raw = request(REAL_PROXY, "GET", "/admin/keys", headers=auth)
+            before = {k["id"]: k["selections"] for k in json_of(raw)["providers"]["nvidia"]}
+            status = None
+            attempts = 0
+            elapsed = 0.0
+        else:
+            _, _, raw = request(REAL_PROXY, "GET", "/admin/keys", headers=auth)
+        before = {k["id"]: k["selections"] for k in json_of(raw)["providers"]["nvidia"]}
+        if allowed:
+            before = {k["id"]: k["selections"] for k in json_of(raw)["providers"]["nvidia"]}
+            started = time.time()
+            status, headers, raw = request(
+                REAL_PROXY, "POST", "/v1/chat/completions",
+                {"model": RETIRED_MODEL, "messages": [{"role": "user", "content": "hi"}]},
+                {"x-llm-model": RETIRED_MODEL},
+                timeout=30.0,
+            )
+            elapsed = time.time() - started
+            _, _, keys_raw = request(REAL_PROXY, "GET", "/admin/keys", headers=auth)
+            after = {k["id"]: k["selections"] for k in json_of(keys_raw)["providers"]["nvidia"]}
+            attempts = sum(after[k] - before[k] for k in before)
+            check("a retired model (410 Gone) is surfaced to the client", status == 410,
+                  f"status={status} body={raw[:200]!r}")
+            check("a retired model fails fast instead of burning the whole key pool",
+                  attempts == 1, f"attempts={attempts} elapsed={elapsed:.2f}s")
+            check("the client sees the provider's own explanation",
+                  b"end of life" in raw or b"no longer available" in raw,
+                  f"body={raw[:200]!r}")
 
         # Metrics reflect the real traffic.
         status, _, raw = request(REAL_PROXY, "GET", "/metrics")
@@ -572,18 +617,30 @@ def run_real_profile() -> None:
         log_text = open(broker_log, encoding="utf-8").read()
         check("access log contains real request lines", "request completed" in log_text, "")
     finally:
-        broker.stop()
+        if broker is not None:
+            broker.stop()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=["mock", "real"], required=True)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="attach to an already-running broker on this port instead of starting one",
+    )
+    parser.add_argument(
+        "--admin-token",
+        default=None,
+        help="admin token for --port when it is not one of the known local ports",
+    )
     args = parser.parse_args()
 
     if args.profile == "mock":
         run_mock_profile()
     else:
-        run_real_profile()
+        run_real_profile(args.port, args.admin_token)
 
     passed = sum(1 for ok, _, _ in RESULTS if ok)
     failed = [(name, detail) for ok, name, detail in RESULTS if not ok]

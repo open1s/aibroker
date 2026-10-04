@@ -8,3 +8,4 @@ config.toml
 /test-mock-config.toml
 *.log
 /broker-*.log
+/local-config.toml
