@@ -30,6 +30,7 @@ use crate::proxy::body::{
     DEFAULT_REQUEST_SCAN_LIMIT, estimate_request_tokens, extract_model, model_from_path,
 };
 use crate::proxy::ctx::RequestContext;
+use crate::proxy::dump::DumpConfig;
 
 /// Upper bound on the pause before a retry, so a large upstream `Retry-After`
 /// cannot stall a client request behind the retry budget.
@@ -53,6 +54,8 @@ pub struct ProxySettings {
     pub max_wait_for_key: Duration,
     pub max_retries: usize,
     pub request_scan_limit: usize,
+    /// Request/response dumping for LLM debugging.
+    pub dump: DumpConfig,
 }
 
 impl ProxySettings {
@@ -74,7 +77,14 @@ impl ProxySettings {
             max_wait_for_key: Duration::from_secs(config.load_balancing.max_wait_for_key_secs),
             max_retries: config.server.max_retries.max(1),
             request_scan_limit: DEFAULT_REQUEST_SCAN_LIMIT,
+            dump: DumpConfig::default(),
         }
+    }
+
+    /// Turn request/response dumping on, from the CLI.
+    pub fn with_dump(mut self, dump: DumpConfig) -> Self {
+        self.dump = dump;
+        self
     }
 }
 
@@ -96,6 +106,12 @@ impl ProxyService {
             admin,
             admin_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Turn dumping on for every request this service handles.
+    pub fn with_dump(mut self, dump: DumpConfig) -> Self {
+        self.settings.dump = dump;
+        self
     }
 
     pub fn settings(&self) -> &ProxySettings {
@@ -394,6 +410,9 @@ impl ProxyHttp for ProxyService {
     fn new_ctx(&self) -> Self::CTX {
         let mut ctx = RequestContext::default();
         ctx.configure_usage_scan(self.settings.usage_tracking, self.settings.usage_scan_limit);
+        if self.settings.dump.enabled() {
+            ctx.enable_dump(crate::proxy::dump::next_request_id(), self.settings.dump);
+        }
         ctx
     }
 
@@ -415,6 +434,16 @@ impl ProxyHttp for ProxyService {
         if self.is_metrics_path(&path) {
             self.handle_metrics(session).await?;
             return Ok(true);
+        }
+
+        if let Some(dump) = ctx.dump.as_mut() {
+            let header = session.req_header();
+            dump.request_headers(
+                header.method.as_str(),
+                &header.uri.to_string(),
+                &format!("{:?}", header.version),
+                header,
+            );
         }
 
         self.runtime
@@ -439,6 +468,13 @@ impl ProxyHttp for ProxyService {
         // Record the model for logging, metrics and token estimation. It does
         // not drive routing: the upstream was already chosen before this filter
         // ran (see `resolve_early_model`).
+        if let Some(chunk) = body.as_deref()
+            && !chunk.is_empty()
+            && let Some(dump) = ctx.dump.as_mut()
+        {
+            dump.request_body(chunk);
+        }
+
         if let Some(chunk) = body.as_deref()
             && !chunk.is_empty()
             && ctx.body.is_empty()
@@ -609,6 +645,10 @@ impl ProxyHttp for ProxyService {
             apply_uri(req, &new_path, new_query.as_deref())?;
         }
 
+        if let Some(dump) = ctx.dump.as_mut() {
+            dump.upstream_request(req);
+        }
+
         Ok(())
     }
 
@@ -619,6 +659,9 @@ impl ProxyHttp for ProxyService {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         let status = resp.status.as_u16();
+        if let Some(dump) = ctx.dump.as_mut() {
+            dump.response_headers(status, resp);
+        }
         ctx.upstream_status = Some(status);
         // From here on the response belongs to this key; a later transport
         // error must not cause a replay on another key.
@@ -697,6 +740,11 @@ impl ProxyHttp for ProxyService {
             && !chunk.is_empty()
         {
             ctx.usage.push(chunk);
+            if let Some(dump) = ctx.dump.as_mut() {
+                dump.response_body(chunk, end_of_stream);
+            }
+        } else if end_of_stream && let Some(dump) = ctx.dump.as_mut() {
+            dump.response_body(&[], true);
         }
         if end_of_stream {
             ctx.usage.finish();
@@ -923,7 +971,9 @@ pub fn runtime_from_config(
 }
 
 /// Start the proxy server with the control plane configured by the file.
-pub fn run_server(config: Config, runtime: SharedRuntime) -> anyhow::Result<()> {
+///
+/// `dump` turns on request/response diagnostics for LLM debugging.
+pub fn run_server(config: Config, runtime: SharedRuntime, dump: DumpConfig) -> anyhow::Result<()> {
     let server_conf = build_server_conf(&config);
     let mut server = Server::new_with_opt_and_conf(None, server_conf);
     server.bootstrap();
@@ -946,7 +996,7 @@ pub fn run_server(config: Config, runtime: SharedRuntime) -> anyhow::Result<()> 
         server.add_service(svc);
     }
 
-    let proxy = ProxyService::new(
+    let mut proxy = ProxyService::new(
         Arc::clone(&runtime),
         Some(AdminRouter::new(
             Arc::clone(&runtime),
@@ -954,6 +1004,7 @@ pub fn run_server(config: Config, runtime: SharedRuntime) -> anyhow::Result<()> 
             config.admin.allow_insecure,
         )),
     );
+    proxy = proxy.with_dump(dump);
     let mut svc = pingora::proxy::http_proxy_service(&server.configuration, proxy);
     let addr = format!("{}:{}", config.server.host, config.server.port);
     svc.add_tcp(&addr);
@@ -1037,6 +1088,7 @@ mod tests {
             connect_timeout: None,
             read_timeout: None,
             write_timeout: None,
+            dump: DumpConfig::default(),
             metrics_path: "/metrics".into(),
             metrics_enabled: true,
             access_log: false,

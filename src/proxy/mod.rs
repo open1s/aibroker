@@ -5,6 +5,7 @@ pub mod body;
 pub mod control;
 pub mod ctx;
 pub mod dashboard;
+pub mod dump;
 pub mod pingora_backend;
 
 pub use pingora_backend::{ProxyService, ProxySettings, build_server_conf, run_server};

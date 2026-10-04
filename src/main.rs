@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use aibroker::config::Config;
 use aibroker::core::runtime::{Runtime, shared};
+use aibroker::proxy::dump::DumpConfig;
 use aibroker::proxy::pingora_backend::run_server;
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -24,6 +25,23 @@ struct Args {
     /// Print the effective configuration (including secrets) and exit.
     #[arg(long)]
     dump_config: bool,
+
+    /// Dump every request (line, headers, body) to the log.
+    ///
+    /// Credentials are always redacted. Pair with `--dump-response` for a full
+    /// picture when debugging an LLM integration.
+    #[arg(long)]
+    dump_request: bool,
+
+    /// Dump every upstream response (status, headers, body) to the log.
+    ///
+    /// Streaming answers are printed frame by frame as they arrive.
+    #[arg(long)]
+    dump_response: bool,
+
+    /// Maximum bytes of a body to print in a dump (default 8192).
+    #[arg(long, value_name = "BYTES", default_value_t = 8192)]
+    dump_max_bytes: usize,
 
     /// Query a running broker's admin API and print the result, then exit.
     ///
@@ -106,7 +124,20 @@ fn main() {
 
     install_signal_handlers();
 
-    if let Err(error) = run_server(config, runtime) {
+    if args.dump_request || args.dump_response {
+        eprintln!(
+            "[dump] request={} response={} max_body_bytes={} (credentials are redacted; filter with RUST_LOG=info,llm_broker::dump=off)",
+            args.dump_request, args.dump_response, args.dump_max_bytes
+        );
+    }
+
+    let dump = DumpConfig {
+        dump_request: args.dump_request,
+        dump_response: args.dump_response,
+        max_body_bytes: args.dump_max_bytes,
+    };
+
+    if let Err(error) = run_server(config, runtime, dump) {
         eprintln!("server error: {error}");
         std::process::exit(1);
     }

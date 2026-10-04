@@ -262,6 +262,58 @@ Token counts come from the response `usage` object when it is present
 (OpenAI, Anthropic, Gemini and Ollama field names are recognised), which also
 feeds TPM accounting and optional cost estimates.
 
+## Debugging a request
+
+`--dump-request` and `--dump-response` print the full exchange, which is the
+quickest way to answer "why is my client getting that?":
+
+```bash
+aibroker --config config.toml --dump-request --dump-response
+# optionally cap the printed body (default 8192 bytes)
+aibroker --config config.toml --dump-request --dump-max-bytes 2000
+```
+
+Each event is one line, tagged with a request id and the elapsed milliseconds,
+so concurrent traffic stays separable and a key rotation is visible as two
+upstream attempts under one id:
+
+```
+[#1 req +0ms] POST /v1/chat/completions HTTP/1.1
+[#1 req headers +0ms] host: 127.0.0.1:11436 | content-type: application/json | x-llm-model: gpt-4o
+[#1 upstream req +0ms] POST /v1/chat/completions HTTP/1.1
+[#1 upstream req headers +0ms] host: api.openai.com | authorization: <redacted> | content-length: 84
+[#1 req body +1ms] {"messages":[{"content":"hello","role":"user"}],"model":"gpt-4o"}
+[#1 resp +3ms] 429
+[#1 resp headers +3ms] retry-after: 1 | content-type: application/json
+[#1 upstream req +1006ms] POST /v1/chat/completions HTTP/1.1      <- rotated key
+[#1 resp +1007ms] 200
+[#1 resp body +1007ms] data: {"choices":[{"delta":{"content":"he"}}]}
+[#1 done +1007ms] status=200 attempts=2 provider=openai key=openai-2 req_bytes=84 resp_bytes=246
+```
+
+What it gives you:
+
+- the **upstream** request, not just the client's: the rewritten path, the
+  `Host`, and how the request was routed, next to what the client actually sent;
+- **both attempts** of a rotation under one id, with the elapsed time, which is
+  what makes an unexplained retry obvious;
+- streaming answers **frame by frame** as they arrive, not buffered until the
+  end;
+- JSON bodies compacted to one line so `grep`, `awk` and `jq -c` still work.
+
+Credentials are **always redacted** (`authorization`, `x-api-key`, `api-key`,
+`x-admin-token`, `cookie`, `set-cookie`), because the broker injects a provider
+key into the upstream request and a naive dump would write secrets to disk.
+Bodies are printed as they are otherwise — including a provider that echoes
+something secret inside its *content* — so treat dump output as sensitive.
+
+Dumps go to the `llm_broker::dump` tracing target, which means they can be
+switched off without losing the rest of the log:
+
+```bash
+RUST_LOG=info,llm_broker::dump=off aibroker --dump-request
+```
+
 ## Stopping it
 
 `Ctrl+C` exits immediately. `SIGTERM` (what a supervisor or `docker stop`

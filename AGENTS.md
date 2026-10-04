@@ -168,6 +168,25 @@ the entire grace period and the only escape was `kill -9`.
   uninterruptible. The handler only touches an atomic and `_exit`; keep it
   async-signal-safe.
 
+## Dumping for LLM debugging
+
+`--dump-request` / `--dump-response` (plus `--dump-max-bytes`) print the
+exchange via the `llm_broker::dump` tracing target. `proxy/dump.rs` owns the
+formatting and is unit-tested; the filters only call it.
+
+Rules for anything added here:
+
+- **Never print a credential.** The broker injects a provider key into the
+  upstream request, so `SECRET_HEADERS` redaction is load-bearing, not
+  cosmetic. Add new credential headers to that list rather than special-casing
+  a call site, and never print a value before checking its name.
+- **One line per event**, tagged `[#id phase +Nms]`, so concurrent requests stay
+  separable and a rotation is visible as two upstream attempts under one id.
+- **A retry replays the same body.** `request_body` recognises the pingora
+  retry buffer and reports a replay instead of reprinting, so the byte counters
+  describe the client's request rather than how many times we sent it.
+- **Dumps are sensitive.** Content the upstream returns is printed verbatim.
+
 ## pingora constraints worth knowing
 
 - `upstream_peer` runs **before** the request body is streamed, and pingora

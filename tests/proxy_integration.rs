@@ -225,7 +225,11 @@ fn spawn_broker(config: Config, port: u16) {
     );
 
     std::thread::spawn(move || {
-        let _ = run_server(config, runtime);
+        let _ = run_server(
+            config,
+            runtime,
+            aibroker::proxy::dump::DumpConfig::default(),
+        );
     });
 
     wait_for_port(port);

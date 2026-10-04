@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::core::key_state::{KeyGuard, KeyState, TokenUsage};
 use crate::proxy::body::UsageAccumulator;
+use crate::proxy::dump::{Dump, DumpConfig};
 use crate::proxy::pingora_backend::BodyBuffer;
 
 /// Everything the filters need to remember about one request.
@@ -45,6 +46,8 @@ pub struct RequestContext {
     pub settled: bool,
     /// Set when the client closed the connection early.
     pub client_gone: bool,
+    /// Request/response dump state, present only when diagnostics are on.
+    pub dump: Option<Dump>,
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -81,6 +84,7 @@ impl Default for RequestContext {
             usage: UsageAccumulator::new(true, 64 * 1024),
             settled: false,
             client_gone: false,
+            dump: None,
         }
     }
 }
@@ -104,6 +108,11 @@ impl RequestContext {
     /// Configure how much of the response body is scanned for usage.
     pub fn configure_usage_scan(&mut self, enabled: bool, limit: usize) {
         self.usage = UsageAccumulator::new(enabled, limit);
+    }
+
+    /// Attach dump state for this request.
+    pub fn enable_dump(&mut self, id: u64, config: DumpConfig) {
+        self.dump = config.enabled().then(|| Dump::with_id(id, config));
     }
 }
 
