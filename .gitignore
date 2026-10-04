@@ -13,3 +13,8 @@ config.toml
 # CI log downloads
 /.ci-*.log
 /.ci-*.zip
+
+# control plane: /admin (read-only status page + JSON API)
+/local-config.toml
+/.admin-token.tmp
+/test*.toml
