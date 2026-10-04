@@ -40,6 +40,8 @@ const MAX_RETRY_PAUSE: Duration = Duration::from_secs(5);
 pub struct ProxySettings {
     pub idle_timeout: Duration,
     pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub write_timeout: Option<Duration>,
     pub metrics_path: String,
     pub metrics_enabled: bool,
     pub access_log: bool,
@@ -59,6 +61,8 @@ impl ProxySettings {
             idle_timeout: config.idle_timeout(),
             connect_timeout: (config.server.connect_timeout_ms > 0)
                 .then(|| Duration::from_millis(config.server.connect_timeout_ms)),
+            read_timeout: config.server.read_timeout_ms.map(Duration::from_millis),
+            write_timeout: config.server.write_timeout_ms.map(Duration::from_millis),
             metrics_path: config.observability.metrics_path.clone(),
             metrics_enabled: config.observability.metrics_enabled,
             access_log: config.observability.access_log,
@@ -532,12 +536,7 @@ impl ProxyHttp for ProxyService {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        let peer = build_peer(
-            &selected.base_url,
-            self.settings.idle_timeout,
-            self.settings.connect_timeout,
-        )
-        .await?;
+        let peer = build_peer(&selected.base_url, &self.settings).await?;
 
         debug!(
             provider = %selected.provider,
@@ -841,11 +840,7 @@ fn host_of(base_url: &str) -> String {
 }
 
 /// Build the upstream peer, resolving DNS for a concrete IP.
-async fn build_peer(
-    base_url: &str,
-    idle_timeout: Duration,
-    connect_timeout: Option<Duration>,
-) -> pingora::Result<HttpPeer> {
+async fn build_peer(base_url: &str, settings: &ProxySettings) -> pingora::Result<HttpPeer> {
     let parsed = Url::parse(base_url).map_err(|error| {
         pingora::Error::explain(
             ErrorType::new("InvalidBaseUrl"),
@@ -871,10 +866,13 @@ async fn build_peer(
 
     let mut peer = HttpPeer::new(format!("{ip}:{port}"), tls, host);
     if let Some(options) = peer.get_mut_peer_options() {
-        options.idle_timeout = Some(idle_timeout);
-        if let Some(connect_timeout) = connect_timeout {
-            options.connection_timeout = Some(connect_timeout);
-        }
+        options.idle_timeout = Some(settings.idle_timeout);
+        options.connection_timeout = settings.connect_timeout;
+        // Left at pingora's default unless configured: LLM completions can
+        // legitimately take minutes, and a premature read timeout is retried
+        // as a transport failure, which would drain the key pool.
+        options.read_timeout = settings.read_timeout;
+        options.write_timeout = settings.write_timeout;
     }
     Ok(peer)
 }
@@ -981,6 +979,8 @@ mod tests {
                 group: None,
                 connect_timeout_ms: 0,
                 idle_timeout_ms: None,
+                read_timeout_ms: None,
+                write_timeout_ms: None,
                 max_retries: 3,
             },
             proxy_type: None,
@@ -1019,6 +1019,8 @@ mod tests {
         ProxySettings {
             idle_timeout: Duration::from_secs(30),
             connect_timeout: None,
+            read_timeout: None,
+            write_timeout: None,
             metrics_path: "/metrics".into(),
             metrics_enabled: true,
             access_log: false,
@@ -1206,6 +1208,24 @@ mod tests {
         let conf = build_server_conf(&config);
         assert_eq!(conf.max_retries, 7);
         assert_eq!(conf.threads, 3);
+    }
+
+    #[test]
+    fn upstream_timeouts_follow_the_config() {
+        let mut config = minimal_config();
+        assert_eq!(
+            ProxySettings::from_config(&config).read_timeout,
+            None,
+            "unset means pingora's default, not a zero timeout"
+        );
+
+        config.server.read_timeout_ms = Some(180_000);
+        config.server.write_timeout_ms = Some(30_000);
+        config.server.connect_timeout_ms = 5_000;
+        let settings = ProxySettings::from_config(&config);
+        assert_eq!(settings.read_timeout, Some(Duration::from_secs(180)));
+        assert_eq!(settings.write_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(settings.connect_timeout, Some(Duration::from_secs(5)));
     }
 
     #[test]

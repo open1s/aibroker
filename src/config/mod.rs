@@ -73,6 +73,21 @@ pub struct ServerConfig {
     /// `load_balancing.idle_timeout_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_ms: Option<u64>,
+    /// Per-attempt read timeout in milliseconds. `None` keeps pingora's
+    /// default (60s).
+    ///
+    /// LLM answers routinely take longer than that -- a long completion, or a
+    /// reasoning model that thinks before it writes, can exceed a minute on its
+    /// own. When this fires the attempt is recorded as a transport failure and
+    /// the request is retried on another key, so too small a value turns normal
+    /// slow answers into exhausted key pools. Raise it for LLM traffic, or set
+    /// a generous value and rely on the client's own timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_timeout_ms: Option<u64>,
+    /// Per-attempt write timeout in milliseconds. `None` keeps pingora's
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_timeout_ms: Option<u64>,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
 }

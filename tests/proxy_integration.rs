@@ -166,6 +166,8 @@ fn base_config(
             group: None,
             connect_timeout_ms: 2_000,
             idle_timeout_ms: Some(5_000),
+            read_timeout_ms: None,
+            write_timeout_ms: None,
             max_retries: 3,
         },
         proxy_type: None,

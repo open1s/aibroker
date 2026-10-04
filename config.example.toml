@@ -22,6 +22,12 @@ daemon = false
 connect_timeout_ms = 5_000
 # Upstream keep-alive; falls back to load_balancing.idle_timeout_secs.
 idle_timeout_ms = 120_000
+# Per-attempt read timeout. Unset keeps pingora's 60s default, which is short
+# for LLM traffic: a long completion, or a reasoning model that thinks before
+# it writes, can exceed a minute. When this fires the attempt counts as a
+# transport failure and rotates to another key, so a small value turns normal
+# slow answers into an exhausted key pool. Set generously for LLM work.
+read_timeout_ms = 600_000
 # Total attempts per client request, including the first one. This is also the
 # budget for rotating onto another key after a 429/5xx.
 max_retries = 3

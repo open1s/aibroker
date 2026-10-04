@@ -144,6 +144,18 @@ one that yields a usable key:
 | `4xx` describing the request (`400`, `401`, `403`, `404`, `405`, `410`, `422`) | Returned straight to the caller and **never** replayed: every key would fail identically. A retired model answering `410 Gone` costs exactly one attempt |
 | Every key unusable | `429` with `Retry-After`, or `503` when no key matches the model |
 
+### Upstream timeouts
+
+`server.connect_timeout_ms`, `server.read_timeout_ms` and
+`server.write_timeout_ms` map onto pingora's per-attempt deadlines, and
+`server.idle_timeout_ms` (or `load_balancing.idle_timeout_secs`) controls
+keep-alive. The read timeout is the one to watch: pingora defaults it to 60s,
+but LLM answers routinely take longer, and a read timeout is treated as a
+transport failure that rotates to another key. A 60s ceiling therefore turns a
+slow-but-healthy provider into an exhausted pool. Set `read_timeout_ms`
+generously (10 minutes is reasonable) and let the client decide when to give
+up.
+
 ### Key state
 
 Each key tracks, per provider: enabled flag, weight, model allow-list, RPM/TPM

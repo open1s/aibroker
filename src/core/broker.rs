@@ -477,6 +477,8 @@ mod tests {
                 group: None,
                 connect_timeout_ms: 0,
                 idle_timeout_ms: None,
+                read_timeout_ms: None,
+                write_timeout_ms: None,
                 max_retries: 3,
             },
             proxy_type: None,

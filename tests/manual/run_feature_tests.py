@@ -437,6 +437,9 @@ REAL_ADMIN_TOKEN = "test-admin-token-11536"
 # Tokens of brokers this harness may attach to with --port.
 ATTACH_TOKENS = {11536: "local-admin-token", 11636: MOCK_ADMIN_TOKEN}
 REAL_MODEL = "deepseek-ai/deepseek-v4.1-flash"
+# Upstream latency for reasoning models varies a lot (observed 4s to 90s for
+# the same prompt), so the client budget must be generous.
+REAL_TIMEOUT = 300.0
 RETIRED_MODEL = "minimaxai/minimax-m2.5"
 
 
@@ -505,7 +508,7 @@ def run_real_profile(existing_port: int | None = None, admin_token: str | None =
                 "temperature": 0,
             },
             {"x-llm-model": REAL_MODEL},
-            timeout=60.0,
+            timeout=300.0,
         )
         elapsed = time.time() - started
         body = json_of(raw)
@@ -534,7 +537,7 @@ def run_real_profile(existing_port: int | None = None, admin_token: str | None =
             REAL_PROXY, "POST", "/v1/chat/completions",
             {"model": REAL_MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16},
             {"x-llm-model": REAL_MODEL, "Authorization": "Bearer not-a-real-key"},
-            timeout=60.0,
+            timeout=300.0,
         )
         check("the broker overrides a client-supplied Authorization header",
               status == 200, f"status={status} body={raw[:200]!r}")
@@ -604,7 +607,7 @@ def run_real_profile(existing_port: int | None = None, admin_token: str | None =
                 {"model": REAL_MODEL, "messages": [{"role": "user", "content": "hi"}],
                  "max_tokens": 16},
                 {"x-llm-model": REAL_MODEL},
-                timeout=60.0,
+                timeout=300.0,
             )
             if status == 200:
                 seen.add(status)
