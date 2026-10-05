@@ -197,6 +197,14 @@ token = "env:LLM_BROKER_ADMIN_TOKEN"
 1.x configs keep working: every new section has a default, and `models`,
 `weight` and `max_rpm` mean what they always did.
 
+A key's `models` list is a **preference, not a gate**. Keys that declare the
+model are tried first; if none of them can serve, the rest of the pool is tried
+anyway. So `models = ["deepseek-*"]` means "try me first for these", not "refuse
+everything else" — declare what a key is *for* rather than everything it could
+technically answer, and a request for a model nobody declared still goes out
+instead of failing at the broker. Entries take the same `*`/`?` globs as
+`allowed_models`.
+
 ### Routing order
 
 For a request the broker tries providers in this order, stopping at the first
@@ -418,6 +426,12 @@ Point `[policy] files = ["policy.rego"]` at it. [policy.example.rego](policy.exa
 documents every fact the policy can see and includes worked examples; a test
 compiles it with the real engine, so it cannot silently rot.
 
+A directory is the better shape once a policy has more than one concern:
+`[policy] rules_dir = "policy.rules.d"` loads every `*.rego` beneath it in
+sorted order, and regorus merges modules by *package*, so several files may
+contribute to `llm.authz`. [policy.example.d/](policy.example.d) is a working
+example, compiled and exercised by the same kind of test.
+
 ### Trying a policy before it can break anything
 
 A policy is code that runs on every request, and `default allow := false` with a
@@ -584,6 +598,61 @@ pattern = "-----BEGIN [A-Z ]*PRIVATE KEY-----"
   protection while inspecting nothing is worse than being off.
 - A body larger than the scan limit (`server.request_scan_limit`, 256 KiB) is
   reported as `body-over-scan-limit` rather than silently passing.
+
+### Deciding the content verdict in Rego
+
+`[content_guard] action` is one answer for the whole guard, and real rules are
+not that uniform: a provider credential in a prompt is never acceptable, while a
+customer's email address is exactly what a support tool is for. Name a
+`content_rule` and the policy decides per finding:
+
+```toml
+[content_guard]
+enabled = true
+action = "report"
+
+[policy]
+enabled = true
+rules_dir = "policy.rules.d"
+# content_rule = "data.llm.content.action"   # the default, when it exists
+```
+
+```rego
+package llm.content
+
+import rego.v1
+
+# A Rego `default` must be a constant, so "whatever the config said" is a
+# catch-all body instead. That also keeps `action` defined for every finding.
+action := input.configured if { not overridden }
+
+overridden if { input.rule == "aws-key" }
+action := "deny" if { input.rule == "aws-key" }
+
+action := "report" if {
+	input.rule == "email-address"
+	input.client.name == "support-triage"
+}
+```
+
+The rule sees `input.rule`, `input.field`, `input.configured`, the client and
+the request. It **never sees the matched text**: the engine retains its input, so
+passing the match in would make the policy a second copy of the secret it is
+judging.
+
+- **No content rule is a silent pass-through.** If the policy defines none, the
+  configured `action` still decides — the policy only speaks when it has
+  something to say, so switching this on cannot change the verdict for every
+  pattern at once.
+- **A policy that cannot answer refuses.** A rule that exists but is *undefined*
+  for this finding is an error, not a shrug. A `default`, or a catch-all body
+  like the one above, keeps it defined.
+- **A policy that fails fails closed**, exactly as for the admission decision.
+- Name a `content_rule` the policy does not define and the broker refuses to
+  start, rather than discovering it on the first real finding.
+
+[policy.example.d/20-content.rego](policy.example.d/20-content.rego) is a
+complete worked example.
 
 ## Credentials in config dumps
 

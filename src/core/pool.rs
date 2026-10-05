@@ -11,7 +11,11 @@ use crate::core::strategy::{Candidate, RotationCounter, Strategy, select};
 /// Why a pool could not place a request.
 #[derive(Debug, Clone)]
 pub enum SelectError {
-    /// No key in this pool can ever serve the model.
+    /// This pool holds no keys at all, so it can never serve anything.
+    ///
+    /// It used to mean "no key's `models` list covers this model", which is no
+    /// longer a refusal: `models` is a preference, so the rest of the pool is
+    /// tried first. The broker still uses this to skip an empty provider.
     NoKeyForModel { model: Option<String> },
     /// Keys exist but every one is blocked.
     Exhausted {
@@ -172,7 +176,12 @@ impl KeyPool {
         self.keys.len() != before
     }
 
-    /// Keys that could serve `model`, regardless of current limits.
+    /// Keys that **declare** they serve `model`, regardless of current limits.
+    ///
+    /// The declaration decides routing order (a provider that names the model is
+    /// tried first) and whether exhaustion is "matching but blocked" or
+    /// "nothing here at all". It is not a serving gate -- see
+    /// [`KeyPool::select`].
     pub fn keys_for_model(&self, model: Option<&str>) -> Vec<&Arc<KeyState>> {
         self.keys
             .iter()
@@ -197,39 +206,55 @@ impl KeyPool {
             .keys
             .iter()
             .filter(|key| !exclude.contains(&key.id))
-            .filter(|key| match model {
-                Some(model) => key.supports_model(model),
-                None => true,
-            })
             .collect();
 
         if considered.is_empty() {
-            // Distinguish "no such key" from "all such keys already tried".
-            let any_for_model = self.keys.iter().any(|key| match model {
-                Some(model) => key.supports_model(model),
-                None => true,
-            });
-            if any_for_model {
-                return Err(SelectError::Exhausted {
-                    earliest_retry: self.earliest_available(),
-                    reason: UnavailableReason::RateLimited,
-                    attempted: exclude.len(),
+            // Distinguish "this pool has no keys at all" from "every key was
+            // already tried for this request". The broker skips the first and
+            // treats the second as retryable exhaustion.
+            if self.keys.is_empty() {
+                return Err(SelectError::NoKeyForModel {
+                    model: model.map(|m| m.to_string()),
                 });
             }
-            return Err(SelectError::NoKeyForModel {
-                model: model.map(|m| m.to_string()),
+            return Err(SelectError::Exhausted {
+                earliest_retry: self.earliest_available(),
+                reason: UnavailableReason::RateLimited,
+                attempted: exclude.len(),
             });
         }
 
-        // Try the configured strategy, then each fallback, so a pool that is
-        // fully rate limited under `usage_based` still gets one more honest
-        // attempt under `round_robin` before we give up.
+        let attempted = considered.len();
+
+        // A key's `models` list is a **preference, not a gate**. Keys that
+        // declare the model are tried first; if none of them can take the
+        // request -- cooling down, out of quota -- the rest of the pool is tried
+        // before giving up.
+        //
+        // So a model missing from every list is still *served*, which is the
+        // difference between "this key was not meant for that model" and "you
+        // may not ask for it". A key that does declare the model still wins,
+        // which is what keeps the list worth writing down.
+        let (declared, others): (Vec<&Arc<KeyState>>, Vec<&Arc<KeyState>>) =
+            considered.into_iter().partition(|key| match model {
+                Some(model) => key.supports_model(model),
+                None => true,
+            });
+
         let mut reasons: Vec<UnavailableReason> = Vec::new();
-        for strategy in std::iter::once(self.strategy).chain(self.fallbacks.iter().copied()) {
-            if let Some(key) =
-                self.try_strategy(strategy, &considered, estimated_tokens, &mut reasons)
-            {
-                return Ok(key);
+        for tier in [declared, others] {
+            if tier.is_empty() {
+                continue;
+            }
+            // Try the configured strategy, then each fallback, so a pool that
+            // is fully rate limited under `usage_based` still gets one more
+            // honest attempt under `round_robin` before we give up.
+            for strategy in std::iter::once(self.strategy).chain(self.fallbacks.iter().copied()) {
+                if let Some(key) =
+                    self.try_strategy(strategy, &tier, estimated_tokens, &mut reasons)
+                {
+                    return Ok(key);
+                }
             }
         }
 
@@ -239,7 +264,7 @@ impl KeyPool {
                 .first()
                 .copied()
                 .unwrap_or(UnavailableReason::RateLimited),
-            attempted: considered.len(),
+            attempted,
         })
     }
 
@@ -533,16 +558,101 @@ mod tests {
     }
 
     #[test]
-    fn unknown_model_reports_no_key_for_model() {
+    fn a_model_missing_from_every_list_is_still_served() {
+        // `models` is a preference, not a gate: a model no key declares is
+        // forwarded to the pool rather than refused. That is the difference
+        // between "this key was not meant for that model" and "you may not ask".
         let pool = pool_of(
             vec![key_config("a", &["gpt-4"], None)],
             Strategy::RoundRobin,
         );
-        let error = pool
+        let selected = pool
             .select(Some("unknown"), &HashSet::new(), 0)
+            .expect("an undeclared model must still be served");
+        assert_eq!(selected.id, "a");
+    }
+
+    #[test]
+    fn an_empty_pool_is_the_only_no_key_for_model_case() {
+        // With the filter gone this error means "this pool holds no keys", so
+        // the broker can still tell an empty provider from an exhausted one.
+        let pool = pool_of(vec![], Strategy::RoundRobin);
+        let error = pool
+            .select(Some("anything"), &HashSet::new(), 0)
             .unwrap_err();
         assert!(matches!(error, SelectError::NoKeyForModel { .. }));
         assert!(error.retry_after().is_none());
+    }
+
+    #[test]
+    fn a_declared_model_beats_an_undeclared_one() {
+        // The preference has to be real, or writing `models` down would do
+        // nothing at all.
+        let pool = pool_of(
+            vec![
+                key_config("declares", &["claude-3"], None),
+                key_config("silent", &["gpt-4"], None),
+            ],
+            Strategy::RoundRobin,
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                pool.select(Some("claude-3"), &HashSet::new(), 0)
+                    .unwrap()
+                    .id,
+                "declares",
+                "the key that declares the model must win every time"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declaring_key_that_cannot_serve_falls_back_to_the_rest() {
+        // Preference must never become a requirement: if the key that declares
+        // the model is out of quota, the pool serves the request from the rest
+        // instead of reporting exhaustion.
+        let pool = pool_of(
+            vec![
+                key_config("declares", &["claude-3"], Some(1)),
+                key_config("silent", &["gpt-4"], None),
+            ],
+            Strategy::RoundRobin,
+        );
+        let empty = HashSet::new();
+        assert_eq!(
+            pool.select(Some("claude-3"), &empty, 0).unwrap().id,
+            "declares",
+            "the first request should still prefer the declaring key"
+        );
+        assert_eq!(
+            pool.select(Some("claude-3"), &empty, 0).unwrap().id,
+            "silent",
+            "the rest of the pool must be tried before giving up"
+        );
+    }
+
+    #[test]
+    fn a_glob_in_a_keys_model_list_puts_it_in_the_preferred_tier() {
+        // Asserting only "the glob key gets served" proves nothing now that an
+        // undeclared key is served anyway -- that version passed with globbing
+        // removed entirely. A glob has to *win* against a key declaring a
+        // different model, which only happens if the pattern really matched.
+        let pool = pool_of(
+            vec![
+                key_config("glob", &["deepseek-*"], None),
+                key_config("other", &["gpt-4"], None),
+            ],
+            Strategy::RoundRobin,
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                pool.select(Some("deepseek-v4.1-flash"), &HashSet::new(), 0)
+                    .unwrap()
+                    .id,
+                "glob",
+                "a glob in a key's models list must make it a declaring key"
+            );
+        }
     }
 
     #[test]

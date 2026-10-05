@@ -17,7 +17,7 @@ use pingora::server::Server;
 use pingora::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::ErrorType;
 use tokio::net::lookup_host;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::config::{AdminMode, Config};
@@ -798,12 +798,53 @@ impl ProxyHttp for ProxyService {
                     .scan(ctx.body.bytes())
                     .map(|finding| (guard.action(), finding))
             });
-            if let Some((action, finding)) = verdict {
+            if let Some((configured, finding)) = verdict {
                 self.runtime
                     .read()
                     .metrics()
                     .content_findings
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                // A Rego policy may override the configured action, so the
+                // verdict can vary by client, by path, or by which rule matched.
+                //
+                // The matched text never reaches the engine: `ContentFacts`
+                // carries the rule name, the field and the request, nothing
+                // else. Passing the match in would make the policy layer a
+                // second copy of the secret it is judging.
+                let request_path = session.req_header().uri.path().to_string();
+                let policy_verdict = {
+                    let runtime = self.runtime.read();
+                    let facts = crate::core::policy::ContentFacts::new(
+                        &finding,
+                        configured,
+                        ctx.client_name.as_deref(),
+                        ctx.client_name.is_some(),
+                        ctx.model.as_deref(),
+                        &request_path,
+                    );
+                    runtime.policy().content_verdict(&facts)
+                };
+
+                // A policy that cannot answer refuses the request. This is a
+                // security decision, and "the engine is broken" is not a reason
+                // to let the body leave the machine.
+                let (action, policy_reason) = match policy_verdict {
+                    Ok(Some(verdict)) => (verdict.action, verdict.reason),
+                    Ok(None) => (configured, None),
+                    Err(error) => {
+                        error!(
+                            target: "llm_broker::content",
+                            error = %error,
+                            finding = %finding.describe(),
+                            "content policy failed; refusing the request"
+                        );
+                        (
+                            crate::core::content::GuardAction::Deny,
+                            Some("the content policy could not be evaluated".to_string()),
+                        )
+                    }
+                };
 
                 warn!(
                     target: "llm_broker::content",
@@ -812,6 +853,7 @@ impl ProxyHttp for ProxyService {
                     // Names the rule, never the match: a security log that
                     // repeats the secret becomes the leak.
                     finding = %finding.describe(),
+                    policy = policy_reason.as_deref().unwrap_or("-"),
                     "request content matched a guard pattern"
                 );
 
@@ -826,10 +868,16 @@ impl ProxyHttp for ProxyService {
                     if let Some(chunk) = body.as_mut() {
                         chunk.clear();
                     }
-                    let detail = format!(
-                        "the request body matched the `{}` content rule",
-                        finding.rule
-                    );
+                    let detail = match &policy_reason {
+                        Some(reason) => format!(
+                            "the request body matched the `{}` content rule: {reason}",
+                            finding.rule
+                        ),
+                        None => format!(
+                            "the request body matched the `{}` content rule",
+                            finding.rule
+                        ),
+                    };
                     return self
                         .refuse(
                             session,

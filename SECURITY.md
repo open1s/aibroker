@@ -11,7 +11,7 @@ commands are the ones used, so they can be re-run after a change.
 | Another local process spends your API keys | Client tokens (`[[clients]]`); the proxy refuses an unauthenticated request |
 | A client reaches a model or provider it should not | Per-client model/provider allow-lists, enforced before the body is forwarded |
 | One client exhausts the pool | Per-client RPM, TPM and concurrency budgets |
-| A secret inside a prompt leaks to a provider | `[content_guard]` patterns, optionally refusing the request |
+| A secret inside a prompt leaks to a provider | `[content_guard]` patterns, optionally refusing the request; the verdict may be decided per client and per rule by a Rego `content_rule` |
 | A secret inside a prompt leaks to the *log* | `[dump] redact`, applied to every dumped body and header |
 | Credentials leak through the control plane | `/admin/config` and `--dump-config` redact; client tokens are never in admin output |
 | A burst of rate limits becomes an outage | Cooldown escalation resets after sustained success, so one bad minute is not permanent |
@@ -90,6 +90,19 @@ grep -c 'AKIAIOSFODNN7EXAMPLE'    broker.log     # 0: the dump redacted it
 With `action = "deny"` the status is 403 **and** the provider must not see the
 body. Assert on the upstream, not the status: an earlier version returned 403
 while the body was still forwarded, and only checking the provider caught it.
+
+The same holds when a Rego `content_rule` decides the verdict, which is what
+makes the decision per client rather than per pattern:
+
+```bash
+# config says report; the policy refuses this rule for this client
+grep -c 'content policy failed' broker.log      # 0 when the policy answered
+grep -c 'policy = ' broker.log                  # the policy's own reason
+```
+
+A policy that cannot answer (a rule that is undefined for this finding) refuses,
+and so does one that fails to evaluate. Both are covered end-to-end: the tests
+assert the upstream received no secret, not merely that the status was 403.
 
 ### Cooldowns recover
 

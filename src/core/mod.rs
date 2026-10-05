@@ -11,6 +11,7 @@ pub mod broker;
 pub mod content;
 pub mod key_state;
 pub mod metrics;
+pub mod pattern;
 pub mod policy;
 pub mod pool;
 pub mod ratelimit;

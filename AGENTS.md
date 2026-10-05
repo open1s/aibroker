@@ -205,6 +205,28 @@ uploaded, and the client's in-flight slot is released in `logging`.
   fake. That is the mechanism working, not an obstacle to route around.
 - **A finding never carries the match.** It names the rule and the field. A
   security log that repeats the secret becomes the leak.
+- **The content verdict may live in Rego, and the match never crosses into it.**
+  `[policy] content_rule` (default `data.llm.content.action`) lets a policy
+  override `[content_guard] action` per finding, so "who is asking" can be part
+  of "is this allowed" — the support client may discuss customer emails that
+  everyone else is refused for. `ContentFacts` carries the rule name, the field,
+  the configured action and the request, and deliberately **not** the matched
+  text. `Ok(None)` means the policy is silent and the config decides; a runtime
+  `Undefined`, an action that is not `report`/`deny`, and an evaluation error are
+  all **refusals**. A `content_rule` the policy does not define fails at startup.
+  A test pins the serialized shape of `ContentFacts` so a future field carrying
+  the value fails loudly.
+- **Regorus compiles lazily, so validate the packages you query.** A semantic
+  error in `llm.content` is invisible to the `data.llm.authz.allow` query the
+  broker evaluates first — a test caught exactly that with an invalid `default`.
+  The startup probe in `discover_content_rule` evaluates the content rule once on
+  purpose, and a failure that is not `not a valid rule path` is re-raised rather
+  than read as "no content rule". Reading *any* `Err` as "absent" is how a broken
+  policy becomes a silent fallback to `report`.
+- **`rules_dir` counts as a policy source.** `PolicyEngine::from_config` returns
+  the built-in default when no source is configured; leaving `rules_dir` out of
+  that check gave an operator their built-in policy instead of the directory they
+  pointed at, silently, while still starting and still allowing traffic.
 - **A policy failure refuses the request.** A broker that forwards traffic when
   its policy engine is broken is worse than one that returns 500. An invalid
   policy fails at `Runtime::new`, not on the first request.
@@ -266,6 +288,23 @@ which candidate a scoring function prefers; it does not prove that a pool shares
 load, and both bugs above passed every unit test they had. `Score` is a trait so
 a ranking can order lexicographically — do not compress two independent
 decisions (explored? / how fast?) into one `f64`.
+
+### A key's `models` list is a preference, not a gate
+
+Keys that declare the model form a preferred tier; every other key forms a
+second tier tried when the first cannot serve. So a per-key `models` entry is
+"try me first", and an empty list declares everything, which is why 1.x configs
+still route. Entries take the same `*`/`?` globs as a client's `allowed_models`,
+through the single implementation in `core/pattern.rs`.
+
+The accepted consequence: a model that **no** key declares is now forwarded to a
+provider rather than refused by the broker, because the provider is the authority
+on its own models. That is why `RouteError::Unroutable` no longer exists.
+
+Testing this is easy to get wrong. Asserting "the request was served" passes even
+with globbing removed, because the undeclared key is served from the second tier
+anyway — a false positive that mutation testing exposed. The test has to require
+the glob key to *beat* a key declaring a different model.
 
 ## Health means reliability, not speed
 

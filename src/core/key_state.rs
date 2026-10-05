@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
 
 use crate::config::ApiKeyConfig;
+use crate::core::pattern::pattern_matches;
 use crate::core::ratelimit::{Admit, RateLimiter};
 use crate::error::Result;
 
@@ -298,8 +299,22 @@ impl KeyState {
         self.max_concurrency
     }
 
+    /// Whether this key *declares* it can serve `model`.
+    ///
+    /// An empty list declares everything. Entries accept the same `*`/`?`
+    /// patterns as a client's `allowed_models`, so `deepseek-*` means the same
+    /// thing in both places -- one pattern implementation, in
+    /// [`crate::core::pattern`].
+    ///
+    /// This is a **preference, not a gate**. `KeyPool::select` tries the keys
+    /// that declare the model first and then falls back to the rest, so a model
+    /// missing from every list is still served rather than refused.
     pub fn supports_model(&self, model: &str) -> bool {
-        self.models.is_empty() || self.models.iter().any(|m| m == model)
+        self.models.is_empty()
+            || self
+                .models
+                .iter()
+                .any(|pattern| pattern_matches(pattern, model))
     }
 
     /// Map a client-facing model name to the upstream name for this key.

@@ -16,8 +16,6 @@ use crate::core::strategy::Strategy;
 /// Why a request could not be placed.
 #[derive(Debug, Clone)]
 pub enum RouteError {
-    /// No provider is configured for the requested model.
-    Unroutable { model: Option<String> },
     /// Providers match but every key is currently unusable.
     Exhausted {
         retry_after: Option<Duration>,
@@ -38,7 +36,7 @@ impl RouteError {
 
     pub fn model(&self) -> Option<&str> {
         match self {
-            RouteError::Unroutable { model } | RouteError::NoKeys { model } => model.as_deref(),
+            RouteError::NoKeys { model } => model.as_deref(),
             RouteError::Exhausted { .. } => None,
         }
     }
@@ -47,10 +45,6 @@ impl RouteError {
 impl std::fmt::Display for RouteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RouteError::Unroutable { model } => match model {
-                Some(model) => write!(f, "no provider serves model `{model}`"),
-                None => write!(f, "no provider serves this request"),
-            },
             RouteError::Exhausted { detail, .. } => write!(f, "{detail}"),
             RouteError::NoKeys { model } => match model {
                 Some(model) => write!(f, "no keys configured for model `{model}`"),
@@ -132,34 +126,9 @@ impl ModelPattern {
     }
 }
 
-/// Iterative glob matcher supporting `*` and `?`.
-pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-    let (mut p, mut t) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-
-    while t < text.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pattern.len() && pattern[p] == '*' {
-            star = Some((p, t));
-            p += 1;
-        } else if let Some((star_p, star_t)) = star {
-            p = star_p + 1;
-            t = star_t + 1;
-            star = Some((star_p, star_t + 1));
-        } else {
-            return false;
-        }
-    }
-
-    while p < pattern.len() && pattern[p] == '*' {
-        p += 1;
-    }
-    p == pattern.len()
-}
+/// Re-exported so the routing table and the policy bridge keep using one
+/// implementation of what a pattern means.
+pub use crate::core::pattern::glob_match;
 
 impl Broker {
     /// Compile a config into an immutable routing table.
@@ -301,9 +270,13 @@ impl Broker {
 
     /// Select a key for `model`, skipping ids in `exclude`.
     ///
-    /// Exhaustion is sticky: if any provider had a matching-but-blocked key we
-    /// report `Exhausted` rather than `Unroutable`, because that distinction
-    /// decides between "retry later" and "this model does not exist here".
+    /// Exhaustion is sticky: if any provider had a key that matched but was
+    /// blocked, `Exhausted` wins over `NoKeys`, because that distinction
+    /// decides between "retry later" and "there is nothing here at all".
+    ///
+    /// A model that *no* key declares is still routed, because `models` is a
+    /// preference rather than a gate, so there is no longer a "this model does
+    /// not exist here" refusal -- the provider gets to answer for itself.
     pub fn select(
         &self,
         model: Option<&str>,
@@ -376,12 +349,11 @@ impl Broker {
                 detail: "every matching key has already been tried for this request".to_string(),
             });
         }
-        if self.pools.is_empty() || self.pools.values().all(|pool| pool.is_empty()) {
-            return Err(RouteError::NoKeys {
-                model: model.map(|m| m.to_string()),
-            });
-        }
-        Err(RouteError::Unroutable {
+        // The only way to reach here: no pool handed back a key, and none
+        // reported retryable exhaustion, so every pool is empty of keys. A pool
+        // holding a key either serves the request or reports `Exhausted` above,
+        // now that `models` is a preference rather than a gate.
+        Err(RouteError::NoKeys {
             model: model.map(|m| m.to_string()),
         })
     }
@@ -505,18 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn glob_matcher_handles_wildcards() {
-        assert!(glob_match("claude-*", "claude-3-opus"));
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("gpt-?.*", "gpt-4.5"));
-        assert!(glob_match("a*b*c", "axxbyyc"));
-        assert!(!glob_match("claude-*", "gpt-4"));
-        assert!(!glob_match("gpt-?", "gpt-44"));
-        assert!(glob_match("exact", "exact"));
-        assert!(!glob_match("exact", "exactly"));
-    }
-
-    #[test]
     fn model_routing_skips_providers_without_the_model() {
         // Regression: the old code picked an arbitrary pool and could send a
         // gpt-4 request to a provider that only serves llama.
@@ -576,21 +536,31 @@ mod tests {
     }
 
     #[test]
-    fn unroutable_models_are_reported_distinctly() {
+    fn a_model_no_provider_claims_is_still_routed() {
+        // `models` is a preference, not a gate. A key listing only `gpt-4`
+        // still serves an unlisted model rather than refusing it, so the broker
+        // cannot claim "this model does not exist here" -- it forwards, and the
+        // provider answers for itself.
         let cfg = config(
             vec![provider("openai", vec![key("oa", &["gpt-4"])])],
             vec![],
         );
         let broker = Broker::from_config(&cfg).unwrap();
-        let error = broker
+        let selected = broker
             .select(Some("does-not-exist"), &HashSet::new(), 0)
+            .expect("an unclaimed model must still be routed somewhere");
+        assert_eq!(selected.provider, "openai");
+        assert_eq!(selected.upstream_model.as_deref(), Some("does-not-exist"));
+    }
+
+    #[test]
+    fn a_configuration_with_no_keys_reports_no_keys() {
+        let cfg = config(vec![provider("openai", vec![])], vec![]);
+        let broker = Broker::from_config(&cfg).unwrap();
+        let error = broker
+            .select(Some("gpt-4"), &HashSet::new(), 0)
             .unwrap_err();
-        // No provider claims that model, which is a routing failure rather
-        // than an exhausted pool — the distinction decides 503 vs 429.
-        assert!(
-            matches!(error, RouteError::Unroutable { .. }),
-            "got {error:?}"
-        );
+        assert!(matches!(error, RouteError::NoKeys { .. }), "got {error:?}");
         assert!(error.retry_after().is_none());
     }
 

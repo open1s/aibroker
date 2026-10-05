@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::config::ClientConfig;
-use crate::core::broker::glob_match;
 use crate::core::ratelimit::{Admit, RateLimiter};
 
 /// Why a request was refused.
@@ -363,21 +362,7 @@ impl ClientAccess {
     }
 }
 
-/// Glob match that also accepts an exact name case-insensitively.
-///
-/// Public because the policy bridge passes the verdict to Rego as a fact: one
-/// implementation means a policy cannot disagree with the broker about what a
-/// pattern means.
-pub fn pattern_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if pattern.contains('*') || pattern.contains('?') {
-        glob_match(&pattern.to_ascii_lowercase(), &value.to_ascii_lowercase())
-    } else {
-        pattern.eq_ignore_ascii_case(value)
-    }
-}
+pub use crate::core::pattern::pattern_matches;
 
 /// The configured clients, indexed by token.
 pub struct ClientRegistry {

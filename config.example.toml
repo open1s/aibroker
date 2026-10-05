@@ -274,6 +274,13 @@ persist = true
 [policy]
 enabled = true
 # files = ["policy.rego"]     # loaded in order; see policy.example.rego
+# rules_dir = "policy.rules.d"  # every *.rego beneath it, sorted; modules merge
+#                               # by package, so several files may contribute to
+#                               # `llm.authz`. See policy.example.d/.
+# content_rule = "data.llm.content.action"   # lets the policy decide content
+#                               # findings per rule and per client; defaults to
+#                               # this name when the policy defines it. See the
+#                               # content guard below.
 # inline = """
 # package llm.authz
 # import rego.v1
@@ -313,6 +320,12 @@ enabled = true
 #
 # A finding names the rule, never the matched text -- a security log that
 # repeats the secret becomes the leak.
+#
+# `action` here is the single answer for every pattern. To decide per finding --
+# a credential is always refused, a customer's email is allowed for the support
+# client but nobody else -- point `[policy] content_rule` at a rule and let the
+# policy override this action. See policy.example.d/20-content.rego. The policy
+# never sees the matched text, and a policy that cannot answer refuses.
 #
 # [content_guard]
 # enabled = true

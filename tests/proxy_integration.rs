@@ -680,7 +680,11 @@ fn exhausted_keys_produce_a_429_with_retry_after() {
 }
 
 #[test]
-fn unknown_model_is_refused_without_touching_an_upstream() {
+fn a_model_no_key_declares_is_forwarded_rather_than_refused() {
+    // A key's `models` list is a preference, not a gate, so a model nothing
+    // declares is forwarded. The assertion is on what the upstream *received*,
+    // not on a status: the old test asserted 503 and nothing forwarded, and a
+    // status-only rewrite would pass whether or not the body was passed on.
     let upstream_port = free_port();
     let proxy_port = free_port();
     let seen = spawn_mock(upstream_port, vec![200]);
@@ -704,11 +708,22 @@ fn unknown_model_is_refused_without_touching_an_upstream() {
         Some("no-such-model"),
     );
     assert_eq!(
-        response.status, 503,
-        "an unroutable model is a configuration problem, got: {}",
+        response.status, 200,
+        "an undeclared model must be forwarded, got: {}",
         response.body
     );
-    assert_nothing_was_forwarded(&seen, "refused before reaching a provider");
+
+    let requests = seen.lock().expect("lock").clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the request must reach the provider exactly once"
+    );
+    assert!(
+        requests[0].body.contains("no-such-model"),
+        "the provider must receive the model the client asked for, got: {}",
+        requests[0].body
+    );
 }
 
 #[test]
@@ -1558,6 +1573,150 @@ fn a_secret_in_a_prompt_is_refused_before_it_is_forwarded() {
         "the refusal must never echo the secret: {}",
         response.body
     );
+}
+
+#[test]
+fn a_rego_content_rule_refuses_what_the_config_only_reports() {
+    // `[content_guard] action = "report"` says "watch this, do not block it".
+    // The policy disagrees for one rule and the request must not leave.
+    //
+    // This is the end-to-end version of `content_verdict`, and it asserts the
+    // same way the guard's own tests do: on what the upstream received, not on
+    // the status code. A 403 with the secret already in the body would satisfy a
+    // status-only assertion and fail the actual requirement.
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200; 12]);
+
+    // Two packages, so two files: one answers the admission question the broker
+    // always asks, the other decides what to do about the finding.
+    let dir = std::env::temp_dir().join(format!("aibroker-content-policy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp rules dir");
+    std::fs::write(
+        dir.join("10-authz.rego"),
+        "package llm.authz\nimport rego.v1\nallow := true\n",
+    )
+    .expect("write authz policy");
+    std::fs::write(
+        dir.join("20-content.rego"),
+        "package llm.content\nimport rego.v1\n\
+         action := \"deny\" if { input.rule == \"aws-key\" }\n\
+         reason := \"an AWS key is never allowed in a prompt\" if { input.rule == \"aws-key\" }\n\
+         action := \"report\" if { input.rule != \"aws-key\" }\n",
+    )
+    .expect("write content policy");
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.content_guard = content_config("report");
+    config.policy = aibroker::config::PolicyConfig {
+        enabled: true,
+        rules_dir: dir.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let _runtime = spawn_broker_with_runtime(config, proxy_port);
+
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        SECRET_BODY,
+        Some("test-model"),
+    );
+
+    assert_eq!(
+        response.status, 403,
+        "the policy must escalate report to a refusal: {}",
+        response.status_line
+    );
+    assert_nothing_was_forwarded(&seen, "a policy denial must withhold the body");
+    for request in seen.lock().expect("lock").iter() {
+        assert!(
+            !request.body.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the secret reached the provider in {}: {}",
+            request.path,
+            request.body
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_policy_that_cannot_answer_the_content_question_refuses() {
+    // The policy defines `action`, but only for a rule that never fires here.
+    // At runtime the value is *undefined* for this finding, which is not "no
+    // opinion" -- it is a broken policy.
+    //
+    // Fail closed: the configured action is `report`, so falling back to it
+    // would forward the secret while the broker believed it was protected. The
+    // only acceptable outcome is a refusal.
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![200; 12]);
+
+    let dir = std::env::temp_dir().join(format!("aibroker-broken-policy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp rules dir");
+    std::fs::write(
+        dir.join("10-authz.rego"),
+        "package llm.authz\nimport rego.v1\nallow := true\n",
+    )
+    .expect("write authz policy");
+    std::fs::write(
+        dir.join("20-content.rego"),
+        "package llm.content\nimport rego.v1\n\
+         action := \"deny\" if { input.rule == \"some-rule-that-never-fires\" }\n",
+    )
+    .expect("write content policy");
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "test-provider",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key1", "sk-mock-1")],
+        )],
+        vec![],
+    );
+    config.content_guard = content_config("report");
+    config.policy = aibroker::config::PolicyConfig {
+        enabled: true,
+        rules_dir: dir.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let _runtime = spawn_broker_with_runtime(config, proxy_port);
+
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        SECRET_BODY,
+        Some("test-model"),
+    );
+
+    assert_eq!(
+        response.status, 403,
+        "an unanswerable content policy must refuse: {}",
+        response.status_line
+    );
+    assert_nothing_was_forwarded(&seen, "a policy error must withhold the body");
+    for request in seen.lock().expect("lock").iter() {
+        assert!(
+            !request.body.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the secret reached the provider in {}: {}",
+            request.path,
+            request.body
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

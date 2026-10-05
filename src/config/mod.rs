@@ -168,6 +168,35 @@ pub struct PolicyConfig {
     /// Inline shadow policy, for a rule too small to be worth a file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dry_run_inline: Option<String>,
+
+    /// A directory of `.rego` files, loaded in sorted order of their relative
+    /// path, before `files`.
+    ///
+    /// A policy outgrows a single file quickly, and a directory can be reviewed
+    /// in pieces: `10-clients.rego`, `20-models.rego`, `30-content.rego`.
+    /// Regorus merges modules by *package*, so several files may contribute to
+    /// `package llm.authz`, and one file may define a package another
+    /// references through `data`. An unreadable directory, or one holding no
+    /// `.rego` files, is a startup error rather than a silently empty policy.
+    #[serde(default)]
+    pub rules_dir: String,
+
+    /// The Rego rule that decides a **content finding's** action. Defaults to
+    /// `data.llm.content.action` when empty.
+    ///
+    /// This is the one decision the admission policy cannot make, because a
+    /// finding is discovered after that policy has already run. The matched
+    /// text never reaches Rego -- only the rule name, the field and the request
+    /// facts do -- so a policy can vary the verdict by client, route or rule
+    /// name without the engine ever holding the secret.
+    ///
+    /// Empty means "use the rule if the policy happens to define it, otherwise
+    /// keep the configured `[content_guard] action`", so a policy written
+    /// before content control existed keeps working. Naming a rule here makes it
+    /// **required**: a missing rule then fails at startup instead of silently
+    /// falling back to the config.
+    #[serde(default)]
+    pub content_rule: String,
 }
 
 fn default_inline_name() -> String {
@@ -183,6 +212,8 @@ impl Default for PolicyConfig {
             inline_name: default_inline_name(),
             dry_run: None,
             dry_run_inline: None,
+            rules_dir: String::new(),
+            content_rule: String::new(),
         }
     }
 }
