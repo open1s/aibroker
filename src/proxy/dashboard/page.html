@@ -324,7 +324,14 @@ async function refresh() {
     // credentials, and the browser still attaches its Basic credentials to the
     // request.
     const url = location.origin + location.pathname + location.search;
-    const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+    // The page authenticated with HTTP credentials, but a fetch is not
+    // guaranteed to receive them: they live in the browser's auth cache or in
+    // the URL bar, and neither is reliable for a subresource request. Chrome
+    // answers a URL-credential login for the *navigation* and then sends the
+    // page's own refreshes bare, so this used to sit on 401 forever. The
+    // server hands the page a read-only token to send instead.
+    const headers = initial.refresh_token ? { 'X-Admin-Token': initial.refresh_token } : {};
+    const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store', headers });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
     const node = doc.getElementById('data');

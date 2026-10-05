@@ -132,7 +132,10 @@ not, add the test.
 6. **Admin auth fails closed.** No token and no `allow_insecure` means refuse,
    with a constant-time comparison.
 7. **Secrets never appear in admin responses.** `/admin/keys` and `/admin/status`
-   expose state, never `key`. `/admin/config` used to be the documented
+   expose state, never `key`. The one credential a response does carry is the
+   dashboard's read-only refresh token, which is deliberately not the admin
+   token, is regenerated on every start, and is accepted for `GET` only — see
+   "The dashboard must answer \"is it working?\"". `/admin/config` used to be the documented
    exception; it now redacts too. `Config::to_toml` is the **display** path and
    redacts every credential value; `Config::to_toml_with_secrets(true)` is for
    writing the file back and is the only caller that keeps them. Redacting in
@@ -255,18 +258,47 @@ for a message can pass by matching the script source rather than the rendered
 state — that happened once with the open-proxy warning, which is why the state
 is a payload value and the assertions parse the JSON block.
 
-One defect the payload cannot express, because it lives in the script: **the
-refresh URL must not be relative.** `fetch(location.pathname)` is resolved
-against the document's base URL, and an operator who logs in the convenient way
-— `http://user:token@host/admin` — has those credentials *in that base*. `fetch`
-then refuses outright to construct a Request from a URL that includes them
-("Request cannot be constructed from a URL that includes credentials"), so every
-tick threw and the page sat on "refresh failed", which reads as an expired token
-rather than a broken URL. Build it from `location.origin`, which never carries
-credentials. A template assertion guards it; the browser proof is a Playwright
-run against `http://x:<token>@127.0.0.1:<port>/admin`, which is the only way to
-see the difference — a context with `httpCredentials` set masks it, because
-Playwright answers the challenge itself.
+**The dashboard's refresh cannot rely on the browser for credentials.** This
+took two attempts, and the first one taught the difference between "the fetch is
+malformed" and "the fetch is unauthenticated".
+
+The first symptom was a relative URL. `fetch(location.pathname)` is resolved
+against the document's base, and an operator who logs in the convenient way —
+`http://user:token@host/admin` — has those credentials *in that base*, so the
+Fetch standard refused outright:
+
+    Request cannot be constructed from a URL that includes credentials
+
+Building the URL from `location.origin` removed that error and replaced it with a
+401, which is the real problem underneath: **a `fetch` is not guaranteed to
+receive HTTP credentials at all.** They live in the browser's auth cache or in
+the URL bar, and Chrome answers a URL-credential login for the *navigation* while
+sending the page's own subresource requests bare. No amount of URL hygiene fixes
+that, and "refresh failed (HTTP 401)" reads as an expired token, so the operator
+re-types it and nothing changes.
+
+So the server hands the already-authenticated page a **read-only token** to send
+back as `X-Admin-Token`. It is minted per process (`generate_dashboard_token`),
+it is deliberately *not* the admin token, and `AdminRouter::accepts_dashboard_token`
+accepts it for safe methods only — a mutation that presents it still has to
+authenticate as an operator. It is checked before `authenticate`, so a healthy
+refresh is not counted as a rejected authentication.
+
+Verify this on the server, not in a browser:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" localhost:11536/admin/status                    # 401
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-Admin-Token: $REFRESH" localhost:11536/admin/status  # 200
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "X-Admin-Token: $REFRESH" localhost:11536/admin/config/reload  # 401
+```
+
+That triple is the whole mechanism, and it is the only honest proof: a Playwright
+context with `httpCredentials` set masks the bug (Playwright answers the
+challenge itself), and so does `page.route` — intercepting the refresh to strip
+its `Authorization` header still leaves Chrome free to answer the challenge, so
+the "control" returns 200 as well and demonstrates nothing. What the browser
+*can* show is that the refresh request carries `X-Admin-Token`, which is worth
+one assertion.
 
 ## Load balancing strategies
 

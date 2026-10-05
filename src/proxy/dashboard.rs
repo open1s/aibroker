@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::core::runtime::SharedRuntime;
 
 /// Render the dashboard.
-pub fn render(runtime: &SharedRuntime, admin_path: &str) -> String {
+pub fn render(runtime: &SharedRuntime, admin_path: &str, refresh_token: &str) -> String {
     let runtime = runtime.read();
     let config = runtime.config();
     let metrics = runtime.metrics();
@@ -93,6 +93,14 @@ pub fn render(runtime: &SharedRuntime, admin_path: &str) -> String {
         "redacts_secrets": true,
         "models": config.known_models(),
         "admin_path": admin_path,
+        // The page's own refresh cannot authenticate the way the page itself
+        // did. HTTP credentials live in the browser's auth cache or in the URL
+        // bar, and a subresource request is not guaranteed to receive either:
+        // Chrome answers a URL-credential login for the navigation and then
+        // sends the page's refreshes bare, which surfaces as a 401 the operator
+        // cannot act on. So the server hands the already-authenticated page a
+        // read-only token to send back. See `AdminRouter::accepts_dashboard_token`.
+        "refresh_token": refresh_token,
         "security": {
             "client_auth_required": runtime.requires_client_auth(),
             // The exact sentence the page shows when the proxy is open. Kept
@@ -144,6 +152,10 @@ pub fn render(runtime: &SharedRuntime, admin_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The refresh token the tests hand the page. Only the test that asserts
+    /// the page sends it back cares about the value.
+    const REFRESH: &str = "test-refresh-token";
+
     use super::*;
     use crate::config::{ApiKeyConfig, Config, ProviderConfig, ServerConfig};
     use crate::core::runtime::{Runtime, shared};
@@ -207,7 +219,7 @@ mod tests {
 
     #[test]
     fn dashboard_renders_the_expected_furniture() {
-        let html = render(&runtime(), "/admin");
+        let html = render(&runtime(), "/admin", REFRESH);
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("LLM Broker"));
         assert!(html.contains("Read-only view"));
@@ -225,7 +237,7 @@ mod tests {
 
     #[test]
     fn dashboard_never_embeds_a_key_secret() {
-        let html = render(&runtime(), "/admin");
+        let html = render(&runtime(), "/admin", REFRESH);
         assert!(
             !html.contains("sk-test"),
             "the dashboard must not leak a credential"
@@ -253,7 +265,7 @@ mod tests {
                 .expect("apply");
         }
 
-        let html = render(&runtime, "/admin");
+        let html = render(&runtime, "/admin", REFRESH);
         // The client and its scope are visible...
         assert!(html.contains("laptop"), "client should be listed");
         assert!(html.contains("gpt-*"), "scope should be visible");
@@ -315,7 +327,7 @@ mod tests {
                 .expect("apply");
         }
 
-        let html = render(&runtime, "/admin");
+        let html = render(&runtime, "/admin", REFRESH);
         assert!(
             html.contains("\"content_guard\""),
             "the payload should carry the guard"
@@ -352,7 +364,7 @@ mod tests {
     #[test]
     fn dashboard_reports_a_missing_content_guard_as_a_warning() {
         // Silence about an absent guard is how it stays absent.
-        let html = render(&runtime(), "/admin");
+        let html = render(&runtime(), "/admin", REFRESH);
         assert!(
             html.contains("No content rules"),
             "the page should say that prompts are not inspected"
@@ -365,7 +377,7 @@ mod tests {
 
     #[test]
     fn dashboard_warns_when_the_proxy_is_open() {
-        let html = render(&runtime(), "/admin");
+        let html = render(&runtime(), "/admin", REFRESH);
         assert!(
             html.contains("\"client_auth_required\":false"),
             "the payload should report an open proxy"
@@ -391,7 +403,7 @@ mod tests {
         config.providers[0].default_models = vec![hostile.to_string()];
         config.default_route = None;
         let runtime = shared(Runtime::new(config, None).unwrap());
-        let html = render(&runtime, "/admin");
+        let html = render(&runtime, "/admin", REFRESH);
         // Slice at the literal end of the data block. The document always
         // contains that closing tag; what must not appear is one *inside* the
         // JSON payload.
@@ -424,7 +436,7 @@ mod tests {
         // version looked for the string "Keys available", which is JavaScript
         // text: it would keep passing if the renderer stopped emitting the
         // card, and it broke the moment the wording was improved.
-        let payload = payload_of(&render(&runtime(), "/admin"));
+        let payload = payload_of(&render(&runtime(), "/admin", REFRESH));
         // Deliberately does not assume a key count: the fixture has one, and the
         // point here is that an untouched pool renders a well-formed payload
         // rather than one with missing fields.
@@ -446,7 +458,7 @@ mod tests {
         // broker from one they had left open for an hour -- and a restarted
         // process reads zero everywhere. The refresh affordances are structural,
         // so they can be pinned without a browser.
-        let html = render(&runtime(), "/admin");
+        let html = render(&runtime(), "/admin", REFRESH);
 
         for needed in [
             "id=\"refresh\"", // a manual reload
@@ -470,7 +482,7 @@ mod tests {
         // Blanking the page on a dropped fetch reads as "the broker is down",
         // which is a worse failure than a stale number. The stamp carries the
         // warning and the render is only replaced on success.
-        let html = render(&runtime(), "/admin");
+        let html = render(&runtime(), "/admin", REFRESH);
         assert!(
             html.contains("refresh failed"),
             "a failed refresh should say so"
@@ -484,7 +496,7 @@ mod tests {
     #[test]
     fn the_dashboard_does_not_claim_config_dumps_contain_secrets() {
         // It said exactly that for several releases after redaction landed.
-        let html = render(&runtime(), "/admin");
+        let html = render(&runtime(), "/admin", REFRESH);
         assert!(
             !html.contains("the on-disk document (contains secrets)"),
             "the reference table must not claim the endpoint exposes credentials"
@@ -500,7 +512,7 @@ mod tests {
         // The reference table claimed `/admin/config` "contains secrets" for
         // several releases after redaction landed. The wording now comes from
         // the payload, and this pins that.
-        let payload = payload_of(&render(&runtime(), "/admin"));
+        let payload = payload_of(&render(&runtime(), "/admin", REFRESH));
         assert_eq!(
             payload["redacts_secrets"], true,
             "`/admin/config` always redacts; the page must say so"
@@ -521,7 +533,7 @@ mod tests {
         // from `location.origin` fixes it. Unlike the rest of this page the
         // defect is in the script itself, so this asserts on the script rather
         // than on the rendered payload.
-        let html = render(&runtime(), "/admin");
+        let html = render(&runtime(), "/admin", REFRESH);
         assert!(
             html.contains("location.origin + location.pathname"),
             "the refresh URL must be absolute, so it cannot inherit credentials"
@@ -529,6 +541,25 @@ mod tests {
         assert!(
             !html.contains("fetch(location.pathname"),
             "a relative path inherits the page URL's credentials and throws"
+        );
+    }
+
+    #[test]
+    fn the_payload_carries_the_refresh_token() {
+        let payload = payload_of(&render(&runtime(), "/admin", REFRESH));
+        assert_eq!(payload["refresh_token"], REFRESH);
+    }
+
+    #[test]
+    fn the_page_sends_the_refresh_token_it_was_given() {
+        // The script, not the payload, because the defect is in the script: the
+        // page authenticated as a navigation and its `fetch` was not given
+        // those credentials, so every tick was a 401. Handing the page a token
+        // only helps if the page actually sends it back.
+        let html = render(&runtime(), "/admin", REFRESH);
+        assert!(
+            html.contains("'X-Admin-Token': initial.refresh_token"),
+            "the refresh request must carry the token the server handed the page"
         );
     }
 }

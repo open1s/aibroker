@@ -75,6 +75,25 @@ done
 `/admin/config` reports `env:` and `file:` references verbatim — they are not the
 secret, and knowing which reference is configured is the point of the dump.
 
+### The dashboard can refresh itself, and only read
+
+A browser will not attach HTTP credentials to a page's own `fetch`, so the
+dashboard is served a per-process, read-only token to send back. It is not the
+admin token, and it is accepted for safe methods only:
+
+```bash
+# The token is in the page's own payload; the point is that it cannot write.
+REFRESH=$(curl -s -u "x:$ADMIN" localhost:11536/admin \
+  | python3 -c "import sys,re,json;print(json.loads(re.search(r'<script id="data"[^>]*>(.*?)</script>',sys.stdin.read(),re.S).group(1))['refresh_token'])")
+
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-Admin-Token: $REFRESH" localhost:11536/admin/status   # 200
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "X-Admin-Token: $REFRESH" \
+  localhost:11536/admin/config/reload                                                               # 401
+```
+
+It is regenerated when the broker restarts, so a dashboard left open in a tab
+stops refreshing rather than keeping access forever.
+
 ### The content guard
 
 ```bash

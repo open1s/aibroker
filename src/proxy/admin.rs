@@ -246,6 +246,10 @@ pub struct AdminRouter {
     allow_insecure: bool,
     /// Whether key secrets may be echoed in responses. Always false by default.
     expose_secrets: bool,
+    /// A per-process token that lets the dashboard page refresh itself. See
+    /// `accepts_dashboard_token` for why the page cannot reuse the admin
+    /// credential, and why this one is read-only.
+    dashboard_token: String,
 }
 
 impl AdminRouter {
@@ -255,6 +259,7 @@ impl AdminRouter {
             token,
             allow_insecure,
             expose_secrets: false,
+            dashboard_token: generate_dashboard_token(),
         }
     }
 
@@ -305,10 +310,32 @@ impl AdminRouter {
 
     /// Handle one request.
     pub fn handle(&self, request: AdminRequest) -> AdminResponse {
+        // Before `authenticate`, so a healthy dashboard refresh is not counted
+        // as a rejected authentication.
+        if self.accepts_dashboard_token(&request) {
+            return self.dispatch(request);
+        }
         if let Err(response) = self.authenticate(&request.credentials) {
             return response;
         }
         self.dispatch(request)
+    }
+
+    /// Whether this request carries the dashboard's read-only refresh token.
+    ///
+    /// Safe methods only. The token exists so a status page can refresh itself,
+    /// and nothing about that needs to change the configuration; a credential
+    /// that can only read is a far smaller thing to leave sitting in a browser
+    /// tab. A mutation that happens to present it still has to authenticate as
+    /// an operator.
+    fn accepts_dashboard_token(&self, request: &AdminRequest) -> bool {
+        if !request.method.eq_ignore_ascii_case("GET") {
+            return false;
+        }
+        match request.credentials.header_token.as_deref() {
+            Some(provided) => constant_time_eq(&self.dashboard_token, provided),
+            None => false,
+        }
     }
 
     fn dispatch(&self, request: AdminRequest) -> AdminResponse {
@@ -344,7 +371,8 @@ impl AdminRouter {
     fn dashboard(&self) -> AdminResponse {
         let runtime = self.runtime.read();
         let admin_path = runtime.config().admin.path.clone();
-        let html = crate::proxy::dashboard::render(&self.runtime, &admin_path);
+        let html =
+            crate::proxy::dashboard::render(&self.runtime, &admin_path, &self.dashboard_token);
         AdminResponse::text(200, "text/html; charset=utf-8", html)
     }
 
@@ -779,6 +807,25 @@ fn prevalidate_key(provider: &str, key: &ApiKeyConfig) -> Result<(), LlmBrokerEr
     Ok(())
 }
 
+/// Mint the dashboard's per-process refresh token.
+///
+/// There is no RNG in the dependency tree and none is needed: `RandomState` is
+/// seeded from the OS once per process, which is exactly the lifetime this
+/// token has. It is regenerated on every start, so a dashboard left open in a
+/// tab stops refreshing when the broker restarts, which is the behaviour an
+/// operator would expect from a credential they never typed.
+fn generate_dashboard_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    let state = std::collections::hash_map::RandomState::new();
+    let mut hasher = state.build_hasher();
+    hasher.write_u64(state.build_hasher().finish());
+    let first = hasher.finish();
+    let mut hasher = state.build_hasher();
+    hasher.write_u64(first);
+    format!("{first:016x}{:016x}", hasher.finish())
+}
+
 /// Constant-time comparison so token checks do not leak length/prefix timing.
 fn constant_time_eq(expected: &str, provided: &str) -> bool {
     let expected = expected.as_bytes();
@@ -879,6 +926,103 @@ mod tests {
         let mut req = request(method, path, body);
         req.credentials = AdminCredentials::from_headers(Some(&format!("Bearer {token}")), None);
         req
+    }
+
+    /// A request that carries a token the way the dashboard page does, in
+    /// `X-Admin-Token` rather than in the URL or the auth cache.
+    fn with_header_token(mut req: AdminRequest, token: &str) -> AdminRequest {
+        req.credentials = AdminCredentials::from_headers(None, Some(token));
+        req
+    }
+
+    #[test]
+    fn the_dashboard_token_refreshes_the_page_without_the_admin_token() {
+        // The defect: the page authenticated as a *navigation*, and its own
+        // `fetch` was not given those credentials, so every refresh was a 401
+        // the operator could not act on -- re-entering the token changed
+        // nothing, because the token was never the problem.
+        let router = router(runtime(), Some("admin-secret"));
+        let token = router.dashboard_token.clone();
+
+        let response = router.handle(with_header_token(request("GET", "", &[]), &token));
+
+        assert_eq!(response.status, 200);
+        assert!(
+            response.content_type.starts_with("text/html"),
+            "the refresh token should be served the page, not merely any 200"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_token_is_not_the_admin_token() {
+        let router = router(runtime(), Some("admin-secret"));
+        assert_ne!(router.dashboard_token, "admin-secret");
+        assert!(
+            router.dashboard_token.len() >= 32,
+            "a refresh token should not be guessable from a short value"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_token_cannot_change_anything() {
+        // Read-only by construction. A status page's refresh never needs to
+        // mutate, and a credential that cannot mutate is a far smaller thing to
+        // leave sitting in a browser tab. Each of these *would* succeed for an
+        // operator, so a 401 is what proves the token was refused rather than
+        // the route being absent.
+        let router = router(runtime(), Some("admin-secret"));
+        let token = router.dashboard_token.clone();
+
+        for (method, path) in [
+            ("POST", "config/reload"),
+            ("PUT", "config/strategy"),
+            ("POST", "keys"),
+            ("DELETE", "keys/openai/k1"),
+            ("PATCH", "keys/openai/k1"),
+        ] {
+            let response = router.handle(with_header_token(request(method, path, b"{}"), &token));
+            assert_eq!(
+                response.status, 401,
+                "{method} {path} must not accept the dashboard refresh token"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_dashboard_token_is_refused() {
+        let router = router(runtime(), Some("admin-secret"));
+        let response = router.handle(with_header_token(
+            request("GET", "", &[]),
+            "not-the-refresh-token",
+        ));
+        assert_eq!(response.status, 401);
+    }
+
+    #[test]
+    fn the_refresh_token_does_not_inflate_the_auth_failure_counter() {
+        // A successful refresh is not a failed authentication. Counting it as
+        // one made a healthy dashboard look like an attack in the metric.
+        let runtime = runtime();
+        let router = router(runtime.clone(), Some("admin-secret"));
+        let token = router.dashboard_token.clone();
+
+        let before = runtime
+            .read()
+            .metrics()
+            .rejected_admin_auth
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let response = router.handle(with_header_token(request("GET", "", &[]), &token));
+        let after = runtime
+            .read()
+            .metrics()
+            .rejected_admin_auth
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            before, after,
+            "a successful refresh must not count as a failure"
+        );
     }
 
     #[test]
