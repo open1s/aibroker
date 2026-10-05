@@ -1,6 +1,6 @@
 [package]
 name = "aibroker"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 description = "Local LLM proxy with load balancing, retry-on-rate-limit and key management"
 
@@ -8,51 +8,51 @@ description = "Local LLM proxy with load balancing, retry-on-rate-limit and key 
 # Pingora - async HTTP proxy framework (server, TLS and upstream pools).
 # `pingora-error` is referenced directly for `ErrorType`; the proxy and core
 # crates arrive through the `proxy` feature.
-pingora = { version = "0.8.0", features = ["proxy", "rustls"] }
-pingora-error = "0.8.0"
+pingora = { version = "0.9.0", features = ["proxy", "rustls"] }
+pingora-error = "0.9.0"
 
 
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
-async-trait = "0.1"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
+async-trait = "0.1.92"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "1.1"
-http = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6+spec-1.1.0"
+http = "1.5.0"
 
 # Error handling
-thiserror = "2.0"
-anyhow = "1.0"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Policy engine: Rego for egress/access policy (see core/policy.rs)
-regorus = { version = "0.12", default-features = false, features = ["std", "arc", "glob", "regex"] }
+regorus = { version = "0.12.0", default-features = false, features = ["std", "arc", "glob", "regex"] }
 
 # Redaction patterns for --dump-* output. Already in the tree via regorus, so
 # this adds no new transitive dependency.
-regex = "1"
+regex = "1.13.1"
 
 # Utilities
-parking_lot = "0.12"
+parking_lot = "0.12.5"
 # Restores the default SIGINT handler so Ctrl+C exits during pingora's
 # graceful-shutdown sleep (see main.rs).
-libc = "0.2"
-url = "2"
-bytes = "1"
-dirs = "6.0"
+libc = "0.2.190"
+url = "2.5.8"
+bytes = "1.12.1"
+dirs = "7.0.0"
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
 [dev-dependencies]
 # The integration tests run a mock upstream on a real pingora listener.
-pingora = { version = "0.8.0", features = ["proxy"] }
-async-trait = "0.1"
-bytes = "1"
+pingora = { version = "0.9.0", features = ["proxy"] }
+async-trait = "0.1.92"
+bytes = "1.12.1"
 

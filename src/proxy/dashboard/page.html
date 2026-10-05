@@ -313,7 +313,18 @@ async function refresh() {
   try {
     // Re-fetch this page and read the payload it embeds, so one code path
     // produces both the first paint and every refresh.
-    const res = await fetch(location.pathname, { credentials: 'same-origin', cache: 'no-store' });
+    //
+    // The URL is built from `location.origin`, not left relative. A relative URL
+    // is resolved against the document's base, and when the operator logged in
+    // by typing `http://user:token@host/admin` that base *carries the
+    // credentials* -- and `fetch` refuses outright to construct a Request from a
+    // URL containing them ("Request cannot be constructed from a URL that
+    // includes credentials"). Every tick threw and the page sat on "refresh
+    // failed" while looking like a token problem. `origin` never carries
+    // credentials, and the browser still attaches its Basic credentials to the
+    // request.
+    const url = location.origin + location.pathname + location.search;
+    const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
     const node = doc.getElementById('data');

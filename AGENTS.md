@@ -255,6 +255,19 @@ for a message can pass by matching the script source rather than the rendered
 state — that happened once with the open-proxy warning, which is why the state
 is a payload value and the assertions parse the JSON block.
 
+One defect the payload cannot express, because it lives in the script: **the
+refresh URL must not be relative.** `fetch(location.pathname)` is resolved
+against the document's base URL, and an operator who logs in the convenient way
+— `http://user:token@host/admin` — has those credentials *in that base*. `fetch`
+then refuses outright to construct a Request from a URL that includes them
+("Request cannot be constructed from a URL that includes credentials"), so every
+tick threw and the page sat on "refresh failed", which reads as an expired token
+rather than a broken URL. Build it from `location.origin`, which never carries
+credentials. A template assertion guards it; the browser proof is a Playwright
+run against `http://x:<token>@127.0.0.1:<port>/admin`, which is the only way to
+see the difference — a context with `httpCredentials` set masks it, because
+Playwright answers the challenge itself.
+
 ## Load balancing strategies
 
 | Strategy | Behaviour |

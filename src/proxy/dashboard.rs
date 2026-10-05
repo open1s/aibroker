@@ -506,4 +506,29 @@ mod tests {
             "`/admin/config` always redacts; the page must say so"
         );
     }
+
+    #[test]
+    fn the_refresh_url_cannot_inherit_credentials_from_the_page_url() {
+        // A relative `fetch(location.pathname)` is resolved against the
+        // document's base URL. When the operator logs in the convenient way --
+        // `http://user:token@host/admin` -- that base carries the credentials,
+        // and `fetch` refuses to construct a Request from a URL containing them:
+        //
+        //   Request cannot be constructed from a URL that includes credentials
+        //
+        // Every tick then threw and the page sat on "refresh failed", which
+        // reads as an expired token rather than a broken URL. Building the URL
+        // from `location.origin` fixes it. Unlike the rest of this page the
+        // defect is in the script itself, so this asserts on the script rather
+        // than on the rendered payload.
+        let html = render(&runtime(), "/admin");
+        assert!(
+            html.contains("location.origin + location.pathname"),
+            "the refresh URL must be absolute, so it cannot inherit credentials"
+        );
+        assert!(
+            !html.contains("fetch(location.pathname"),
+            "a relative path inherits the page URL's credentials and throws"
+        );
+    }
 }
