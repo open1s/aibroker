@@ -1,6 +1,6 @@
 [package]
 name = "aibroker"
-version = "2.1.2"
+version = "2.1.3"
 edition = "2024"
 description = "Local LLM proxy with load balancing, retry-on-rate-limit and key management"
 
@@ -40,6 +40,9 @@ regex = "1.13.1"
 
 # Utilities
 parking_lot = "0.12.5"
+# OS entropy for the dashboard's per-process refresh token. Already in the tree
+# through pingora, so this adds no new version to the lockfile.
+getrandom = "0.3"
 # Restores the default SIGINT handler so Ctrl+C exits during pingora's
 # graceful-shutdown sleep (see main.rs).
 libc = "0.2.190"

@@ -15,7 +15,7 @@ rotation drift apart.
 
 ```bash
 cargo build --offline          # dependencies are already in the local registry
-cargo test  --offline          # 143 unit + 7 end-to-end tests
+cargo test  --offline          # 323 unit + 32 integration tests
 cargo fmt --all
 cargo clippy --offline --all-targets   # must stay warning-free
 cargo run -- --config config.toml

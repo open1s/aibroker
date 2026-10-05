@@ -59,6 +59,11 @@ a SaaS control plane does not. Everything is one small Rust binary.
 
 ## Get started in a minute
 
+[USAGE.md](USAGE.md) is the detailed operator's manual — install, every config
+section, running it as a service, pointing clients at it, the dashboard, the
+admin API with worked examples, and a symptom→cause table for when something
+looks wrong.
+
 ```bash
 # 1. Build (or grab a binary from Releases)
 cargo build --release
@@ -101,8 +106,8 @@ Then watch it work:
 ## Is it production-ready?
 
 It is a local tool, and it is honest about that: no clustering, no shared state
-between instances, config in one TOML file. What it does have is tests — 183 of
-them, including end-to-end tests that prove a `429` really does rotate onto
+between instances, config in one TOML file. What it does have is tests — 353 of
+them (321 unit, 32 end-to-end), including end-to-end tests that prove a `429` really does rotate onto
 another key with the body replayed — a pinned toolchain, and a clean
 `clippy -D warnings` build on Linux, macOS and Windows. Every release ships
 prebuilt binaries for five targets.
@@ -512,6 +517,16 @@ fallback (that would put a credential in a URL):
 curl -H 'Authorization: Bearer <token>' http://127.0.0.1:11436/admin | less
 ```
 
+The page's own **auto-refresh** does not use your credentials at all: a browser
+does not attach HTTP credentials to a page's `fetch` — they live in the
+browser's auth cache or in the URL bar — so the broker hands the page a
+**read-only token** to send back as `X-Admin-Token`. You do nothing: load the
+page once and the refresh works however you logged in. The token cannot write
+(it is accepted for `GET` only, so a mutation presenting it still has to
+authenticate as an operator), and it is regenerated when the broker restarts —
+on a restart the page notices the first `401`, reloads once to pick up a fresh
+token, and carries on. The admin token itself never appears in a response.
+
 **CLI** — the binary can query a running broker directly, which is handy over
 SSH or in a script:
 
@@ -544,7 +559,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/keys"   | jq '.providers'
 | `POST` | `/admin/keys/{provider}/{id}/reset` | Clear cooldown, failures and rate-limit history |
 | `GET`\|`PUT` | `/admin/config/strategy` | Read or change the selection strategy |
 | `POST` | `/admin/config/reload` | Re-read the config file, preserving live key state |
-| `GET` | `/admin/config` | The on-disk document (contains secrets — token required) |
+| `GET` | `/admin/config` | The effective config, **redacted** — no credential in the output |
 | `GET` | `/admin/models` | Models the config knows about |
 | `GET` | `/admin/routes` | Compiled routing table |
 | `GET` | `/admin/metrics` | Prometheus text (same as `/metrics`) |
@@ -596,7 +611,7 @@ pattern = "-----BEGIN [A-Z ]*PRIVATE KEY-----"
   not train people to ignore the guard.
 - **Enable it without patterns and the broker refuses to start** — looking like
   protection while inspecting nothing is worse than being off.
-- A body larger than the scan limit (`server.request_scan_limit`, 256 KiB) is
+- A body larger than the scan limit — a fixed 256 KiB, not a config knob — is
   reported as `body-over-scan-limit` rather than silently passing.
 
 ### Deciding the content verdict in Rego
@@ -691,6 +706,10 @@ values, or a reload would lose them.
 - `llm_broker_requests_in_flight`, `llm_broker_uptime_seconds`
 - `llm_broker_client_auth_failures_total` — requests refused for a missing or
   unknown client token
+- `llm_broker_admin_auth_failures_total` — admin requests rejected for a bad
+  token. A dashboard tab left open across a broker restart contributes one
+  failure before it reloads and recovers, so a slow climb with nobody typing
+  anything is worth investigating but is not an attack by itself
 - `llm_broker_policy_denials_total` — requests refused by the egress policy
 - `llm_broker_client_denials_total{reason}` — the same refusals broken down by
   `missing_credential`, `unknown_credential`, `client_disabled`,
@@ -855,7 +874,7 @@ tested directly; the pingora layer is a thin adapter over it.
 
 ```bash
 cargo build
-cargo test                 # 143 unit + 7 end-to-end tests
+cargo test                 # 321 unit + 32 integration tests
 cargo fmt
 cargo clippy --all-targets
 ```

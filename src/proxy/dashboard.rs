@@ -562,4 +562,24 @@ mod tests {
             "the refresh request must carry the token the server handed the page"
         );
     }
+
+    #[test]
+    fn a_stale_token_recovers_instead_of_failing_forever() {
+        // The defect: the token is regenerated on every start, so a tab left
+        // open across a restart then repeated the reported symptom on every
+        // tick with no way out. The page reloads once on a 401 -- a reload
+        // re-authenticates the way the page itself did and comes back with a
+        // fresh token -- and the guard lives in `sessionStorage`, which
+        // survives the reload but not a new tab, so a broker that is genuinely
+        // refusing the page cannot turn the auto-refresh into a reload loop.
+        let html = render(&runtime(), "/admin", REFRESH);
+        assert!(
+            html.contains("aibroker-reloaded-on-401"),
+            "the page must reload once on a 401 to pick up a fresh token"
+        );
+        assert!(
+            html.contains("sessionStorage.removeItem('aibroker-reloaded-on-401')"),
+            "a successful refresh must clear the guard so a later restart can reload again"
+        );
+    }
 }

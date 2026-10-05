@@ -321,8 +321,7 @@ async function refresh() {
     // URL containing them ("Request cannot be constructed from a URL that
     // includes credentials"). Every tick threw and the page sat on "refresh
     // failed" while looking like a token problem. `origin` never carries
-    // credentials, and the browser still attaches its Basic credentials to the
-    // request.
+    // credentials.
     const url = location.origin + location.pathname + location.search;
     // The page authenticated with HTTP credentials, but a fetch is not
     // guaranteed to receive them: they live in the browser's auth cache or in
@@ -332,12 +331,28 @@ async function refresh() {
     // server hands the page a read-only token to send instead.
     const headers = initial.refresh_token ? { 'X-Admin-Token': initial.refresh_token } : {};
     const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store', headers });
+    if (res.status === 401) {
+      // A 401 on a page that authenticated means the token it holds is stale:
+      // the broker restarted and minted a new one. A reload is the one request
+      // that re-authenticates the way this page originally did, and it comes
+      // back with a fresh token. Guarded through `sessionStorage`, which
+      // survives a reload but not a new tab, so a broker that is genuinely
+      // refusing the page cannot turn the auto-refresh into a reload loop.
+      if (!sessionStorage.getItem('aibroker-reloaded-on-401')) {
+        sessionStorage.setItem('aibroker-reloaded-on-401', '1');
+        location.reload();
+        return;
+      }
+      throw new Error('HTTP 401');
+    }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
     const node = doc.getElementById('data');
     if (!node) throw new Error('no payload in response');
     paint(JSON.parse(node.textContent));
     failures = 0;
+    // The token works again, so a later restart may reload once more.
+    sessionStorage.removeItem('aibroker-reloaded-on-401');
   } catch (e) {
     // A failed refresh must not wipe the last good view: a blank page reads as
     // "the broker is down" when it may only be a token prompt.

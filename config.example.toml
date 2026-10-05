@@ -65,6 +65,12 @@ id = "openai-2"
 key = "env:OPENAI_API_KEY_2"
 weight = 1
 max_rpm = 500
+# What this key is *for*. A key's `models` list is a preference, not a gate:
+# keys that declare the model are tried FIRST, and if none of them can serve the
+# rest of the pool is tried anyway. So this means "prefer me for these", not
+# "refuse everything else". Empty declares everything, which is why a 1.x config
+# still routes. Entries take the same * and ? globs as a client's allowed_models.
+# models = ["gpt-*", "o3-*"]
 # Keep a key in the pool but out of rotation.
 # enabled = false
 
@@ -214,6 +220,11 @@ usage_scan_limit_bytes = 65_536
 # The control plane can add, disable and delete credentials, so it refuses
 # every request when no token is configured unless `allow_insecure` is set.
 
+# The dashboard also holds a second credential: a read-only token the broker
+# mints at startup and hands to the page, so its auto-refresh can authenticate
+# without the browser's HTTP auth cache. It is not configured here and cannot
+# be -- it is per-process, accepted for GET only, and regenerated on every
+# restart. See USAGE.md "How the dashboard authenticates".
 [admin]
 enabled = true
 mode = "path"              # separate | path | off
@@ -320,6 +331,10 @@ enabled = true
 #
 # A finding names the rule, never the matched text -- a security log that
 # repeats the secret becomes the leak.
+#
+# The scan covers the first 256 KiB of a body (a fixed bound, not a setting);
+# a larger body is reported as `body-over-scan-limit` rather than silently
+# passing.
 #
 # `action` here is the single answer for every pattern. To decide per finding --
 # a credential is always refused, a customer's email is allowed for the support

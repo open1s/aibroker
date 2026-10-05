@@ -358,13 +358,19 @@ def run_mock_profile() -> None:
               status == 200 and "[server]" in raw.decode(), f"status={status}")
 
         # --- 8. routing: a model no key serves -----------------------------
+        # `models` is a preference, not a gate: a model no key declares is
+        # forwarded rather than refused, because the provider is the authority
+        # on its own models and refusing at the broker would break a model added
+        # upstream after the config was written. Asserting on the body, not just
+        # the status, so "200" cannot come from a broker-generated error.
         status, headers, raw = request(
             MOCK_PROXY, "POST", "/v1/chat/completions",
             {"model": "unserved-model", "messages": []},
             {"x-llm-model": "unserved-model"},
         )
-        check("an unserved model is refused with 503 and no upstream call",
-              status == 503, f"status={status} body={raw[:200]!r}")
+        check("a model no key declares is forwarded (the provider is the authority)",
+              status == 200 and "mock-completion" in raw.decode(),
+              f"status={status} body={raw[:200]!r}")
 
         # --- 9. 5xx is rotated too ----------------------------------------
         reset_all_keys(MOCK_PROXY, "mock", MOCK_KEYS, auth)

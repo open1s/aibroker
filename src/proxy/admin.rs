@@ -809,21 +809,16 @@ fn prevalidate_key(provider: &str, key: &ApiKeyConfig) -> Result<(), LlmBrokerEr
 
 /// Mint the dashboard's per-process refresh token.
 ///
-/// There is no RNG in the dependency tree and none is needed: `RandomState` is
-/// seeded from the OS once per process, which is exactly the lifetime this
-/// token has. It is regenerated on every start, so a dashboard left open in a
-/// tab stops refreshing when the broker restarts, which is the behaviour an
-/// operator would expect from a credential they never typed.
+/// A browser will not attach HTTP credentials to a page's own `fetch`, so the
+/// dashboard is served a token to send back (see `accepts_dashboard_token`). It
+/// is drawn from the OS entropy source rather than derived from anything an
+/// operator typed, and regenerated on every start -- so a dashboard left open in
+/// a tab stops working when the broker restarts, which is what you would expect
+/// from a credential you never entered.
 fn generate_dashboard_token() -> String {
-    use std::hash::{BuildHasher, Hasher};
-
-    let state = std::collections::hash_map::RandomState::new();
-    let mut hasher = state.build_hasher();
-    hasher.write_u64(state.build_hasher().finish());
-    let first = hasher.finish();
-    let mut hasher = state.build_hasher();
-    hasher.write_u64(first);
-    format!("{first:016x}{:016x}", hasher.finish())
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the OS entropy source is always available");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Constant-time comparison so token checks do not leak length/prefix timing.
@@ -986,6 +981,23 @@ mod tests {
                 "{method} {path} must not accept the dashboard refresh token"
             );
         }
+    }
+
+    #[test]
+    fn the_dashboard_token_is_drawn_from_os_entropy() {
+        // Sixteen random bytes, hex-encoded: not derived from the admin token,
+        // not derived from anything guessable, and different in every process.
+        let a = router(runtime(), Some("admin-secret"));
+        let b = router(runtime(), Some("admin-secret"));
+        assert_eq!(a.dashboard_token.len(), 32);
+        assert!(
+            a.dashboard_token.chars().all(|c| c.is_ascii_hexdigit()),
+            "the token should be plain hex"
+        );
+        assert_ne!(
+            a.dashboard_token, b.dashboard_token,
+            "each router mints its own"
+        );
     }
 
     #[test]
