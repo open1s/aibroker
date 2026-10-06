@@ -40,11 +40,10 @@ with one key. Everything else has a default, so start small:
 host = "127.0.0.1"     # loopback unless you mean to serve other hosts
 port = 11436
 
-[[providers]]
-name = "openai"
+[providers.openai]
 base_url = "https://api.openai.com"
 
-[[providers.api_keys]]
+[[providers.openai.api_keys]]
 id = "openai-1"
 key = "env:OPENAI_API_KEY"
 ```
@@ -53,14 +52,34 @@ That is a working proxy: one key, no rotation (there is nothing to rotate to),
 no client authentication, admin API on `/admin` behind a token you must set
 (see step 6).
 
+The provider's name *is* the table key, which is why there is no `name = ...`:
+a key block can only attach to the provider it names. The 1.x array form is
+exactly equivalent and still loads unchanged, so an existing config needs no
+edit:
+
+```toml
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com"
+
+[[providers.api_keys]]        # attaches to the `[[providers]]` entry above
+id = "openai-1"
+key = "env:OPENAI_API_KEY"
+```
+
+Both keep document order, and provider order is the failover order — the array
+form attaches keys to whichever `[[providers]]` entry came last, which is the
+one sharp edge of that shape. A provider with no keys is a config that cannot
+serve, so it is refused at startup rather than started as an empty pool.
+
 Then grow it. Every field is explained in
 [`config.example.toml`](config.example.toml); the sections you are most likely
 to change, in the order they usually matter:
 
 | Section | Why you touch it |
 |---------|------------------|
-| `[[providers]]` | Add key pools. `auth` is `bearer`, `x-api-key`, `api-key`, `query` or a header name; `max_rpm`/`max_tpm`/`max_concurrency` are provider-wide defaults for keys that do not set their own. |
-| `[[providers.api_keys]]` | The keys. `weight` biases weighted strategies, `max_rpm`/`max_tpm` cap that key, `enabled = false` parks it, and `models` declares what it is *for* (below). |
+| `[providers.<name>]` | Add a key pool. `auth` is `bearer`, `x-api-key`, `api-key`, `query` or a header name; `max_rpm`/`max_tpm`/`max_concurrency` are provider-wide defaults for keys that do not set their own. |
+| `[[providers.<name>.api_keys]]` | The keys. `weight` biases weighted strategies, `max_rpm`/`max_tpm` cap that key, `enabled = false` parks it, and `models` declares what it is *for* (below). |
 | `[[routes]]` | Which provider serves which model. `providers` is an ordered failover list. |
 | `[load_balancing]` | The selection strategy and its fallbacks. |
 | `[server]` | Timeouts. `read_timeout_ms` is the one to watch — see the note below. |
@@ -77,7 +96,7 @@ every child process can read it.
 **A key's `models` list is a preference, not a gate.**
 
 ```toml
-[[providers.api_keys]]
+[[providers.deepseek.api_keys]]
 id = "deepseek-1"
 key = "env:DEEPSEEK_API_KEY"
 models = ["deepseek-*"]        # globs, same syntax as a client's allowed_models

@@ -5,8 +5,12 @@
 //! keys can be added or toggled at runtime through the admin API and written
 //! back to disk.
 
-use serde::{Deserialize, Serialize};
+use indexmap::IndexMap;
+use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{LlmBrokerError, Result};
@@ -27,7 +31,9 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_type: Option<String>,
 
-    #[serde(default)]
+    /// `[[providers]]` (a list) and `[providers.<name>]` (a map) are the same
+    /// thing; see [`ProvidersField`].
+    #[serde(default, deserialize_with = "deserialize_providers")]
     pub providers: Vec<ProviderConfig>,
 
     /// Explicit model -> provider routing. Models without a route fall back to
@@ -67,6 +73,99 @@ pub struct Config {
     /// Inspection of request *content* before it is forwarded.
     #[serde(default)]
     pub content_guard: ContentGuardConfig,
+}
+
+/// The two shapes `providers` accepts.
+///
+/// The array form is the 1.x shape and stays supported. The map form puts the
+/// provider's name in the table path, which is what makes the association
+/// explicit: `[[providers.openai.api_keys]]` cannot attach to the wrong
+/// provider, where the array form attaches to whichever `[[providers]]` entry
+/// came last. The name comes from the table key, so the map form omits
+/// `name = ...`.
+///
+/// **Order is document order in both forms, and provider order is the failover
+/// order.** That is why `indexmap` and `toml`'s `preserve_order` are load
+/// bearing: without them the map form deserialises through a sorted table and
+/// silently reorders the pool alphabetically, which is a behaviour change no
+/// one would think to look for.
+#[derive(Debug, Clone)]
+enum ProvidersField {
+    List(Vec<ProviderConfig>),
+    Map(IndexMap<String, ProviderConfig>),
+}
+
+impl ProvidersField {
+    fn into_vec(self) -> std::result::Result<Vec<ProviderConfig>, String> {
+        match self {
+            Self::List(list) => Ok(list),
+            Self::Map(map) => map
+                .into_iter()
+                .map(|(name, mut provider)| {
+                    if !provider.name.is_empty() && provider.name != name {
+                        return Err(format!(
+                            "`[providers.{name}]` also declares `name = \"{}\"`. In the map \
+                             form the name is the table key; remove the field.",
+                            provider.name
+                        ));
+                    }
+                    provider.name = name;
+                    Ok(provider)
+                })
+                .collect(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProvidersField {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProvidersVisitor;
+
+        impl<'de> Visitor<'de> for ProvidersVisitor {
+            type Value = ProvidersField;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a list of providers (`[[providers]]`) or a map keyed by provider name \
+                     (`[providers.<name>]`)",
+                )
+            }
+
+            fn visit_seq<A>(self, seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let list = Vec::<ProviderConfig>::deserialize(SeqAccessDeserializer::new(seq))?;
+                Ok(ProvidersField::List(list))
+            }
+
+            fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let map = IndexMap::<String, ProviderConfig>::deserialize(
+                    MapAccessDeserializer::new(map),
+                )?;
+                Ok(ProvidersField::Map(map))
+            }
+        }
+
+        deserializer.deserialize_any(ProvidersVisitor)
+    }
+}
+
+fn deserialize_providers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ProviderConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ProvidersField::deserialize(deserializer)?
+        .into_vec()
+        .map_err(serde::de::Error::custom)
 }
 
 /// `[content_guard]` — what must not appear inside a prompt.
@@ -274,6 +373,10 @@ pub struct ServerConfig {
 /// A provider endpoint plus its key pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    /// Taken from the table key in the `[providers.<name>]` form, so it is
+    /// optional there and required in the `[[providers]]` form. Validation
+    /// rejects an empty one rather than letting a nameless provider through.
+    #[serde(default)]
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -750,6 +853,29 @@ impl Config {
 
         let mut provider_names = HashSet::new();
         for provider in &self.providers {
+            if provider.name.trim().is_empty() {
+                return Err(LlmBrokerError::InvalidConfig(
+                    "a provider has no name: give its `[[providers]]` entry a `name`, or use \
+                     the map form `[providers.<name>]`, where the name is the table key"
+                        .to_string(),
+                ));
+            }
+
+            // A provider with no keys can never serve a request, so a config
+            // that has one is a config that cannot work. This is not a
+            // hypothetical: `[[openai.api_keys]]` is valid TOML, and the broker
+            // used to parse it, find no keys and start anyway -- so the mistake
+            // looked like a working proxy that failed every request.
+            if provider.api_keys.is_empty() {
+                return Err(LlmBrokerError::InvalidConfig(format!(
+                    "provider `{}` has no keys. If you wrote `[[{}.api_keys]]`, nest it \
+                     under the provider instead: `[providers.{}]` with \
+                     `[[providers.{}.api_keys]]`, or a `[[providers.api_keys]]` block below \
+                     its `[[providers]]` entry.",
+                    provider.name, provider.name, provider.name, provider.name
+                )));
+            }
+
             if !provider_names.insert(provider.name.clone()) {
                 return Err(LlmBrokerError::InvalidConfig(format!(
                     "duplicate provider name `{}`",
@@ -1098,5 +1224,171 @@ models = ["m"]
         for key in ["port", "model", "host", "strategy", "path", "name"] {
             assert!(!is_credential_key(key), "{key} should not be redacted");
         }
+    }
+
+    // --- providers: the two accepted shapes --------------------------------
+
+    /// The array form is the 1.x shape and must keep working unchanged.
+    #[test]
+    fn the_list_form_still_parses() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 11436
+
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com"
+
+[[providers.api_keys]]
+id = "k1"
+key = "sk-test"
+"#,
+        )
+        .expect("a list-form config must load");
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].name, "openai");
+        assert_eq!(config.providers[0].api_keys.len(), 1);
+    }
+
+    /// The map form carries the name in the table path, so `name` is absent
+    /// from the table and has to come from the key.
+    #[test]
+    fn the_map_form_takes_the_name_from_the_table_key() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 11436
+
+[providers.openai]
+base_url = "https://api.openai.com"
+
+[[providers.openai.api_keys]]
+id = "k1"
+key = "sk-test"
+"#,
+        )
+        .expect("a map-form config must load");
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].name, "openai");
+        assert_eq!(config.providers[0].api_keys[0].id, "k1");
+    }
+
+    /// Provider order is the failover order, and a map that deserialised
+    /// through a sorted table would silently reorder the pool alphabetically.
+    /// `zebra` is declared first and must stay first -- this is the test that
+    /// catches a dropped `preserve_order` or a `BTreeMap` substitution, both
+    /// of which look like nothing at all until traffic fails over wrongly.
+    #[test]
+    fn the_map_form_keeps_document_order() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 11436
+
+[providers.zebra]
+base_url = "https://zebra.test"
+[[providers.zebra.api_keys]]
+id = "z1"
+key = "sk-z"
+
+[providers.alpha]
+base_url = "https://alpha.test"
+[[providers.alpha.api_keys]]
+id = "a1"
+key = "sk-a"
+"#,
+        )
+        .expect("a map-form config must load");
+        let names: Vec<&str> = config.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["zebra", "alpha"],
+            "provider order must be document order"
+        );
+    }
+
+    /// Naming the provider twice, with two different answers, is ambiguous
+    /// rather than helpful.
+    #[test]
+    fn the_map_form_rejects_a_conflicting_name() {
+        let error = toml::from_str::<Config>(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 11436
+
+[providers.zebra]
+name = "alpha"
+base_url = "https://zebra.test"
+[[providers.zebra.api_keys]]
+id = "z1"
+key = "sk-z"
+"#,
+        )
+        .expect_err("a mismatched name must be refused");
+        assert!(error.to_string().contains("table key"), "{error}");
+    }
+
+    /// A provider with no keys can never serve a request, so a config holding
+    /// one does not work. `[[openai.api_keys]]` is why this matters: it is
+    /// valid TOML, it attaches nothing, and the broker used to start anyway
+    /// and fail every request through an empty pool.
+    #[test]
+    fn a_provider_with_no_keys_is_refused() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 11436
+
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com"
+
+[[openai.api_keys]]
+id = "k1"
+key = "sk-test"
+"#,
+        )
+        .expect("the document parses; it is validation that refuses it");
+        let error = config
+            .validate()
+            .expect_err("an empty pool must be refused");
+        let message = error.to_string();
+        assert!(message.contains("has no keys"), "{message}");
+        // The message must name the syntax that works, because the author's
+        // mistake is believing their own does.
+        assert!(
+            message.contains("[[providers.openai.api_keys]]"),
+            "{message}"
+        );
+    }
+
+    /// The list form has no table key to fall back on, so a missing `name`
+    /// becomes a nameless provider rather than a parse error.
+    #[test]
+    fn a_nameless_list_provider_is_refused() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 11436
+
+[[providers]]
+base_url = "https://api.openai.com"
+[[providers.api_keys]]
+id = "k1"
+key = "sk-test"
+"#,
+        )
+        .expect("the document parses");
+        let error = config
+            .validate()
+            .expect_err("a nameless provider must be refused");
+        assert!(error.to_string().contains("no name"), "{error}");
     }
 }

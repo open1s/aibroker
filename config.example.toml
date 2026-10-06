@@ -7,7 +7,7 @@
 # gitignored for that reason; prefer `env:NAME` references so the repository
 # only ever holds a variable name.
 #
-# Every section below is optional except `[[providers]]`. Existing 1.x configs
+# Every section below is optional except one provider with one key. Existing 1.x configs
 # keep working: the only fields that were ever required are `server.host`,
 # `server.port` and one provider with one key.
 
@@ -40,9 +40,25 @@ graceful_shutdown_secs = 30
 # ---------------------------------------------------------------------------
 # Providers and their key pools
 # ---------------------------------------------------------------------------
+# The provider's name is the table key -- `[providers.openai]`, with its keys in
+# `[[providers.openai.api_keys]]` blocks below it. There is no `name = ...` field
+# in this form, and a key block can only ever attach to the provider it names.
+#
+# The 1.x array form is exactly equivalent and still supported, so an existing
+# config keeps loading unchanged:
+#
+#   [[providers]]
+#   name = "openai"
+#   base_url = "https://api.openai.com"
+#
+#   [[providers.api_keys]]
+#   id = "openai-1"
+#   key = "env:OPENAI_API_KEY_1"
+#
+# Use whichever reads better. Both keep document order, and provider order is
+# the failover order.
 
-[[providers]]
-name = "openai"
+[providers.openai]
 base_url = "https://api.openai.com"
 # auth = "bearer"          # bearer | x-api-key | api-key | query | <header name>
 # auth_query_param = "key" # used when auth = "query"
@@ -53,14 +69,14 @@ max_tpm = 2_000_000
 max_concurrency = 64
 default_models = ["gpt-4o", "gpt-4o-mini"]
 
-[[providers.api_keys]]
+[[providers.openai.api_keys]]
 id = "openai-1"
 # `env:NAME` reads the secret from the environment instead of the file.
 key = "env:OPENAI_API_KEY_1"
 weight = 2
 max_rpm = 500
 
-[[providers.api_keys]]
+[[providers.openai.api_keys]]
 id = "openai-2"
 key = "env:OPENAI_API_KEY_2"
 weight = 1
@@ -74,29 +90,27 @@ max_rpm = 500
 # Keep a key in the pool but out of rotation.
 # enabled = false
 
-[[providers]]
-name = "anthropic"
+[providers.anthropic]
 base_url = "https://api.anthropic.com"
 # Anthropic expects `x-api-key`; this is the default for the provider.
 auth = "x-api-key"
 default_models = ["claude-3-5-sonnet-latest"]
 
-[[providers.api_keys]]
+[[providers.anthropic.api_keys]]
 id = "anthropic-1"
 key = "env:ANTHROPIC_API_KEY"
 
-[[providers]]
-name = "nvidia"
+[providers.nvidia]
 base_url = "https://integrate.api.nvidia.com"
 default_models = ["minimaxai/minimax-m2.5"]
 
-[[providers.api_keys]]
+[[providers.nvidia.api_keys]]
 id = "nvidia-1"
 key = "env:NVIDIA_API_KEY_1"
 weight = 2
 max_rpm = 40
 
-[[providers.api_keys]]
+[[providers.nvidia.api_keys]]
 id = "nvidia-2"
 key = "env:NVIDIA_API_KEY_2"
 weight = 2

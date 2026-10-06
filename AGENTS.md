@@ -15,7 +15,7 @@ rotation drift apart.
 
 ```bash
 cargo build --offline          # dependencies are already in the local registry
-cargo test  --offline          # 323 unit + 32 integration tests
+cargo test  --offline          # 329 unit + 32 integration tests
 cargo fmt --all
 cargo clippy --offline --all-targets   # must stay warning-free
 cargo run -- --config config.toml
@@ -492,6 +492,28 @@ Rules for anything added here:
   `Connection: close` request header makes pingora skip the body.
 
 ## Conventions
+
+### `providers` accepts two shapes, and order is load bearing
+
+`[providers.<name>]` (a map keyed by the provider's name) and `[[providers]]`
+(a list with `name = ...`) deserialise to the same `Vec<ProviderConfig>`.
+`ProvidersField` owns both, and the map form takes the name from the table key,
+so it carries no `name = ...`. Naming the provider both ways and disagreeing is
+a parse error rather than a silent preference.
+
+**Provider order is the failover order, so the map form must preserve document
+order.** That rests on two things that look incidental and are not: `toml`'s
+`preserve_order` feature and `indexmap`. Drop either and the map form
+deserialises through a sorted table and reorders the pool alphabetically, with
+nothing to show for it until traffic fails over to the wrong provider.
+`the_map_form_keeps_document_order` is the guard; it fails with
+`["alpha", "zebra"]` the moment `preserve_order` goes.
+
+**A provider with no keys is a validation error.** It used to pass, which is
+what made `[[openai.api_keys]]` dangerous: that is valid TOML, it attaches
+nothing, and the broker used to start anyway — reporting the provider, holding
+no keys, and failing every request. The error names the syntax that works,
+because the author's mistake is believing theirs already does.
 
 - `thiserror` for library errors; `anyhow` only in `main`.
 - No `unwrap` on anything reachable from a request path.

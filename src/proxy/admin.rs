@@ -1254,7 +1254,13 @@ mod tests {
         runtime
             .write()
             .apply(|config| {
-                config.providers.push(provider("anthropic", vec![]));
+                // The second provider needs a key of its own: a provider with
+                // an empty pool is a config that cannot serve, and validation
+                // rejects it. The conflict under test is `k1` already
+                // belonging to `openai`.
+                config
+                    .providers
+                    .push(provider("anthropic", vec![key("a1")]));
             })
             .unwrap();
         let router = router(Arc::clone(&runtime), Some("t"));

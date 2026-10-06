@@ -106,8 +106,8 @@ Then watch it work:
 ## Is it production-ready?
 
 It is a local tool, and it is honest about that: no clustering, no shared state
-between instances, config in one TOML file. What it does have is tests — 353 of
-them (321 unit, 32 end-to-end), including end-to-end tests that prove a `429` really does rotate onto
+between instances, config in one TOML file. What it does have is tests — 361 of
+them (329 unit, 32 end-to-end), including end-to-end tests that prove a `429` really does rotate onto
 another key with the body replayed — a pinned toolchain, and a clean
 `clippy -D warnings` build on Linux, macOS and Windows. Every release ships
 prebuilt binaries for five targets.
@@ -172,12 +172,11 @@ host = "0.0.0.0"
 port = 11436
 max_retries = 3          # total attempts per client request
 
-[[providers]]
-name = "openai"
+[providers.openai]
 base_url = "https://api.openai.com"
 auth = "bearer"          # bearer | x-api-key | api-key | query | <header>
 
-[[providers.api_keys]]
+[[providers.openai.api_keys]]
 id = "openai-1"
 key = "env:OPENAI_API_KEY_1"   # or a literal secret
 weight = 2
@@ -201,6 +200,13 @@ token = "env:LLM_BROKER_ADMIN_TOKEN"
 
 1.x configs keep working: every new section has a default, and `models`,
 `weight` and `max_rpm` mean what they always did.
+
+A provider's name is its table key, so `[providers.openai]` carries no
+`name = ...`. The 1.x array form — `[[providers]]` with `name = "openai"` and
+`[[providers.api_keys]]` under it — is exactly equivalent and still loads
+unchanged. Both keep document order, and provider order is the failover order.
+A provider with no keys is refused at startup rather than left as a pool that
+can never serve a request.
 
 A key's `models` list is a **preference, not a gate**. Keys that declare the
 model are tried first; if none of them can serve, the rest of the pool is tried
@@ -874,7 +880,7 @@ tested directly; the pingora layer is a thin adapter over it.
 
 ```bash
 cargo build
-cargo test                 # 321 unit + 32 integration tests
+cargo test                 # 329 unit + 32 integration tests
 cargo fmt
 cargo clippy --all-targets
 ```
