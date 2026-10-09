@@ -900,6 +900,86 @@ fn a_rate_limited_key_is_skipped_by_the_next_request() {
     );
 }
 
+#[test]
+fn a_collapsed_key_returns_after_its_cooldown_without_a_restart() {
+    // The reported outage: once a key's health collapsed, the cooldown expired
+    // and nothing brought the key back — only a process restart did. The
+    // health gate that refused it has no time component, and clearing its
+    // condition needs a success, which needs the key to be selected, which it
+    // never was. Six failures put the score under the threshold and the key
+    // was banned for the life of the process.
+    //
+    // Here the upstream fails exactly six times and then heals. The last
+    // status in the script repeats, so the request made *after* the cooldown
+    // elapses is answered with 200 — and that is the whole assertion: the same
+    // broker, no restart.
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let seen = spawn_mock(upstream_port, vec![503, 503, 503, 503, 503, 503, 200]);
+
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "primary",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key-a", "sk-key-a")],
+        )],
+        vec![],
+    );
+    // A 1 s cooldown with no jitter, and no "wait for a key to come back" —
+    // the gate must release the key on its own or the test fails.
+    config.load_balancing.initial_cooldown_secs = 1;
+    config.load_balancing.max_cooldown_secs = 1;
+    config.load_balancing.cooldown_jitter = 0.0;
+    config.load_balancing.max_wait_for_key_secs = 0;
+    // Only the score collapse should park the key, so all six failures land
+    // before the breaker opens instead of a 1 s park after the third.
+    config.health.failure_threshold = 10;
+    spawn_broker(config, proxy_port);
+
+    let post = || {
+        post_with_model(
+            proxy_port,
+            "/v1/chat/completions",
+            CHAT_BODY,
+            Some("test-model"),
+        )
+    };
+
+    // Six requests while the upstream is broken. A retry rotates to *another*
+    // key and this pool has exactly one, so each request lands one attempt on
+    // the upstream — and each failure drops the health score by a fifth.
+    for round in 1..=6 {
+        let response = post();
+        assert_ne!(
+            response.status, 200,
+            "request {round} must fail while the upstream is broken: {}",
+            response.status_line
+        );
+    }
+
+    // The sixth failure puts the score under the circuit threshold and parks
+    // the key. The cooldown elapses; the upstream is healthy again. One
+    // process, one key, no restart.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let recovery = post();
+    assert_eq!(
+        recovery.status, 200,
+        "a key whose cooldown elapsed must return to rotation without a restart: {}",
+        recovery.status_line
+    );
+
+    // The healed upstream really answered the recovery request: six failures
+    // were consumed, and the seventh hit is the one that returned 200.
+    let requests = seen.lock().expect("lock").clone();
+    assert_eq!(
+        requests.len(),
+        7,
+        "six failures then the recovery call, got {} upstream requests",
+        requests.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Data security: who may send what, proven over the wire.
 // ---------------------------------------------------------------------------

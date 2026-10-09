@@ -526,6 +526,30 @@ mod tests {
     }
 
     #[test]
+    fn select_hands_back_a_key_whose_cooldown_elapsed_despite_collapsed_health() {
+        // The real selection path: `try_strategy` filters every candidate
+        // through `availability`, so a health gate that never lets go is not
+        // just a bad status read — it empties the pool until the process is
+        // restarted.
+        let pool = pool_of(vec![key_config("a", &[], None)], Strategy::RoundRobin);
+        let key = pool.key("a").unwrap();
+        let policy = CooldownPolicy::default();
+        let tuning = HealthTuning::default();
+        for _ in 0..6 {
+            key.record_failure(&policy, &tuning);
+        }
+        // The cooldown has elapsed while the upstream was still broken.
+        key.cooldown_for(Duration::ZERO);
+
+        let empty = HashSet::new();
+        let chosen = pool.select(None, &empty, 0).unwrap();
+        assert_eq!(
+            chosen.id, "a",
+            "an elapsed cooldown must put the key back into rotation"
+        );
+    }
+
+    #[test]
     fn round_robin_rotates_across_keys() {
         let pool = pool_of(
             vec![key_config("a", &[], None), key_config("b", &[], None)],

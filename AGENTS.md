@@ -15,7 +15,7 @@ rotation drift apart.
 
 ```bash
 cargo build --offline          # dependencies are already in the local registry
-cargo test  --offline          # 329 unit + 32 integration tests
+cargo test  --offline          # 334 unit + 33 integration tests
 cargo fmt --all
 cargo clippy --offline --all-targets   # must stay warning-free
 cargo run -- --config config.toml
@@ -406,6 +406,19 @@ and jittered by `cooldown_jitter`. Defaults give 1min → 5min → 25min. An
 upstream `Retry-After` overrides the escalation for that key. The failure score
 is an exponential decay (`score *= 0.8` per failure) and a success clears the
 streak and starts lifting the score back toward `1.0`.
+
+**An open health circuit must be able to close without a restart.** The gate in
+`KeyState::availability` (`score < 0.3 && consecutive_failures >= 2`) is
+time-blind: both conditions clear only on `record_success`, which needs the key
+to be selected first — a circular wait that banned a key for the life of the
+process (six failures reach 0.8⁶ ≈ 0.26), so the cooldown could elapse and
+nothing brought the key back. The gate now admits exactly one half-open probe
+once the cooldown has elapsed: the first caller through marks
+`half_open_probe_in_flight` and later callers wait while that probe is actually
+in flight, so one success closes the circuit and one failure re-parks the key on
+the next cooldown. Keep both halves when touching this: an admission nobody
+reserved must be forgiven (or the flag itself becomes a permanent lockout), and
+a refusal that outlives its own cooldown is the bug class this fixes.
 
 ## Signals
 

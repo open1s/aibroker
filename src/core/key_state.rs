@@ -455,12 +455,32 @@ impl KeyState {
             return Err(UnavailableReason::Concurrency);
         }
 
-        // The circuit is open when health collapsed or recent failures are
-        // stacking up; half-open probes are allowed through.
-        let health = *self.health.read();
+        // The circuit opens when health collapses or recent failures are
+        // stacking up. It cannot close by itself: both of these conditions
+        // clear only on a success, and a success needs this key to be
+        // selected first — so an unconditional refusal here locks the key out
+        // for the life of the process and only a restart brings it back.
+        //
+        // So the open circuit admits exactly one half-open probe once the
+        // cooldown has elapsed. The probe either lifts health above the
+        // threshold (one success always does: `score += (1-score)*0.3` lands
+        // on 0.3 or better even from zero) or fails and re-parks the key on a
+        // longer cooldown. Either way the key is judged by time, not banned
+        // for life.
+        //
+        // The `in_flight` check is what keeps a mere *admission* from
+        // latching: `try_strategy` filters every candidate and the strategy
+        // then picks one, so a key can be admitted as the probe and never get
+        // to send anything. An admission nobody reserved is forgiven on the
+        // next call; only a probe actually in flight holds the circuit open.
+        let mut health = self.health.write();
         if health.score < 0.3 && health.consecutive_failures >= 2 {
-            return Err(UnavailableReason::CircuitOpen);
+            if health.half_open_probe_in_flight && self.in_flight() > 0 {
+                return Err(UnavailableReason::CircuitOpen);
+            }
+            health.half_open_probe_in_flight = true;
         }
+        drop(health);
 
         let mut limiter = self.limiter.lock();
         match limiter.admit(now, self.max_rpm, self.max_tpm, estimated_tokens) {
@@ -1115,6 +1135,127 @@ mod tests {
         }
         assert!(key.health_score() > 0.95, "score {}", key.health_score());
         assert_eq!(key.health_snapshot().consecutive_failures, 0);
+    }
+
+    /// Collapse a key the way a dead upstream does: consecutive failures that
+    /// both drop the score under the circuit threshold and park the key.
+    fn collapse(key: &KeyState) {
+        let policy = CooldownPolicy::default();
+        let tuning = HealthTuning::default();
+        for _ in 0..6 {
+            key.record_failure(&policy, &tuning);
+        }
+        // The park period elapses while the upstream is still broken.
+        key.cooldown_for(Duration::ZERO);
+    }
+
+    #[test]
+    fn an_elapsed_cooldown_hands_the_key_back_despite_collapsed_health() {
+        // Reported: keys that entered cooldown never returned to rotation
+        // without a restart. Once the cooldown elapsed the *health* gate kept
+        // refusing the key forever: `score < 0.3` and
+        // `consecutive_failures >= 2` are both cleared only by a success, and
+        // a success needs the key to be selected first — so the condition that
+        // barred it could never become false.
+        let key = key_with(None, None);
+        let tuning = HealthTuning::default();
+
+        collapse(&key);
+
+        assert!(
+            key.health_score() < tuning.unhealthy_threshold,
+            "premise: health must have collapsed, score {}",
+            key.health_score()
+        );
+        assert_eq!(
+            key.availability(0),
+            Ok(()),
+            "an elapsed cooldown must hand the key back to rotation"
+        );
+    }
+
+    #[test]
+    fn an_unused_probe_admission_never_parks_the_key() {
+        // Selection filters *every* candidate, so a key can be admitted as the
+        // half-open probe and then not chosen. If that admission latched, the
+        // next request would find the probe "already in flight" forever and
+        // never select the key again — the same permanent outage, a second
+        // door over.
+        let key = key_with(None, None);
+        collapse(&key);
+
+        assert_eq!(key.availability(0), Ok(()), "first admission");
+        assert_eq!(
+            key.availability(0),
+            Ok(()),
+            "an admission nobody used must not lock the key out"
+        );
+    }
+
+    #[test]
+    fn the_half_open_probe_is_one_trial_and_a_success_closes_the_circuit() {
+        let key = key_with(None, None);
+        let policy = CooldownPolicy::default();
+        let tuning = HealthTuning::default();
+        collapse(&key);
+
+        // First admission is the probe; it is a real attempt at the upstream.
+        assert_eq!(key.availability(0), Ok(()));
+        let guard = key.reserve();
+        assert_eq!(
+            key.availability(0).unwrap_err(),
+            UnavailableReason::CircuitOpen,
+            "while the probe is in flight the circuit stays open"
+        );
+
+        // One success closes it: the streak clears and the score clears the
+        // threshold, so the key serves normally again.
+        guard.complete(
+            Outcome::Success,
+            Duration::from_millis(30),
+            TokenUsage::default(),
+            &policy,
+            &tuning,
+        );
+        assert_eq!(key.availability(0), Ok(()));
+        assert!(key.health_score() > tuning.unhealthy_threshold);
+        assert_eq!(key.health_state(), HealthState::Closed);
+    }
+
+    #[test]
+    fn a_failed_probe_reopens_with_a_longer_cooldown_instead_of_permanence() {
+        let key = key_with(None, None);
+        let policy = CooldownPolicy {
+            initial: Duration::from_secs(60),
+            max: Duration::from_secs(1500),
+            multiplier: 5.0,
+            jitter: 0.0,
+        };
+        let tuning = HealthTuning::default();
+        collapse(&key);
+        let level_before = key.health_snapshot().consecutive_failures;
+
+        assert_eq!(key.availability(0), Ok(()));
+        let guard = key.reserve();
+        guard.complete(
+            Outcome::Failure,
+            Duration::from_millis(10),
+            TokenUsage::default(),
+            &policy,
+            &tuning,
+        );
+
+        // Still cooling down — time, not a lifetime ban, holds it back.
+        assert_eq!(
+            key.availability(0).unwrap_err(),
+            UnavailableReason::Cooldown
+        );
+        assert!(
+            key.cooldown_remaining().is_some(),
+            "the failed probe must re-park the key"
+        );
+        let after = key.health_snapshot().consecutive_failures;
+        assert!(after > level_before || after >= 2);
     }
 
     #[test]
