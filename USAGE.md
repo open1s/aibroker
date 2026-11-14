@@ -67,7 +67,7 @@ id = "openai-1"
 key = "env:OPENAI_API_KEY"
 ```
 
-Both keep document order, and provider order is the failover order — the array
+Both keep document order, and provider order is the preference order — the array
 form attaches keys to whichever `[[providers]]` entry came last, which is the
 one sharp edge of that shape. A provider with no keys is a config that cannot
 serve, so it is refused at startup rather than started as an empty pool.
@@ -80,8 +80,8 @@ to change, in the order they usually matter:
 |---------|------------------|
 | `[providers.<name>]` | Add a key pool. `auth` is `bearer`, `x-api-key`, `api-key`, `query` or a header name; `max_rpm`/`max_tpm`/`max_concurrency` are provider-wide defaults for keys that do not set their own. |
 | `[[providers.<name>.api_keys]]` | The keys. `weight` biases weighted strategies, `max_rpm`/`max_tpm` cap that key, `enabled = false` parks it, and `models` declares what it is *for* (below). |
-| `[[routes]]` | Which provider serves which model. `providers` is an ordered failover list. |
-| `[load_balancing]` | The selection strategy and its fallbacks. |
+| `[[routes]]` | Which provider serves which model. `providers` is an ordered preference list; a request only moves down it when `cross_provider_failover` is on. |
+| `[load_balancing]` | The selection strategy and its fallbacks. `cross_provider_failover` is off by default: retries rotate keys inside the chosen provider, never across vendors. |
 | `[server]` | Timeouts. `read_timeout_ms` is the one to watch — see the note below. |
 | `[[clients]]` | Require a token to use the proxy, and scope what each caller may send. |
 | `[admin]` | The control plane: where it lives, its token, whether changes persist. |

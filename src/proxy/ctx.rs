@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::core::key_state::{KeyGuard, KeyState, TokenUsage};
 
@@ -43,6 +43,15 @@ pub struct RequestContext {
     pub upstream_status: Option<u16>,
     /// Whether the upstream response has been sent downstream already.
     pub response_started: bool,
+    /// `Retry-After` from the last retryable upstream response. When a retry
+    /// finds the pinned provider's pool exhausted, this is the only honest
+    /// wait to tell the client: the key is in `excluded`, so the pool's own
+    /// availability probe cannot see its cooldown any more.
+    pub last_retry_after: Option<Duration>,
+    /// Set when the pinned provider has no key left that this request has
+    /// not already tried. Only consulted when cross-provider failover is
+    /// opted in: it releases the pin so the retry can move down the route.
+    pub provider_pool_exhausted: bool,
     /// Token usage extracted from the response body.
     pub usage: UsageAccumulator,
     /// Set once the outcome has been recorded, so it is recorded exactly once.
@@ -98,6 +107,8 @@ impl Default for RequestContext {
             body_inspected: false,
             upstream_status: None,
             response_started: false,
+            last_retry_after: None,
+            provider_pool_exhausted: false,
             usage: UsageAccumulator::new(true, 64 * 1024),
             settled: false,
             client_gone: false,

@@ -164,6 +164,13 @@ cooldown_jitter = 0.2
 max_wait_for_key_secs = 15
 idle_timeout_secs = 120
 
+# Cross-provider failover is OFF by default: a request is placed on one
+# provider, retries rotate keys inside that provider's pool, and an exhausted
+# pool answers 429 instead of replaying the request to another vendor. Turn it
+# on only when the providers are interchangeable for the routed models -- the
+# route's `providers` list then acts as an ordered failover list.
+cross_provider_failover = false
+
 # ---------------------------------------------------------------------------
 # Key health (circuit breaker)
 # ---------------------------------------------------------------------------

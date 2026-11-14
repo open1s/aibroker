@@ -190,7 +190,7 @@ max_tpm = 2_000_000
 
 [[routes]]
 model = "gpt-*"
-providers = ["openai"]         # ordered failover list
+providers = ["openai"]         # ordered preference list (failover is opt-in)
 
 [load_balancing]
 strategy = "usage_based"
@@ -209,7 +209,14 @@ token = "env:LLM_BROKER_ADMIN_TOKEN"
 A provider's name is its table key, so `[providers.openai]` carries no
 `name = ...`. The 1.x array form — `[[providers]]` with `name = "openai"` and
 `[[providers.api_keys]]` under it — is exactly equivalent and still loads
-unchanged. Both keep document order, and provider order is the failover order.
+unchanged. Both keep document order, and provider order is the preference order.
+
+**Cross-provider failover is off by default.** A request is placed on one
+provider; retries rotate keys *inside that provider's pool*, and an exhausted
+pool answers 429 rather than replaying the request to another vendor. Set
+`load_balancing.cross_provider_failover = true` to let a request move down the
+route's provider list — only do that when the providers are interchangeable
+for the routed models.
 A provider with no keys is refused at startup rather than left as a pool that
 can never serve a request.
 

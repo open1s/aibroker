@@ -600,6 +600,97 @@ fn rate_limited_key_is_rotated_within_the_same_request() {
     );
 }
 
+/// Two single-key providers serving the same model through one mock upstream.
+fn two_providers(upstream_port: u16) -> Config {
+    let base_url = format!("http://127.0.0.1:{upstream_port}");
+    base_config(
+        free_port(),
+        vec![
+            provider("a", base_url.clone(), &[("ka", "sk-key-a")]),
+            provider("b", base_url, &[("kb", "sk-key-b")]),
+        ],
+        vec![RouteConfig {
+            model: "test-model".into(),
+            providers: vec!["a".into(), "b".into()],
+            strategy: None,
+            rewrite: false,
+        }],
+    )
+}
+
+/// By default a retry never crosses providers: when the chosen provider's
+/// pool is exhausted, the client gets the upstream failure instead of having
+/// its request replayed to another vendor. Opting in restores the failover.
+#[test]
+fn cross_provider_failover_is_opt_in() {
+    // Default: provider `a`'s only key is rejected, and provider `b` must
+    // never see the request even though it serves the same model.
+    let default_upstream = free_port();
+    let default_port = free_port();
+    let seen_default = spawn_mock(default_upstream, vec![429, 200]);
+    let mut config = two_providers(default_upstream);
+    config.server.port = default_port;
+    spawn_broker(config, default_port);
+
+    let response = post_with_model(
+        default_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(
+        response.status, 429,
+        "the exhausted provider must surface its failure, not fail over: {} | body {}",
+        response.status_line, response.body
+    );
+    let requests = seen_default.lock().expect("seen lock").clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "no retry may reach the other provider by default, got {requests:?}"
+    );
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer sk-key-a"),
+        "the single attempt must use the chosen provider's key"
+    );
+
+    // Opt-in: the same topology now fails over to provider `b` and succeeds.
+    let optin_upstream = free_port();
+    let optin_port = free_port();
+    let seen_optin = spawn_mock(optin_upstream, vec![429, 200]);
+    let mut config = two_providers(optin_upstream);
+    config.server.port = optin_port;
+    config.load_balancing.cross_provider_failover = true;
+    spawn_broker(config, optin_port);
+
+    let response = post_with_model(
+        optin_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(
+        response.status, 200,
+        "with failover enabled the retry must reach provider `b`: {} | body {}",
+        response.status_line, response.body
+    );
+    let requests = seen_optin.lock().expect("seen lock").clone();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the broker must have tried both providers, got {requests:?}"
+    );
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer sk-key-a")
+    );
+    assert_eq!(
+        requests[1].authorization.as_deref(),
+        Some("Bearer sk-key-b")
+    );
+}
+
 #[test]
 fn a_captured_rotation_attributes_each_attempt_to_its_own_key() {
     // The parquet capture is the only record of *which* key produced the 429, so

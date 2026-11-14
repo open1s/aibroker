@@ -478,6 +478,15 @@ pub struct LoadBalancingConfig {
     /// request (e.g. every key is at its rate limit).
     #[serde(default)]
     pub fallback_strategies: Vec<String>,
+    /// Allow a request to move to the next provider when the first one cannot
+    /// serve it (exhausted keys, or a retry after a 429/5xx).
+    ///
+    /// Off by default: once a request has been placed on a provider, every
+    /// retry stays on that provider's pool, and an exhausted pool refuses the
+    /// request instead of leaking it to another vendor. Turn it on only when
+    /// the providers are interchangeable for the routed models.
+    #[serde(default)]
+    pub cross_provider_failover: bool,
 }
 
 /// Health scoring and circuit breaker behaviour.
@@ -636,6 +645,7 @@ impl Default for LoadBalancingConfig {
             max_wait_for_key_secs: default_max_wait(),
             idle_timeout_secs: default_idle_timeout(),
             fallback_strategies: Vec::new(),
+            cross_provider_failover: false,
         }
     }
 }
@@ -1214,6 +1224,31 @@ models = ["m"]
         let config: Config = toml::from_str(toml).expect("an older config must still load");
         assert_eq!(config.health.unhealthy_threshold, 0.3);
         assert!(config.health.enabled);
+    }
+
+    #[test]
+    fn cross_provider_failover_is_off_unless_asked_for() {
+        // The privacy guarantee is the default: an existing config that never
+        // mentions the flag must not silently gain cross-vendor failover.
+        let toml = r#"
+[server]
+port = 11436
+
+[[providers]]
+name = "p"
+base_url = "http://127.0.0.1:1"
+[[providers.api_keys]]
+id = "k"
+key = "s"
+models = ["m"]
+"#;
+        let config: Config = toml::from_str(toml).expect("config loads");
+        assert!(!config.load_balancing.cross_provider_failover);
+        assert!(!LoadBalancingConfig::default().cross_provider_failover);
+
+        let opt_in = format!("{toml}\n[load_balancing]\ncross_provider_failover = true\n");
+        let config: Config = toml::from_str(&opt_in).expect("opt-in config loads");
+        assert!(config.load_balancing.cross_provider_failover);
     }
 
     #[test]

@@ -78,6 +78,10 @@ pub struct Broker {
     default_provider: Option<String>,
     strategy: Strategy,
     fallbacks: Vec<Strategy>,
+    /// When false (the default), a request is served by exactly one provider:
+    /// retries rotate keys inside that provider's pool and an exhausted pool
+    /// refuses the request instead of moving to the next provider.
+    cross_provider_failover: bool,
 }
 
 struct CompiledRoute {
@@ -173,6 +177,7 @@ impl Broker {
             default_provider: config.default_route.clone(),
             strategy,
             fallbacks,
+            cross_provider_failover: config.load_balancing.cross_provider_failover,
         })
     }
 
@@ -196,6 +201,10 @@ impl Broker {
     /// 2. providers whose keys explicitly list the model,
     /// 3. the configured `default_route`,
     /// 4. every remaining provider.
+    ///
+    /// With `cross_provider_failover` off, only the first candidate is kept:
+    /// the rest of the list is a failover order, and failover across providers
+    /// is opt-in.
     pub fn route_candidates(&self, model: Option<&str>) -> Vec<String> {
         let mut order: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -239,6 +248,9 @@ impl Broker {
             push(name, &mut order, &mut seen);
         }
 
+        if !self.cross_provider_failover {
+            order.truncate(1);
+        }
         order
     }
 
@@ -283,10 +295,32 @@ impl Broker {
         exclude: &HashSet<String>,
         estimated_tokens: u64,
     ) -> Result<SelectedKey, RouteError> {
+        self.select_on(model, exclude, estimated_tokens, None)
+    }
+
+    /// Like [`Broker::select`], but `pinned_provider` restricts selection to
+    /// one provider's pool.
+    ///
+    /// The proxy pins the provider chosen on the first attempt, so a retry
+    /// after a 429/5xx rotates keys inside that provider's pool. With
+    /// `cross_provider_failover` off (the default) the pin holds for the whole
+    /// request; with it on, the proxy releases the pin once the pool has no
+    /// untried key left, letting the retry move down the route.
+    pub fn select_on(
+        &self,
+        model: Option<&str>,
+        exclude: &HashSet<String>,
+        estimated_tokens: u64,
+        pinned_provider: Option<&str>,
+    ) -> Result<SelectedKey, RouteError> {
         let mut best_exhausted: Option<RouteError> = None;
         let mut saw_matching_key = false;
 
-        for provider in self.route_candidates(model) {
+        let candidates = match pinned_provider {
+            Some(provider) => vec![provider.to_string()],
+            None => self.route_candidates(model),
+        };
+        for provider in candidates {
             let Some(pool) = self.pools.get(&provider) else {
                 continue;
             };
@@ -524,8 +558,9 @@ mod tests {
                 .provider,
             "anthropic"
         );
-        // `anthropic`'s key accepts every model, so it is tried before
-        // `openai` for a model nothing explicitly claims.
+        // `anthropic`'s key accepts every model, so it wins for a model
+        // nothing explicitly claims -- and with cross-provider failover off
+        // (the default) it is the *only* candidate.
         assert_eq!(
             broker
                 .select(Some("gpt-4"), &HashSet::new(), 0)
@@ -533,6 +568,7 @@ mod tests {
                 .provider,
             "anthropic"
         );
+        assert_eq!(broker.route_candidates(Some("gpt-4")), vec!["anthropic"]);
     }
 
     #[test]
@@ -581,7 +617,10 @@ mod tests {
     }
 
     #[test]
-    fn retry_exclusion_forces_a_different_provider() {
+    fn retry_exclusion_never_crosses_providers_by_default() {
+        // The default guarantee: a retry rotates keys *within* the provider
+        // that took the request. When that pool has nothing left, the request
+        // is refused rather than replayed to another vendor.
         let cfg = config(
             vec![
                 provider("a", vec![key("ka", &["m"])]),
@@ -592,29 +631,87 @@ mod tests {
         let broker = Broker::from_config(&cfg).unwrap();
         let mut exclude = HashSet::new();
         let first = broker.select(Some("m"), &exclude, 0).unwrap();
+        assert_eq!(first.provider, "a");
         exclude.insert(first.key.id.clone());
-        let second = broker.select(Some("m"), &exclude, 0).unwrap();
-        assert_ne!(first.key.id, second.key.id);
-        assert_ne!(first.provider, second.provider);
+        let error = broker.select(Some("m"), &exclude, 0).unwrap_err();
+        assert!(
+            matches!(error, RouteError::Exhausted { .. }),
+            "the exhausted provider must refuse, not hand the request to `b`: {error:?}"
+        );
     }
 
     #[test]
-    fn fallback_provider_is_used_when_the_preferred_pool_is_exhausted() {
+    fn retry_exclusion_rotates_keys_inside_the_pinned_provider() {
+        let cfg = config(
+            vec![
+                provider("a", vec![key("ka1", &["m"]), key("ka2", &["m"])]),
+                provider("b", vec![key("kb", &["m"])]),
+            ],
+            vec![],
+        );
+        let broker = Broker::from_config(&cfg).unwrap();
+        let mut exclude = HashSet::new();
+        let first = broker.select(Some("m"), &exclude, 0).unwrap();
+        exclude.insert(first.key.id.clone());
+        let second = broker.select(Some("m"), &exclude, 0).unwrap();
+        assert_ne!(first.key.id, second.key.id);
+        assert_eq!(first.provider, second.provider);
+    }
+
+    #[test]
+    fn cross_provider_failover_is_opt_in() {
         let mut limited = key("ka", &["m"]);
         limited.max_rpm = Some(1);
-        let cfg = config(
+        let mut cfg = config(
             vec![
                 provider("a", vec![limited]),
                 provider("b", vec![key("kb", &["m"])]),
             ],
             vec![route("m", &["a", "b"])],
         );
+
+        // Default: `a` is exhausted, so the request is refused even though
+        // `b` is healthy and listed on the same route.
         let broker = Broker::from_config(&cfg).unwrap();
         let exclude = HashSet::new();
         assert_eq!(broker.select(Some("m"), &exclude, 0).unwrap().provider, "a");
-        // `a` is now rate limited, so the request must fail over to `b`.
+        let error = broker.select(Some("m"), &exclude, 0).unwrap_err();
+        assert!(matches!(error, RouteError::Exhausted { .. }), "{error:?}");
+
+        // Opt-in: the same config fails over to `b`.
+        cfg.load_balancing.cross_provider_failover = true;
+        let broker = Broker::from_config(&cfg).unwrap();
+        let exclude = HashSet::new();
+        assert_eq!(broker.select(Some("m"), &exclude, 0).unwrap().provider, "a");
         let second = broker.select(Some("m"), &exclude, 0).unwrap();
         assert_eq!(second.provider, "b");
+    }
+
+    #[test]
+    fn a_pinned_provider_is_honoured_even_with_failover_enabled() {
+        // An explicit pin restricts selection to that provider's pool no
+        // matter what the failover setting says; releasing the pin is the
+        // proxy's decision (opt-in, and only once the pool is exhausted).
+        let mut cfg = config(
+            vec![
+                provider("a", vec![key("ka", &["m"])]),
+                provider("b", vec![key("kb", &["m"])]),
+            ],
+            vec![route("m", &["a", "b"])],
+        );
+        cfg.load_balancing.cross_provider_failover = true;
+        let broker = Broker::from_config(&cfg).unwrap();
+        let mut exclude = HashSet::new();
+        let first = broker.select_on(Some("m"), &exclude, 0, Some("a")).unwrap();
+        assert_eq!(first.provider, "a");
+        exclude.insert(first.key.id.clone());
+        let error = broker
+            .select_on(Some("m"), &exclude, 0, Some("a"))
+            .unwrap_err();
+        assert!(
+            matches!(error, RouteError::Exhausted { .. }),
+            "a pinned retry must not escape to `b`: {error:?}"
+        );
     }
 
     #[test]

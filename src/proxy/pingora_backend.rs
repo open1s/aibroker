@@ -261,9 +261,18 @@ impl ProxyService {
         model: Option<&str>,
     ) -> Result<crate::core::broker::SelectedKey, crate::core::broker::RouteError> {
         let runtime = self.runtime.read();
+        // With cross-provider failover off (the default), once a provider
+        // took this request every retry is pinned to its pool: key rotation
+        // stays inside the provider, and a body already sent to one vendor
+        // is never replayed to another. With failover opted in, the pin is
+        // released when the provider's pool is exhausted so the retry can
+        // walk the route's remaining providers.
+        let pinned = ctx.provider.as_deref().filter(|_| {
+            !runtime.config().load_balancing.cross_provider_failover || !ctx.provider_pool_exhausted
+        });
         runtime
             .broker()
-            .select(model, &ctx.excluded, ctx.estimated_tokens)
+            .select_on(model, &ctx.excluded, ctx.estimated_tokens, pinned)
     }
 
     /// Authenticate the caller and apply the egress policy, once, before the
@@ -939,8 +948,13 @@ impl ProxyHttp for ProxyService {
         let selected = match selection {
             Ok(selected) => selected,
             Err(error) => {
+                // A retry whose pinned provider has nothing left is still a
+                // rate-limit refusal, not "no keys": the pool's own probe
+                // cannot see the cooldown of a key already in `excluded`, so
+                // fall back to the `Retry-After` the upstream last sent.
+                let retry_hint = error.retry_after().or(ctx.last_retry_after);
                 let registry = Arc::clone(self.runtime.read().metrics());
-                if error.retry_after().is_some() {
+                if retry_hint.is_some() {
                     registry
                         .keys_exhausted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -950,13 +964,9 @@ impl ProxyHttp for ProxyService {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                let status = if error.retry_after().is_some() {
-                    429
-                } else {
-                    503
-                };
+                let status = if retry_hint.is_some() { 429 } else { 503 };
                 let mut header = ResponseHeader::build(status, None)?;
-                if let Some(wait) = error.retry_after() {
+                if let Some(wait) = retry_hint {
                     header.insert_header("Retry-After", wait.as_secs().max(1).to_string())?;
                 }
                 header.insert_header("X-LLM-Broker-Error", error.to_string())?;
@@ -1094,6 +1104,16 @@ impl ProxyHttp for ProxyService {
         }
 
         let retry_after = Self::retry_after(resp);
+        ctx.last_retry_after = retry_after;
+        // The key just failed and is in `excluded`; whether its provider has
+        // any key left decides if an opted-in failover may release the pin.
+        ctx.provider_pool_exhausted = {
+            let runtime = self.runtime.read();
+            ctx.provider
+                .as_deref()
+                .and_then(|name| runtime.broker().pool(name))
+                .is_some_and(|pool| pool.keys().iter().all(|key| ctx.excluded.contains(&key.id)))
+        };
         let outcome = if status == 429 {
             Outcome::RateLimited { retry_after }
         } else {

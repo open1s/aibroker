@@ -316,6 +316,18 @@ one assertion.
 `load_balancing.fallback_strategies` lists strategies tried in order when the
 primary one cannot place the request.
 
+**Cross-provider failover is opt-in.** `load_balancing.cross_provider_failover`
+defaults to `false`: `route_candidates` truncates to the first provider, and
+the proxy pins that provider for the whole request (`select_on`), so retries
+rotate keys inside one pool and an exhausted pool answers 429 instead of
+replaying the body to another vendor. Turning it on lets placement walk the
+route's provider list, and the proxy releases the pin once the pinned pool
+has no untried key left (`ctx.provider_pool_exhausted`). An exhausted retry
+answers 429 with the upstream's last `Retry-After` (`ctx.last_retry_after`):
+the pool's own probe cannot see the cooldown of a key already in `excluded`.
+The guards are `cross_provider_failover_is_opt_in` (unit + integration) and
+`a_pinned_provider_is_honoured_even_with_failover_enabled`.
+
 **A strategy must share an identical pool.** `fallback` is the documented
 exception: it is ordered failover, so pinning is its contract. Every other
 strategy is expected to spread, and two shipped with defects that pinned traffic
