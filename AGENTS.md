@@ -22,35 +22,35 @@ cargo run -- --config config.toml
 cargo run -- --config config.toml --check   # validate config and env secrets
 ```
 
-**Toolchain is pinned in `rust-toolchain.toml`** (currently 1.99.0) and CI
-installs that same channel. Do not switch CI back to
-`dtolnay/rust-toolchain@stable`: it floats, so a Rust release can turn the
-build red with no source change. Rust 1.99 deprecating `Atomic::fetch_update`
-in favour of `try_update` did exactly that, and `-D warnings` turned the
-deprecation into a failure.
+**Toolchain tracks stable** via `rust-toolchain.toml` (`channel = "stable"`),
+and CI installs the same channel with `dtolnay/rust-toolchain@stable`. The
+file used to pin an exact version (1.99.0); the pin was removed deliberately.
+Be aware of the trade-off that motivated it: stable floats, so a Rust release
+can turn the build red with no source change — Rust 1.99 deprecating
+`Atomic::fetch_update` in favour of `try_update` did exactly that, and
+`-D warnings` turned the deprecation into a failure. When that happens, fix
+the lint fallout; do not silently reintroduce a pin.
 
-Bumping the pin is a deliberate change:
+When a new stable breaks the build:
 
 ```bash
-# 1. install and select the new channel (mise manages the toolchains here)
-mise install rust@<version>
-# 2. update channel in rust-toolchain.toml and the `toolchain:` values in
-#    BOTH .github/workflows/ci.yml and .github/workflows/release.yml
-# 3. fix fallout, then prove it on that toolchain
+# 1. update the toolchain (mise manages the toolchains here)
+mise install rust@latest
+# 2. fix fallout, then prove it on that toolchain
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-# 4. prove a cross target still builds the way CI does
+# 3. prove a cross target still builds the way CI does
 cargo build --release --target x86_64-apple-darwin
 ```
 
 Two traps when touching this:
 
 - **Keep the workflows and the file in step.** `rust-toolchain.toml` wins over
-  the action's `toolchain:` input, so a workflow left on `@stable` installs a
-  different compiler than the one being tested. That mismatch is what broke the
-  release job: `@stable` installed 1.99.0 in `release.yml` while the file pinned
-  the same channel but with different targets.
+  the action's `toolchain:` input, so a workflow naming a different channel
+  installs a different compiler than the one being tested. That mismatch once
+  broke the release job. All three files now say `stable`; change them
+  together.
 - **`rust-toolchain.toml` also overrides the action's `targets:` input.**
   Cross targets then have to be installed explicitly, or the build fails with
   `can't find crate for \`core\``. `release.yml` does this with a dedicated

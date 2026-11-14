@@ -100,6 +100,9 @@ Then watch it work:
 - <http://127.0.0.1:11436/metrics> — Prometheus;
 - `--dump-request --dump-response` — the full exchange, one line per event,
   credentials redacted, which is how you debug an integration;
+- `-w traffic.parquet` — the same exchanges captured to a parquet file
+  (complete bodies, routing outcome, every attempt), queryable with DuckDB
+  while the broker runs;
 - `aibroker --check-admin http://127.0.0.1:11436/admin/status` — the same from a
   shell.
 
@@ -160,6 +163,8 @@ prebuilt binaries for five targets.
 | `--config <path>` | Config file (default `config.toml`, then `~/.config/aibroker/config.toml`) |
 | `--check` | Validate the config *and* that every `env:` secret resolves, then exit |
 | `--dump-config` | Print the effective config as TOML and exit |
+| `-w, --write-file <file>` | Capture complete exchanges to a parquet file (credentials redacted) |
+| `--capture-max-bytes <n>` | Per-body byte cap in the `-w` capture (default 1 MiB) |
 
 ## Configuration
 
@@ -779,6 +784,31 @@ switched off without losing the rest of the log:
 ```bash
 RUST_LOG=info,llm_broker::dump=off aibroker --dump-request
 ```
+
+### Capturing to a file (`-w`)
+
+The log dump is for watching traffic live; `-w` is for the *afterwards*. It
+writes one parquet row per request — complete bodies (up to
+`--capture-max-bytes`, default 1 MiB), headers, model, provider, key, attempts,
+status and latency — plus each upstream attempt as JSON, so a rotation's
+`429` body is kept next to the retry that succeeded:
+
+```bash
+aibroker --config config.toml -w traffic.parquet
+# query it while the broker is still running
+duckdb -c "SELECT id, model, provider, key_id, attempts, status, duration_ms
+           FROM 'traffic.parquet' WHERE status != 200"
+```
+
+Rows are published about every 500 ms: the writer rewrites the file
+atomically (parquet only becomes readable once its footer is written), so a
+query mid-run always sees a complete file with every request finished up to
+the last publish. The same
+redaction rules as the log dump apply (`authorization`, `x-api-key`, … and the
+`[dump] redact` patterns), before anything is buffered — the file is durable
+storage, so a credential must never reach it. Bodies are still sensitive
+content: treat the capture like the log. The file is truncated at startup;
+each run starts a fresh capture.
 
 ## Stopping it
 

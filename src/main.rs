@@ -54,6 +54,21 @@ struct Args {
     #[arg(long, value_name = "BYTES", default_value_t = 8192)]
     dump_max_bytes: usize,
 
+    /// Write complete request/response exchanges to a parquet file.
+    ///
+    /// One row per request: method, URI, headers, full bodies, model,
+    /// provider, key, attempts, status and latency, plus each upstream
+    /// attempt (so a key rotation is visible). Credentials are redacted with
+    /// the same rules as --dump-request/--dump-response. The file is created
+    /// at startup (truncating any existing one) and can be queried while the
+    /// broker runs, e.g. `duckdb -c "SELECT * FROM 'traffic.parquet'"`.
+    #[arg(short = 'w', long = "write-file", value_name = "FILE")]
+    write_file: Option<PathBuf>,
+
+    /// Maximum bytes of each body stored in the -w capture (default 1 MiB).
+    #[arg(long, value_name = "BYTES", default_value_t = 1024 * 1024)]
+    capture_max_bytes: usize,
+
     /// Redact a pattern from dumped bodies and header values. Repeatable.
     ///
     /// Either `PATTERN` (replaced with `<redacted>`) or `PATTERN=REPLACEMENT`,
@@ -158,6 +173,24 @@ fn main() {
         }
     };
 
+    let capture = match args.write_file.as_ref() {
+        Some(path) => match aibroker::proxy::parquet::CaptureWriter::create(path) {
+            Ok(writer) => {
+                eprintln!(
+                    "[dump] writing complete exchanges to `{}` (parquet, max_body_bytes={})",
+                    path.display(),
+                    args.capture_max_bytes
+                );
+                Some(writer)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     if args.dump_request || args.dump_response {
         eprintln!(
             "[dump] request={} response={} max_body_bytes={} redaction_patterns={} \
@@ -168,7 +201,7 @@ fn main() {
             redactor.len()
         );
     }
-    if (args.dump_request || args.dump_response) && redactor.is_empty() {
+    if (args.dump_request || args.dump_response || capture.is_some()) && redactor.is_empty() {
         // Worth saying out loud: a dump is the one place prompt content reaches
         // durable storage, and `-rw-r--r--` is the usual outcome of a shell
         // redirect.
@@ -184,6 +217,8 @@ fn main() {
         dump_response: args.dump_response,
         max_body_bytes: args.dump_max_bytes,
         redactor,
+        capture,
+        capture_max_bytes: args.capture_max_bytes.max(64),
     };
 
     if let Err(error) = run_server(config, runtime, dump) {

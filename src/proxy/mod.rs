@@ -6,6 +6,7 @@ pub mod control;
 pub mod ctx;
 pub mod dashboard;
 pub mod dump;
+pub mod parquet;
 pub mod payload;
 pub mod pingora_backend;
 pub mod redact;

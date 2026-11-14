@@ -458,6 +458,10 @@ aibroker --config config.toml --dump-request --dump-max-bytes 2000
 # Scrub a shape the built-in redaction does not know about (repeatable)
 aibroker --config config.toml --dump-request --redact 'ghp_[A-Za-z0-9]{20,}'
 
+# capture complete exchanges to a parquet file (queryable while running)
+aibroker --config config.toml -w traffic.parquet
+duckdb -c "SELECT id, model, provider, key_id, attempts, status FROM 'traffic.parquet'"
+
 # Query a running broker from a shell
 aibroker --check-admin http://127.0.0.1:11436/admin/status --admin-token "$TOKEN"
 ```

@@ -21,6 +21,10 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::proxy::parquet::{
+    CaptureWriter, CapturedAttempt, CapturedExchange, DEFAULT_MAX_CAPTURE_BYTES, append_capped,
+    now_ms,
+};
 use crate::proxy::redact::Redactor;
 
 /// Headers whose value must never reach the log.
@@ -49,6 +53,12 @@ pub struct DumpConfig {
     pub max_body_bytes: usize,
     /// Patterns removed from dumped bodies and header values.
     pub redactor: Redactor,
+    /// When set (`-w FILE`), complete exchanges are also written to this
+    /// parquet file, with the same redaction applied.
+    pub capture: Option<CaptureWriter>,
+    /// Per-body byte cap for the parquet capture. Independent of
+    /// `max_body_bytes`, which only bounds a single log line.
+    pub capture_max_bytes: usize,
 }
 
 impl Default for DumpConfig {
@@ -58,13 +68,20 @@ impl Default for DumpConfig {
             dump_response: false,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
             redactor: Redactor::default(),
+            capture: None,
+            capture_max_bytes: DEFAULT_MAX_CAPTURE_BYTES,
         }
     }
 }
 
 impl DumpConfig {
     pub fn enabled(&self) -> bool {
-        self.dump_request || self.dump_response
+        self.dump_request || self.dump_response || self.capture.is_some()
+    }
+
+    /// Whether complete exchanges are being written to a parquet file.
+    pub fn capturing(&self) -> bool {
+        self.capture.is_some()
     }
 
     /// The default body cap.
@@ -90,6 +107,28 @@ pub struct Dump {
     request_bytes: usize,
     response_bytes: usize,
     request_headers_done: bool,
+    capture: Option<Capture>,
+}
+
+/// Per-request capture state for the parquet file (`-w`).
+///
+/// Bodies are accumulated whole (up to the capture cap) rather than sampled
+/// per chunk: the file exists so a developer can see the *complete* exchange
+/// afterwards. Everything stored here has already been redacted.
+#[derive(Debug, Default)]
+struct Capture {
+    timestamp_ms: u64,
+    method: String,
+    uri: String,
+    request_headers: String,
+    request_body: String,
+    request_truncated: bool,
+    /// The body of the first chunk, used to recognise pingora's retry replay.
+    first_chunk: Vec<u8>,
+    response_headers: String,
+    response_body: String,
+    response_truncated: bool,
+    attempts: Vec<CapturedAttempt>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -107,6 +146,10 @@ impl Dump {
     /// Build a dump for an id already assigned by the caller, so one id can
     /// cover the whole request even though the dump is created later.
     pub fn with_id(id: u64, config: DumpConfig) -> Self {
+        let capture = config.capturing().then(|| Capture {
+            timestamp_ms: now_ms(),
+            ..Capture::default()
+        });
         Self {
             id,
             config,
@@ -114,6 +157,7 @@ impl Dump {
             request_bytes: 0,
             response_bytes: 0,
             request_headers_done: false,
+            capture,
         }
     }
 
@@ -145,28 +189,56 @@ impl Dump {
         version: &str,
         headers: &pingora::http::RequestHeader,
     ) {
-        if !self.config.dump_request || self.request_headers_done {
+        if (!self.config.dump_request && !self.config.capturing()) || self.request_headers_done {
             return;
         }
         self.request_headers_done = true;
         let rendered = self.redact(&render_headers(headers.headers.iter()));
-        self.emit("req", &format!("{method} {uri} {version}"));
-        self.emit("req headers", &rendered);
+        if let Some(capture) = self.capture.as_mut() {
+            capture.method = method.to_string();
+            capture.uri = uri.to_string();
+            capture.request_headers = rendered.clone();
+        }
+        if self.config.dump_request {
+            self.emit("req", &format!("{method} {uri} {version}"));
+            self.emit("req headers", &rendered);
+        }
     }
 
     /// Dump the upstream request as it will actually be sent, credential
     /// redacted. This is the interesting one: it shows the model routing
     /// result (path, Host), not just what the client asked for.
-    pub fn upstream_request(&mut self, req: &pingora::http::RequestHeader) {
-        if !self.config.dump_request {
+    pub fn upstream_request(
+        &mut self,
+        req: &pingora::http::RequestHeader,
+        provider: Option<&str>,
+        key: Option<&str>,
+    ) {
+        if !self.config.dump_request && !self.config.capturing() {
             return;
         }
         let rendered = self.redact(&render_headers(req.headers.iter()));
-        self.emit(
-            "upstream req",
-            &format!("{} {} {:?}", req.method, req.uri, req.version),
-        );
-        self.emit("upstream req headers", &rendered);
+        if let Some(capture) = self.capture.as_mut() {
+            // A new attempt starts here: `upstream_peer` re-runs on every key
+            // rotation, so each try gets its own record. The provider and key
+            // are stamped now, not at finish: a rotation means only the last
+            // attempt's routing is still in the context by then.
+            capture.attempts.push(CapturedAttempt {
+                provider: provider.map(str::to_string),
+                key: key.map(str::to_string),
+                method: req.method.to_string(),
+                url: req.uri.to_string(),
+                headers: rendered.clone(),
+                ..CapturedAttempt::default()
+            });
+        }
+        if self.config.dump_request {
+            self.emit(
+                "upstream req",
+                &format!("{} {} {:?}", req.method, req.uri, req.version),
+            );
+            self.emit("upstream req headers", &rendered);
+        }
     }
 
     /// Dump a chunk of the request body.
@@ -177,21 +249,49 @@ impl Dump {
     /// and a retry (pingora replays the body from its buffer on a key rotation)
     /// is reported rather than re-counted.
     pub fn request_body(&mut self, chunk: &[u8]) {
-        if !self.config.dump_request {
+        if !self.config.dump_request && !self.config.capturing() {
             return;
         }
         if self.request_bytes == 0 {
             self.request_bytes = chunk.len();
-            let message = self.request_body_message(chunk);
-            self.emit("req body", &message);
+            if let Some(capture) = self.capture.as_mut() {
+                capture.first_chunk = chunk.to_vec();
+                capture.request_truncated |= append_capped(
+                    &mut capture.request_body,
+                    chunk,
+                    self.config.capture_max_bytes,
+                );
+            }
+            if self.config.dump_request {
+                let message = self.request_body_message(chunk);
+                self.emit("req body", &message);
+            }
             return;
         }
         if self.request_bytes == chunk.len() {
-            self.emit(
-                "req body",
-                &format!("replayed {} bytes (retry)", chunk.len()),
+            // pingora replays the buffered body verbatim on a key rotation:
+            // the same request, not a bigger one. The capture checks the
+            // bytes too, so a same-length *different* chunk is not swallowed.
+            let replay = self
+                .capture
+                .as_ref()
+                .is_none_or(|capture| capture.first_chunk == chunk);
+            if replay {
+                if self.config.dump_request {
+                    self.emit(
+                        "req body",
+                        &format!("replayed {} bytes (retry)", chunk.len()),
+                    );
+                }
+                return;
+            }
+        }
+        if let Some(capture) = self.capture.as_mut() {
+            capture.request_truncated |= append_capped(
+                &mut capture.request_body,
+                chunk,
+                self.config.capture_max_bytes,
             );
-            return;
         }
         // A large upload arrives as many chunks. Print nothing further: the
         // first chunk showed the payload's shape and the summary reports the
@@ -201,33 +301,58 @@ impl Dump {
 
     /// Dump the response status line and headers.
     pub fn response_headers(&mut self, status: u16, headers: &pingora::http::ResponseHeader) {
-        if !self.config.dump_response {
+        if !self.config.dump_response && !self.config.capturing() {
             return;
         }
         let rendered = self.redact(&render_headers(headers.headers.iter()));
-        self.emit("resp", &format!("{status}"));
-        self.emit("resp headers", &rendered);
+        if let Some(capture) = self.capture.as_mut() {
+            capture.response_headers = rendered.clone();
+            // A fresh response body per attempt: on a rotation the previous
+            // attempt keeps its 429/5xx body, which is the interesting part.
+            capture.response_body.clear();
+            capture.response_truncated = false;
+            if let Some(attempt) = capture.attempts.last_mut() {
+                attempt.status = Some(status);
+                attempt.response_headers = rendered.clone();
+            }
+        }
+        if self.config.dump_response {
+            self.emit("resp", &format!("{status}"));
+            self.emit("resp headers", &rendered);
+        }
     }
 
     /// Dump a chunk of the response body. SSE answers arrive as many chunks;
     /// each is printed so the stream can be followed live.
     pub fn response_body(&mut self, chunk: &[u8], end_of_stream: bool) {
-        if !self.config.dump_response {
+        if !self.config.dump_response && !self.config.capturing() {
             return;
         }
         let total = self.response_bytes + chunk.len();
-        // SSE frames are newline separated; print them as separate events.
-        let messages = self.response_body_messages(chunk);
-        for message in &messages {
-            self.emit("resp body", message);
+        if let Some(capture) = self.capture.as_mut() {
+            capture.response_truncated |= append_capped(
+                &mut capture.response_body,
+                chunk,
+                self.config.capture_max_bytes,
+            );
+            if end_of_stream && let Some(attempt) = capture.attempts.last_mut() {
+                attempt.response_body = capture.response_body.clone();
+            }
+        }
+        if self.config.dump_response {
+            // SSE frames are newline separated; print them as separate events.
+            let messages = self.response_body_messages(chunk);
+            for message in &messages {
+                self.emit("resp body", message);
+            }
+            if end_of_stream {
+                self.emit(
+                    "resp body",
+                    &format!("<end of stream, {total} bytes total>"),
+                );
+            }
         }
         self.response_bytes = total;
-        if end_of_stream {
-            self.emit(
-                "resp body",
-                &format!("<end of stream, {total} bytes total>"),
-            );
-        }
     }
 
     /// The message a request body chunk would produce, redacted.
@@ -263,6 +388,82 @@ impl Dump {
             return text.to_string();
         }
         self.config.redactor.apply(text)
+    }
+
+    /// Write the finished exchange to the parquet capture file, if `-w` is on.
+    ///
+    /// Called once per request from the proxy's `logging` phase, so a request
+    /// refused at the edge (no upstream attempt at all) is captured too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish(
+        &mut self,
+        status: Option<u16>,
+        attempts: u32,
+        provider: Option<&str>,
+        key: Option<&str>,
+        model: Option<&str>,
+        client: Option<&str>,
+    ) {
+        let Some(writer) = self.config.capture.as_ref() else {
+            return;
+        };
+        // Redaction only needs the config; taking it out of the borrow lets
+        // the capture below be moved out field by field.
+        let config = self.config.clone();
+        let duration_ms = self.at();
+        let request_bytes = self.request_bytes as u64;
+        let response_bytes = self.response_bytes as u64;
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        // The log path redacts each chunk before printing; the capture keeps
+        // whole bodies, so the rules run once over the assembled text — a
+        // pattern spanning a chunk boundary is caught here, not missed.
+        let redact_captured = |text: &str| {
+            let redacted = config.redactor.apply(text);
+            if redacted.len() <= config.capture_max_bytes {
+                return redacted;
+            }
+            let mut out = String::new();
+            append_capped(&mut out, redacted.as_bytes(), config.capture_max_bytes);
+            out
+        };
+        let exchange = CapturedExchange {
+            id: self.id,
+            timestamp_ms: capture.timestamp_ms,
+            duration_ms,
+            method: std::mem::take(&mut capture.method),
+            uri: std::mem::take(&mut capture.uri),
+            request_headers: std::mem::take(&mut capture.request_headers),
+            request_body: redact_captured(&capture.request_body),
+            request_bytes,
+            request_truncated: capture.request_truncated,
+            model: model.map(str::to_string),
+            provider: provider.map(str::to_string),
+            key: key.map(str::to_string),
+            client: client.map(str::to_string),
+            attempts,
+            status,
+            response_headers: std::mem::take(&mut capture.response_headers),
+            response_body: redact_captured(&capture.response_body),
+            response_bytes,
+            response_truncated: capture.response_truncated,
+            upstream_attempts: capture
+                .attempts
+                .iter_mut()
+                .map(|attempt| CapturedAttempt {
+                    provider: attempt.provider.take(),
+                    key: attempt.key.take(),
+                    method: std::mem::take(&mut attempt.method),
+                    url: std::mem::take(&mut attempt.url),
+                    status: attempt.status,
+                    headers: std::mem::take(&mut attempt.headers),
+                    response_headers: std::mem::take(&mut attempt.response_headers),
+                    response_body: redact_captured(&attempt.response_body),
+                })
+                .collect(),
+        };
+        writer.record(exchange);
     }
 
     /// Report the outcome once the request is finished.
@@ -390,6 +591,200 @@ mod tests {
         );
     }
 
+    /// A capture-only config writing to a fresh temp file.
+    fn capturing(name: &str, redactor: Redactor) -> (Dump, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aibroker-dump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let writer = crate::proxy::parquet::CaptureWriter::create(&path).unwrap();
+        let config = DumpConfig {
+            capture: Some(writer),
+            redactor,
+            ..DumpConfig::default()
+        };
+        (Dump::new(config), path)
+    }
+
+    fn captured_rows(path: &std::path::Path) -> Vec<crate::proxy::parquet::CapturedExchange> {
+        use arrow_array::{StringArray, UInt16Array, UInt64Array};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let batches = loop {
+            if let Ok(file) = std::fs::File::open(path)
+                && let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(file)
+                && let Ok(reader) = builder.build()
+            {
+                let batches: Vec<_> = reader.map(|b| b.unwrap()).collect();
+                if !batches.is_empty() {
+                    break batches;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no rows landed in {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        let mut rows = Vec::new();
+        for batch in batches {
+            let string = |name: &str, i: usize| {
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(i)
+                    .to_string()
+            };
+            for i in 0..batch.num_rows() {
+                rows.push(crate::proxy::parquet::CapturedExchange {
+                    id: batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap()
+                        .value(i),
+                    status: batch
+                        .column_by_name("status")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<UInt16Array>()
+                        .unwrap()
+                        .value(i)
+                        .into(),
+                    method: string("method", i),
+                    uri: string("uri", i),
+                    request_headers: string("request_headers", i),
+                    request_body: string("request_body", i),
+                    response_headers: string("response_headers", i),
+                    response_body: string("response_body", i),
+                    upstream_attempts: serde_json::from_str::<Vec<serde_json::Value>>(&string(
+                        "upstream_attempts",
+                        i,
+                    ))
+                    .unwrap()
+                    .into_iter()
+                    .map(|attempt| crate::proxy::parquet::CapturedAttempt {
+                        provider: attempt["provider"].as_str().map(str::to_string),
+                        key: attempt["key"].as_str().map(str::to_string),
+                        status: attempt["status"].as_u64().map(|s| s as u16),
+                        ..Default::default()
+                    })
+                    .collect(),
+                    ..Default::default()
+                });
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn capture_only_config_is_enabled_without_log_flags() {
+        // `-w` alone must attach the dump state; gating on the log flags only
+        // would silently capture nothing.
+        let (dump, path) = capturing("enabled.parquet", Redactor::default());
+        assert!(dump.config.enabled());
+        assert!(dump.capture.is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_complete_exchange_lands_in_the_parquet_file() {
+        let (mut dump, path) = capturing("exchange.parquet", Redactor::default());
+        let req = headers(&[("Content-Type", "application/json")]);
+        dump.request_headers("POST", "/v1/chat/completions", "HTTP/1.1", &req);
+        dump.request_body(b"{\"model\":\"m\",");
+        dump.request_body(b"\"messages\":[]}");
+        let mut upstream = headers(&[("Authorization", "Bearer sk-upstream-secret")]);
+        upstream.insert_header("Host", "upstream.test").unwrap();
+        dump.upstream_request(&upstream, Some("openai"), Some("k1"));
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("Content-Type", "application/json")
+            .unwrap();
+        dump.response_headers(200, &resp);
+        dump.response_body(b"{\"id\":\"ok\"}", true);
+        dump.finish(Some(200), 1, Some("openai"), Some("k1"), Some("m"), None);
+
+        let rows = captured_rows(&path);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, dump.id());
+        assert_eq!(row.method, "POST");
+        assert_eq!(row.uri, "/v1/chat/completions");
+        assert_eq!(row.status, Some(200));
+        // The body arrived in two chunks; the file must hold both.
+        assert_eq!(row.request_body, "{\"model\":\"m\",\"messages\":[]}");
+        assert_eq!(row.response_body, "{\"id\":\"ok\"}");
+        // The provider credential never reaches the file.
+        assert!(!row.request_headers.contains("sk-upstream-secret"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_secret_in_a_captured_body_is_redacted_before_it_is_stored() {
+        let redactor =
+            Redactor::new(&[("tok-[0-9a-f]{8}".to_string(), "<tok>".to_string())]).unwrap();
+        let (mut dump, path) = capturing("redacted.parquet", redactor);
+        let req = headers(&[]);
+        dump.request_headers("POST", "/v1/chat/completions", "HTTP/1.1", &req);
+        dump.request_body(b"{\"prompt\":\"use tok-deadbeef please\"}");
+        dump.response_body(b"data: {\"note\":\"tok-deadbeef\"}\n\n", true);
+        dump.finish(Some(200), 1, None, None, None, None);
+
+        let rows = captured_rows(&path);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].request_body.contains("<tok>"),
+            "{}",
+            rows[0].request_body
+        );
+        assert!(!rows[0].request_body.contains("tok-deadbeef"));
+        assert!(!rows[0].response_body.contains("tok-deadbeef"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_rotation_keeps_each_attempts_response() {
+        let (mut dump, path) = capturing("rotation.parquet", Redactor::default());
+        let req = headers(&[]);
+        dump.request_headers("POST", "/v1/chat/completions", "HTTP/1.1", &req);
+        let body = b"{\"model\":\"m\"}";
+        dump.request_body(body);
+        // Attempt 1: 429 on k1.
+        dump.upstream_request(&headers(&[]), Some("openai"), Some("k1"));
+        let mut resp = ResponseHeader::build(429, None).unwrap();
+        resp.insert_header("Retry-After", "1").unwrap();
+        dump.response_headers(429, &resp);
+        dump.response_body(b"{\"error\":\"rate limited\"}", true);
+        // pingora replays the same body for attempt 2.
+        dump.request_body(body);
+        dump.upstream_request(&headers(&[]), Some("openai"), Some("k2"));
+        let resp = ResponseHeader::build(200, None).unwrap();
+        dump.response_headers(200, &resp);
+        dump.response_body(b"{\"id\":\"ok\"}", true);
+        dump.finish(Some(200), 2, Some("openai"), Some("k2"), Some("m"), None);
+
+        assert_eq!(
+            dump.request_bytes,
+            body.len(),
+            "a replay is not a bigger request"
+        );
+        let rows = captured_rows(&path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_body, "{\"model\":\"m\"}");
+        assert_eq!(rows[0].response_body, "{\"id\":\"ok\"}");
+        // Each attempt keeps its own routing, not just the final one.
+        assert_eq!(rows[0].upstream_attempts.len(), 2);
+        assert_eq!(rows[0].upstream_attempts[0].key.as_deref(), Some("k1"));
+        assert_eq!(rows[0].upstream_attempts[0].status, Some(429));
+        assert_eq!(rows[0].upstream_attempts[1].key.as_deref(), Some("k2"));
+        assert_eq!(rows[0].upstream_attempts[1].status, Some(200));
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn header_values_keep_their_exact_form() {
         let req = headers(&[("content-type", "application/json; charset=utf-8")]);
@@ -481,6 +876,7 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
             .unwrap(),
+            ..DumpConfig::default()
         }
     }
 

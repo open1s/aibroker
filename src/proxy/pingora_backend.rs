@@ -1068,7 +1068,7 @@ impl ProxyHttp for ProxyService {
         }
 
         if let Some(dump) = ctx.dump.as_mut() {
-            dump.upstream_request(req);
+            dump.upstream_request(req, Some(&provider), Some(&key_id));
         }
 
         Ok(())
@@ -1273,6 +1273,21 @@ impl ProxyHttp for ProxyService {
                     |value| Some(value.saturating_sub(1)),
                 )
                 .ok();
+        }
+
+        // The parquet capture (`-w`) gets its row here: this phase runs for
+        // every request, including ones refused at the edge, and the outcome
+        // is final by now.
+        let key_id = ctx.key_id().map(str::to_string);
+        if let Some(dump) = ctx.dump.as_mut() {
+            dump.finish(
+                ctx.upstream_status,
+                ctx.attempts,
+                ctx.provider.as_deref(),
+                key_id.as_deref(),
+                ctx.model.as_deref(),
+                ctx.client_name.as_deref(),
+            );
         }
     }
 }

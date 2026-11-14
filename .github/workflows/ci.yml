@@ -20,13 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to the channel in rust-toolchain.toml. `@stable` floats, so a
-      # new Rust release could fail this job with no source change (Rust 1.99
-      # deprecating `Atomic::fetch_update` did exactly that).
+      # Keep in step with rust-toolchain.toml (stable). A new Rust release
+      # can fail this job with no source change; fix the fallout rather than
+      # pinning silently.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99.0
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -64,9 +63,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99.0
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2

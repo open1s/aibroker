@@ -1,0 +1,57 @@
+# =============================================================================
+# BSH file-tool ignore rules
+# =============================================================================
+#
+# The workspace file tools (list_dir, read_file, read_files, write_file,
+# edit_file, apply_patch, glob, grep) skip every path that matches a pattern
+# here. The format is .gitignore's: one pattern per line, # starts a comment,
+# a trailing / matches directories only, a leading / anchors a pattern to the
+# workspace root, * and ** glob, and a leading ! re-includes a path.
+#
+# Patterns are relative to the workspace root (the folder that holds .bsh).
+# The common trees below are COMMENTED OUT on purpose: a fresh workspace
+# filters nothing. Delete the leading # from a line to start ignoring it.
+#
+# .bsh and .bos are always excluded from the file tools and need no rule here.
+# This file is BSH's own: the model cannot read or edit .bsh, so change it here.
+# =============================================================================
+
+# Dependencies, virtualenvs and Python caches
+# node_modules
+# __pycache__
+# .venv
+# venv
+# vendor
+# .pytest_cache
+# .mypy_cache
+# .tox
+
+# Version control
+# .git
+# .jj
+# .svn
+# .hg
+
+# Editors and OS metadata
+# .vscode
+# .idea
+# .DS_Store
+
+# Build output and caches
+# target
+# dist
+# build
+# out
+# coverage
+# .next
+# .nuxt
+# .svelte-kit
+# .turbo
+# .vite
+# .cache
+# .gradle
+
+# Local logs and temporary files
+# *.log
+# *.tmp
+# *.swp

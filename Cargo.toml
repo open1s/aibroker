@@ -39,6 +39,14 @@ regorus = { version = "0.12.0", default-features = false, features = ["std", "ar
 # this adds no new transitive dependency.
 regex = "1.13.1"
 
+# Parquet output for `-w/--write-file` traffic capture. Compression features
+# are off: an uncompressed file needs no codec dependency and every parquet
+# reader opens it. Pinned to =60.0.0 (the whole arrow family moves in
+# lockstep) so an offline build resolves against the local registry.
+parquet = { version = "=60.0.0", default-features = false, features = ["arrow"] }
+arrow-array = "=60.0.0"
+arrow-schema = "=60.0.0"
+
 # Utilities
 parking_lot = "0.12.5"
 # OS entropy for the dashboard's per-process refresh token. Already in the tree
