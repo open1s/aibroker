@@ -910,7 +910,7 @@ tested directly; the pingora layer is a thin adapter over it.
 
 ```bash
 cargo build
-cargo test                 # 329 unit + 32 integration tests
+cargo test                 # 342 unit + 34 integration tests
 cargo fmt
 cargo clippy --all-targets
 ```

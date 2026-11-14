@@ -107,6 +107,13 @@ pub struct Dump {
     request_bytes: usize,
     response_bytes: usize,
     request_headers_done: bool,
+    /// How many upstream attempts have started (`upstream_request` calls).
+    /// pingora replays the buffered body from the start on every attempt after
+    /// the first, so this is what tells a replay apart from more of the body.
+    attempts_started: u32,
+    /// Set once a retried attempt's replay has been reported in the log, so one
+    /// line covers the whole replayed body rather than one per chunk.
+    replay_logged: bool,
     capture: Option<Capture>,
 }
 
@@ -123,8 +130,6 @@ struct Capture {
     request_headers: String,
     request_body: String,
     request_truncated: bool,
-    /// The body of the first chunk, used to recognise pingora's retry replay.
-    first_chunk: Vec<u8>,
     response_headers: String,
     response_body: String,
     response_truncated: bool,
@@ -157,6 +162,8 @@ impl Dump {
             request_bytes: 0,
             response_bytes: 0,
             request_headers_done: false,
+            attempts_started: 0,
+            replay_logged: false,
             capture,
         }
     }
@@ -217,6 +224,12 @@ impl Dump {
         if !self.config.dump_request && !self.config.capturing() {
             return;
         }
+        // A new attempt starts here, and with it a fresh body: pingora replays
+        // the buffered request body from the first byte on every attempt after
+        // the first, so the per-attempt counter is the reliable signal that the
+        // chunks which follow are a replay rather than more of the body.
+        self.attempts_started = self.attempts_started.saturating_add(1);
+        self.replay_logged = false;
         let rendered = self.redact(&render_headers(req.headers.iter()));
         if let Some(capture) = self.capture.as_mut() {
             // A new attempt starts here: `upstream_peer` re-runs on every key
@@ -252,40 +265,26 @@ impl Dump {
         if !self.config.dump_request && !self.config.capturing() {
             return;
         }
-        if self.request_bytes == 0 {
-            self.request_bytes = chunk.len();
-            if let Some(capture) = self.capture.as_mut() {
-                capture.first_chunk = chunk.to_vec();
-                capture.request_truncated |= append_capped(
-                    &mut capture.request_body,
-                    chunk,
-                    self.config.capture_max_bytes,
-                );
-            }
-            if self.config.dump_request {
-                let message = self.request_body_message(chunk);
-                self.emit("req body", &message);
-            }
-            return;
-        }
-        if self.request_bytes == chunk.len() {
-            // pingora replays the buffered body verbatim on a key rotation:
-            // the same request, not a bigger one. The capture checks the
-            // bytes too, so a same-length *different* chunk is not swallowed.
-            let replay = self
-                .capture
-                .as_ref()
-                .is_none_or(|capture| capture.first_chunk == chunk);
-            if replay {
+        // pingora replays the whole buffered body on every attempt after the
+        // first, and a body larger than its read buffer comes back chunk by
+        // chunk. Comparing one chunk against the running total only recognised
+        // a single-chunk replay, so a multi-chunk body was appended a second
+        // time and the capture held the request twice. The attempt counter is
+        // the reliable signal: anything arriving while `attempts_started > 1`
+        // belongs to a replay of bytes already captured.
+        if self.attempts_started > 1 {
+            if !self.replay_logged {
+                self.replay_logged = true;
                 if self.config.dump_request {
                     self.emit(
                         "req body",
-                        &format!("replayed {} bytes (retry)", chunk.len()),
+                        &format!("replaying the {} byte body for a retry", self.request_bytes),
                     );
                 }
-                return;
             }
+            return;
         }
+        let first_chunk = self.request_bytes == 0;
         if let Some(capture) = self.capture.as_mut() {
             capture.request_truncated |= append_capped(
                 &mut capture.request_body,
@@ -293,9 +292,13 @@ impl Dump {
                 self.config.capture_max_bytes,
             );
         }
-        // A large upload arrives as many chunks. Print nothing further: the
-        // first chunk showed the payload's shape and the summary reports the
-        // total, so per-chunk progress would only bury it.
+        // A large upload arrives as many chunks. Print only the first: it shows
+        // the payload's shape and the summary reports the total, so per-chunk
+        // progress would only bury it.
+        if first_chunk && self.config.dump_request {
+            let message = self.request_body_message(chunk);
+            self.emit("req body", &message);
+        }
         self.request_bytes += chunk.len();
     }
 
@@ -628,6 +631,15 @@ mod tests {
         };
         let mut rows = Vec::new();
         for batch in batches {
+            let u64_of = |name: &str, i: usize| {
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(i)
+            };
             let string = |name: &str, i: usize| {
                 batch
                     .column_by_name(name)
@@ -661,6 +673,8 @@ mod tests {
                     request_body: string("request_body", i),
                     response_headers: string("response_headers", i),
                     response_body: string("response_body", i),
+                    request_bytes: u64_of("request_bytes", i),
+                    response_bytes: u64_of("response_bytes", i),
                     upstream_attempts: serde_json::from_str::<Vec<serde_json::Value>>(&string(
                         "upstream_attempts",
                         i,
@@ -752,16 +766,16 @@ mod tests {
         let req = headers(&[]);
         dump.request_headers("POST", "/v1/chat/completions", "HTTP/1.1", &req);
         let body = b"{\"model\":\"m\"}";
-        dump.request_body(body);
-        // Attempt 1: 429 on k1.
+        // Attempt 1: 429 on k1. Pingora sends the request header, then the body.
         dump.upstream_request(&headers(&[]), Some("openai"), Some("k1"));
+        dump.request_body(body);
         let mut resp = ResponseHeader::build(429, None).unwrap();
         resp.insert_header("Retry-After", "1").unwrap();
         dump.response_headers(429, &resp);
         dump.response_body(b"{\"error\":\"rate limited\"}", true);
-        // pingora replays the same body for attempt 2.
-        dump.request_body(body);
+        // Attempt 2: a rotation re-runs the header filter, then replays the body.
         dump.upstream_request(&headers(&[]), Some("openai"), Some("k2"));
+        dump.request_body(body);
         let resp = ResponseHeader::build(200, None).unwrap();
         dump.response_headers(200, &resp);
         dump.response_body(b"{\"id\":\"ok\"}", true);
@@ -839,15 +853,63 @@ mod tests {
             ..DumpConfig::default()
         });
         let body = br#"{"model":"m","messages":[]}"#;
+        let req = headers(&[]);
+        dump.upstream_request(&req, Some("openai"), Some("k1"));
         dump.request_body(body);
         assert_eq!(dump.request_bytes, body.len());
-        // pingora replays exactly the same body when rotating keys.
+        // A rotation re-enters `upstream_peer`, then pingora replays exactly the
+        // same body. The replay follows a new attempt; it is not a bare second
+        // body chunk on the same attempt.
+        dump.upstream_request(&req, Some("openai"), Some("k2"));
         dump.request_body(body);
         assert_eq!(
             dump.request_bytes,
             body.len(),
             "a retry is the same request, not a bigger one"
         );
+    }
+
+    #[test]
+    fn a_replayed_multi_chunk_body_is_captured_once() {
+        // A request bigger than pingora's read buffer arrives as several chunks,
+        // and a rotation replays all of them. Judging a replay by "this chunk is
+        // as long as the total so far" only ever catches the single-chunk case,
+        // so a large body was captured twice -- a duplicated JSON document that
+        // no longer parsed.
+        let (mut dump, path) = capturing("replay-multi.parquet", Redactor::default());
+        let req = headers(&[("Content-Type", "application/json")]);
+        dump.request_headers("POST", "/v1/chat/completions", "HTTP/1.1", &req);
+        let a = b"{\"model\":\"m\"," as &[u8];
+        let b = b"\"messages\":[\"x\"," as &[u8];
+        let c = b"\"y\"]}" as &[u8];
+        dump.upstream_request(&req, Some("openai"), Some("k1"));
+        for chunk in [a, b, c] {
+            dump.request_body(chunk);
+        }
+        let total = a.len() + b.len() + c.len();
+        assert_eq!(dump.request_bytes, total);
+
+        // Attempt 2 replays the same chunks.
+        dump.upstream_request(&req, Some("openai"), Some("k2"));
+        for chunk in [a, b, c] {
+            dump.request_body(chunk);
+        }
+        assert_eq!(
+            dump.request_bytes, total,
+            "a replay is not a bigger request"
+        );
+        dump.finish(Some(200), 2, Some("openai"), Some("k2"), Some("m"), None);
+
+        let rows = captured_rows(&path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].request_body,
+            r#"{"model":"m","messages":["x","y"]}"#
+        );
+        assert_eq!(rows[0].request_bytes, total as u64);
+        serde_json::from_str::<serde_json::Value>(&rows[0].request_body)
+            .expect("the captured body must still be one valid JSON document");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

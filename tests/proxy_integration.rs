@@ -239,6 +239,16 @@ fn assert_nothing_was_forwarded(seen: &Arc<Mutex<Vec<SeenRequest>>>, why: &str) 
 /// actually wrote to -- a counter is the only way to prove a diagnostic path
 /// ran, when by design it changes no response.
 fn spawn_broker_with_runtime(config: Config, port: u16) -> aibroker::core::runtime::SharedRuntime {
+    spawn_broker_with_dump(config, port, aibroker::proxy::dump::DumpConfig::default())
+}
+
+/// Start the broker with a specific dump configuration, so a test can turn on
+/// the `-w` parquet capture.
+fn spawn_broker_with_dump(
+    config: Config,
+    port: u16,
+    dump: aibroker::proxy::dump::DumpConfig,
+) -> aibroker::core::runtime::SharedRuntime {
     let runtime = shared(Runtime::new(config.clone(), None).expect("runtime"));
     // Touch the metrics/admin plumbing so the same code path as production is
     // exercised, even though these tests do not call the control plane.
@@ -253,11 +263,7 @@ fn spawn_broker_with_runtime(config: Config, port: u16) -> aibroker::core::runti
 
     let for_server = Arc::clone(&runtime);
     std::thread::spawn(move || {
-        let _ = run_server(
-            config,
-            for_server,
-            aibroker::proxy::dump::DumpConfig::default(),
-        );
+        let _ = run_server(config, for_server, dump);
     });
 
     wait_for_port(port);
@@ -592,6 +598,126 @@ fn rate_limited_key_is_rotated_within_the_same_request() {
         "the retried body must be intact: {}",
         requests[1].body
     );
+}
+
+#[test]
+fn a_captured_rotation_attributes_each_attempt_to_its_own_key() {
+    // The parquet capture is the only record of *which* key produced the 429, so
+    // the attribution has to survive a rotation. The unit test in
+    // `proxy::dump` drives the same calls by hand; this one goes through
+    // pingora's real retry path, where `upstream_peer` re-runs and only the last
+    // attempt's routing is left in the context by the time `logging` runs.
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let _seen = spawn_mock(upstream_port, vec![429, 200]);
+
+    let path = std::env::temp_dir().join(format!(
+        "aibroker-capture-rotation-{}.parquet",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let capture = aibroker::proxy::parquet::CaptureWriter::create(&path).expect("capture writer");
+    let dump = aibroker::proxy::dump::DumpConfig {
+        capture: Some(capture),
+        ..Default::default()
+    };
+
+    let config = base_config(
+        proxy_port,
+        vec![provider(
+            "primary",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key-a", "sk-key-a"), ("key-b", "sk-key-b")],
+        )],
+        vec![RouteConfig {
+            model: "test-model".into(),
+            providers: vec!["primary".into()],
+            strategy: None,
+            rewrite: false,
+        }],
+    );
+    let _runtime = spawn_broker_with_dump(config, proxy_port, dump);
+
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(response.status, 200, "{}", response.status_line);
+
+    let attempts = read_captured_attempts(&path);
+    assert_eq!(attempts.len(), 1, "one request, one row: {attempts:?}");
+    let attempts = &attempts[0];
+    assert_eq!(attempts.len(), 2, "both attempts must be recorded");
+    assert_eq!(
+        attempts[0],
+        ("primary".to_string(), "key-a".to_string(), 429),
+        "the first attempt must name the key that was rate limited"
+    );
+    assert_eq!(
+        attempts[1],
+        ("primary".to_string(), "key-b".to_string(), 200),
+        "the retry must name the key that served it"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Read `(provider, key, status)` for every upstream attempt of every captured
+/// row, waiting for the writer thread to publish the first row.
+fn read_captured_attempts(path: &std::path::Path) -> Vec<Vec<(String, String, u16)>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = std::fs::File::open(path)
+            .ok()
+            .and_then(|file| ParquetRecordBatchReaderBuilder::try_new(file).ok())
+            .and_then(|builder| builder.build().ok())
+            .map(|reader| {
+                let mut rows = Vec::new();
+                for batch in reader.flatten() {
+                    let column = batch
+                        .column_by_name("upstream_attempts")
+                        .expect("upstream_attempts column")
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .expect("upstream_attempts is a string column");
+                    for value in column.iter().flatten() {
+                        let parsed: Vec<serde_json::Value> =
+                            serde_json::from_str(value).expect("attempts are JSON");
+                        rows.push(
+                            parsed
+                                .iter()
+                                .map(|attempt| {
+                                    let text = |name: &str| {
+                                        attempt[name]
+                                            .as_str()
+                                            .unwrap_or_else(|| panic!("attempt has no {name}"))
+                                            .to_string()
+                                    };
+                                    (
+                                        text("provider"),
+                                        text("key"),
+                                        attempt["status"].as_u64().unwrap_or(0) as u16,
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+                rows
+            })
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            return rows;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no rows landed in {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
