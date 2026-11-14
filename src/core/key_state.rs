@@ -489,8 +489,10 @@ impl KeyState {
         }
     }
 
-    /// Like [`KeyState::availability`] but does not consume rate-limit budget.
-    /// Used by metrics and by the "would this ever work" fast path.
+    /// Like [`KeyState::availability`] but does not consume rate-limit budget
+    /// and does not latch the half-open probe. This is the gate selection
+    /// filters candidates with: a key that merely *passes* the filter must not
+    /// spend quota or claim the probe slot before the strategy picks it.
     pub fn probe_availability(
         &self,
         estimated_tokens: u64,
@@ -505,6 +507,20 @@ impl KeyState {
             && self.in_flight() >= max
         {
             return Err(UnavailableReason::Concurrency);
+        }
+        // Same circuit rule as `availability`, minus the latch: while a
+        // half-open probe is actually in flight, no second request may be
+        // offered this key. An open circuit with nothing in flight still
+        // passes, so the key can be chosen as the next probe.
+        {
+            let health = self.health.read();
+            if health.score < 0.3
+                && health.consecutive_failures >= 2
+                && health.half_open_probe_in_flight
+                && self.in_flight() > 0
+            {
+                return Err(UnavailableReason::CircuitOpen);
+            }
         }
         let now = Instant::now();
         let mut limiter = self.limiter.lock();
@@ -983,6 +999,37 @@ mod tests {
             key.availability(0).unwrap_err(),
             UnavailableReason::RateLimited
         );
+    }
+
+    #[test]
+    fn probing_never_consumes_budget_or_latches_the_probe() {
+        // Selection filters candidates with `probe_availability`; if the probe
+        // consumed budget, every viable key would be billed for a request it
+        // never served, and a collapsed key merely examined would claim the
+        // half-open probe slot without sending anything.
+        let key = key_with(Some(1), Some(100));
+        for _ in 0..5 {
+            assert_eq!(key.probe_availability(50), Ok(()));
+        }
+        assert_eq!(key.observed_rates(), (0, 0), "probes must not charge");
+
+        collapse(&key);
+        for _ in 0..3 {
+            assert_eq!(
+                key.probe_availability(0),
+                Ok(()),
+                "an open circuit with nothing in flight may be probed repeatedly"
+            );
+        }
+        // The consuming gate still hands out exactly one probe.
+        assert_eq!(key.availability(0), Ok(()));
+        let guard = key.reserve();
+        assert_eq!(
+            key.probe_availability(0).unwrap_err(),
+            UnavailableReason::CircuitOpen,
+            "while the probe is in flight the probe gate must refuse too"
+        );
+        drop(guard);
     }
 
     #[test]

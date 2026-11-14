@@ -10,6 +10,7 @@ config.toml
 /broker-*.log
 /local-config.toml
 /.bsh
+/.bos
 
 # CI log downloads
 /.ci-*.log

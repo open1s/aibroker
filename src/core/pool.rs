@@ -277,9 +277,16 @@ impl KeyPool {
     ) -> Option<Arc<KeyState>> {
         // Only keys that pass the availability gate become candidates, so the
         // strategy cannot hand back a key that is on cooldown or out of quota.
+        //
+        // The gate must be the *non-consuming* probe: `availability` charges
+        // the RPM/TPM window, and this loop runs over every candidate of every
+        // tier and every fallback strategy. Charging here billed one request
+        // to every viable key -- a three-key pool burned three RPM slots per
+        // dispatch, and a fallback pass billed the survivors twice. Only the
+        // key the strategy actually picks may spend budget.
         let mut viable: Vec<(usize, &Arc<KeyState>)> = Vec::with_capacity(considered.len());
         for key in considered {
-            match key.availability(estimated_tokens) {
+            match key.probe_availability(estimated_tokens) {
                 // The viable list is dense, so its index *is* the candidate
                 // index that the strategy returns.
                 Ok(()) => viable.push((viable.len(), key)),
@@ -295,14 +302,32 @@ impl KeyPool {
             return None;
         }
 
-        let candidates: Vec<Candidate> = viable
-            .iter()
-            .map(|(position, key)| Candidate::snapshot(*position, key))
-            .collect();
-
-        let chosen = select(strategy, &candidates, &self.counter, self.tolerance);
-        // `chosen` indexes the dense viable slice built above.
-        viable.get(chosen).map(|(_, key)| Arc::clone(key))
+        // The probe only said the key *could* take the request; nothing was
+        // charged yet. Another thread may have taken the last slot since, so
+        // the winner is charged through the consuming gate, and a lost race
+        // falls back to the remaining candidates rather than over-admitting.
+        let mut remaining = viable;
+        while !remaining.is_empty() {
+            let candidates: Vec<Candidate> = remaining
+                .iter()
+                .map(|(position, key)| Candidate::snapshot(*position, key))
+                .collect();
+            let chosen = select(strategy, &candidates, &self.counter, self.tolerance);
+            // `chosen` indexes the dense slice built above.
+            let Some((_, key)) = remaining.get(chosen) else {
+                break;
+            };
+            match key.availability(estimated_tokens) {
+                Ok(()) => return Some(Arc::clone(key)),
+                Err(reason) => {
+                    if !reasons.contains(&reason) {
+                        reasons.push(reason);
+                    }
+                    remaining.remove(chosen);
+                }
+            }
+        }
+        None
     }
 
     /// Earliest instant at which any key could accept work.
@@ -562,6 +587,134 @@ mod tests {
         assert_eq!(first.id, "a");
         assert_eq!(second.id, "b");
         assert_eq!(third.id, "a");
+    }
+
+    #[test]
+    fn selection_charges_only_the_chosen_key() {
+        // Regression: `try_strategy` filtered candidates with the *consuming*
+        // availability gate, so every viable key was billed one request per
+        // dispatch. A three-key pool at max_rpm=3 served one request instead
+        // of three: the two keys that merely passed the filter had spent their
+        // whole window without sending anything.
+        let pool = pool_of(
+            vec![
+                key_config("a", &[], Some(3)),
+                key_config("b", &[], Some(3)),
+                key_config("c", &[], Some(3)),
+            ],
+            Strategy::RoundRobin,
+        );
+        let empty = HashSet::new();
+        // The exact rotation order depends on where the shared counter stands
+        // when a key exhausts; the invariant is the budget: nine dispatches,
+        // three per key, and nothing charged to a key that was not chosen.
+        for dispatch in 0..9 {
+            pool.select(None, &empty, 0)
+                .unwrap_or_else(|e| panic!("dispatch {dispatch}: {e}"));
+        }
+        for id in ["a", "b", "c"] {
+            assert_eq!(
+                pool.key(id).unwrap().observed_rates().0,
+                3,
+                "key {id} must have been charged exactly its own dispatches"
+            );
+        }
+        assert!(
+            pool.select(None, &empty, 0).is_err(),
+            "the pool is genuinely exhausted after 9 dispatches"
+        );
+    }
+
+    #[test]
+    fn a_fallback_pass_does_not_bill_the_survivors_twice() {
+        // The consuming filter also ran once per fallback strategy: a pool
+        // rescued by its fallback paid for every candidate on every pass.
+        // Here the declaring key is out of RPM, so the declared tier fails
+        // under both strategies before the others tier serves the request;
+        // the healthy key must be charged once, not once per pass.
+        let pool = KeyPool::from_config(
+            &provider_config(vec![
+                key_config("declares", &["m"], Some(1)),
+                key_config("silent", &[], Some(2)),
+            ]),
+            Strategy::UsageBased,
+            vec![Strategy::RoundRobin],
+            0.0,
+            CooldownPolicy::default(),
+            HealthTuning::default(),
+        )
+        .unwrap();
+        let empty = HashSet::new();
+        assert_eq!(pool.select(Some("m"), &empty, 0).unwrap().id, "declares");
+        assert_eq!(pool.key("silent").unwrap().observed_rates().0, 0);
+
+        assert_eq!(pool.select(Some("m"), &empty, 0).unwrap().id, "silent");
+        assert_eq!(
+            pool.key("silent").unwrap().observed_rates().0,
+            1,
+            "one dispatch must cost one request sample, however many passes ran"
+        );
+        assert_eq!(pool.select(Some("m"), &empty, 0).unwrap().id, "silent");
+        assert!(pool.select(Some("m"), &empty, 0).is_err());
+    }
+
+    #[test]
+    fn selection_charges_the_token_estimate_only_on_the_chosen_key() {
+        // Same defect on the TPM side: the estimate was charged to every
+        // candidate that passed the filter, so unchosen keys looked busy and
+        // `usage_based` ranked them by traffic they never served.
+        let mut a = key_config("a", &[], None);
+        a.max_tpm = Some(1_000);
+        let mut b = key_config("b", &[], None);
+        b.max_tpm = Some(1_000);
+        let pool = pool_of(vec![a, b], Strategy::RoundRobin);
+        let empty = HashSet::new();
+        assert_eq!(pool.select(None, &empty, 400).unwrap().id, "a");
+        assert_eq!(pool.key("a").unwrap().observed_rates().1, 400);
+        assert_eq!(
+            pool.key("b").unwrap().observed_rates().1,
+            0,
+            "a key that merely passed the filter must not be charged"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_key_offers_one_probe_and_the_rest_of_the_pool_serves() {
+        // The non-consuming filter must keep the circuit rule: an open circuit
+        // with a probe in flight refuses, and an unchosen collapsed key never
+        // latches the probe slot (it is only claimed by the consuming gate on
+        // the winner).
+        let pool = pool_of(
+            vec![key_config("sick", &[], None), key_config("well", &[], None)],
+            Strategy::RoundRobin,
+        );
+        let sick = pool.key("sick").unwrap();
+        let policy = CooldownPolicy::default();
+        let tuning = HealthTuning::default();
+        for _ in 0..6 {
+            sick.record_failure(&policy, &tuning);
+        }
+        sick.cooldown_for(Duration::ZERO);
+
+        let empty = HashSet::new();
+        let first = pool.select(None, &empty, 0).unwrap();
+        assert_eq!(first.id, "sick", "the elapsed cooldown offers the probe");
+        let guard = first.reserve();
+        // While the probe is in flight the circuit stays open for selection.
+        assert_eq!(pool.select(None, &empty, 0).unwrap().id, "well");
+        assert_eq!(pool.select(None, &empty, 0).unwrap().id, "well");
+        guard.complete(
+            crate::core::key_state::Outcome::Success,
+            Duration::from_millis(10),
+            crate::core::key_state::TokenUsage::default(),
+            &policy,
+            &tuning,
+        );
+        // One success closes the circuit; the key rotates normally again.
+        let ids: Vec<String> = (0..2)
+            .map(|_| pool.select(None, &empty, 0).unwrap().id.clone())
+            .collect();
+        assert!(ids.contains(&"sick".to_string()));
     }
 
     #[test]
