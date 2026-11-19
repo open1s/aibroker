@@ -1469,6 +1469,22 @@ pub fn runtime_from_config(
 ///
 /// `dump` turns on request/response diagnostics for LLM debugging.
 pub fn run_server(config: Config, runtime: SharedRuntime, dump: DumpConfig) -> anyhow::Result<()> {
+    // The MCP endpoint reads recent exchanges from this ring. It is only
+    // created when the endpoint is enabled: retaining prompt bodies is a
+    // deliberate, operator-visible choice, not a side effect of starting up.
+    let capture_store = config.mcp.enabled.then(|| {
+        crate::proxy::capture::CaptureStore::with_body_cap(
+            config.mcp.capture_capacity,
+            config.mcp.capture_max_bytes,
+        )
+    });
+    let mut dump = dump;
+    if let Some(store) = capture_store.clone() {
+        // Keep any store a caller already supplied (integration tests do), but
+        // the endpoint and the dump must share one ring.
+        dump.capture_store = Some(store);
+    }
+
     let server_conf = build_server_conf(&config);
     let mut server = Server::new_with_opt_and_conf(None, server_conf);
     server.bootstrap();
@@ -1508,6 +1524,17 @@ pub fn run_server(config: Config, runtime: SharedRuntime, dump: DumpConfig) -> a
         describe_admin(&config)
     );
     server.add_service(svc);
+
+    // MCP shares this server (and therefore this process's runtime and signal
+    // handling) instead of owning a second, competing `Server`.
+    if config.mcp.enabled {
+        crate::proxy::mcp::add_mcp_service(
+            &mut server,
+            Arc::clone(&runtime),
+            &config.mcp,
+            capture_store,
+        )?;
+    }
 
     server.run_forever();
 }
@@ -1574,6 +1601,7 @@ mod tests {
             health: Default::default(),
             observability: Default::default(),
             admin: Default::default(),
+            mcp: Default::default(),
             clients: Vec::new(),
             dump: Default::default(),
             content_guard: Default::default(),

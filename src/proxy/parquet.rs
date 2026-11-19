@@ -50,9 +50,14 @@ const ROW_GROUP_ROWS: usize = 64;
 const PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// One upstream attempt inside a captured exchange.
-#[derive(Debug, Clone, Default)]
+///
+/// `Serialize` exists for the MCP reader: an agent fetching an exchange must be
+/// able to see the rotation, and every field here has already been redacted.
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CapturedAttempt {
     pub provider: Option<String>,
+    /// The key's *id*, never its value.
+    #[serde(rename = "key_id", skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub method: String,
     pub url: String,
@@ -71,7 +76,9 @@ pub struct CapturedAttempt {
 ///
 /// Every text field has already been through the dump's redactor by the time
 /// it lands here; this struct is transport-only and never sees a raw secret.
-#[derive(Debug, Clone, Default)]
+/// `Serialize` is for the MCP reader (`CaptureStore`), whose whole contract is
+/// that it only ever exposes redacted text.
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CapturedExchange {
     pub id: u64,
     /// Unix epoch milliseconds when the request entered the proxy.
@@ -85,6 +92,8 @@ pub struct CapturedExchange {
     pub request_truncated: bool,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// The key's *id*, never its value.
+    #[serde(rename = "key_id", skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub client: Option<String>,
     pub attempts: u32,

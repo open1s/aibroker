@@ -2,10 +2,12 @@
 
 pub mod admin;
 pub mod body;
+pub mod capture;
 pub mod control;
 pub mod ctx;
 pub mod dashboard;
 pub mod dump;
+pub mod mcp;
 pub mod parquet;
 pub mod payload;
 pub mod pingora_backend;

@@ -895,6 +895,7 @@ mod tests {
             health: Default::default(),
             observability: Default::default(),
             admin: Default::default(),
+            mcp: Default::default(),
             clients: Vec::new(),
             policy: Default::default(),
             dump: Default::default(),

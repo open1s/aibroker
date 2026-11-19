@@ -179,6 +179,7 @@ fn base_config(
         health: Default::default(),
         observability: Default::default(),
         admin: Default::default(),
+        mcp: Default::default(),
         clients: Vec::new(),
         dump: Default::default(),
         content_guard: Default::default(),
@@ -752,6 +753,351 @@ fn a_captured_rotation_attributes_each_attempt_to_its_own_key() {
         "the retry must name the key that served it"
     );
     std::fs::remove_file(&path).ok();
+}
+
+/// The agent-facing promise, end to end: a real proxied exchange lands in the
+/// in-memory capture ring with the provider credential redacted, while the key
+/// *id* stays visible for diagnosis. This is the path the MCP tools read.
+#[test]
+fn the_capture_ring_holds_real_traffic_without_the_provider_key() {
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let _seen = spawn_mock(upstream_port, vec![200]);
+
+    let store = aibroker::proxy::capture::CaptureStore::new(8);
+    let dump = aibroker::proxy::dump::DumpConfig {
+        capture_store: Some(store.clone()),
+        ..Default::default()
+    };
+
+    let config = base_config(
+        proxy_port,
+        vec![provider(
+            "primary",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key-a", "sk-live-provider-secret")],
+        )],
+        vec![RouteConfig {
+            model: "test-model".into(),
+            providers: vec!["primary".into()],
+            strategy: None,
+            rewrite: false,
+        }],
+    );
+    let _runtime = spawn_broker_with_dump(config, proxy_port, dump);
+
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(response.status, 200, "{}", response.status_line);
+
+    let id = wait_for_capture(&store);
+    let exchange = store.get(id).expect("the ring holds the exchange");
+
+    assert_eq!(exchange.status, Some(200));
+    assert_eq!(exchange.model.as_deref(), Some("test-model"));
+    // The id identifies which pooled key served it; the secret must not.
+    assert_eq!(exchange.key.as_deref(), Some("key-a"));
+    let attempt = exchange
+        .upstream_attempts
+        .first()
+        .expect("the upstream attempt is recorded");
+    assert!(
+        attempt.headers.contains("<redacted>"),
+        "the credential header must be visibly redacted: {}",
+        attempt.headers
+    );
+    const SECRET: &str = "sk-live-provider-secret";
+    assert!(
+        !exchange.request_headers.contains(SECRET),
+        "client headers leaked the provider key"
+    );
+    assert!(
+        !attempt.headers.contains(SECRET),
+        "upstream headers leaked the provider key: {}",
+        attempt.headers
+    );
+    assert!(
+        !serde_json::to_string(&exchange).unwrap().contains(SECRET),
+        "the MCP-facing JSON leaked the provider key"
+    );
+}
+
+/// A provider whose credential travels in the query string, the way Google's
+/// ?key= gateways expect it.
+fn query_auth_provider(name: &str, base_url: String, keys: &[(&str, &str)]) -> ProviderConfig {
+    let mut provider = provider(name, base_url, keys);
+    provider.auth = Some("query".into());
+    provider.auth_query_param = Some("key".into());
+    provider
+}
+
+/// POST one JSON-RPC message to the MCP endpoint.
+fn mcp_post(port: u16, token: Option<&str>, message: serde_json::Value) -> HttpResponse {
+    post_as_client(port, "/", &message.to_string(), None, token)
+}
+
+/// POST a JSON-RPC request and return the parsed response.
+fn mcp_rpc(
+    port: u16,
+    token: &str,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let response = mcp_post(
+        port,
+        Some(token),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    );
+    assert_eq!(
+        response.status, 200,
+        "MCP {method} returned {}: {}",
+        response.status_line, response.body
+    );
+    serde_json::from_str(&response.body)
+        .unwrap_or_else(|error| panic!("MCP response is not JSON ({error}): {}", response.body))
+}
+
+/// The JSON payload carried by a successful tool result.
+fn tool_payload(response: &serde_json::Value) -> serde_json::Value {
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    serde_json::from_str(text)
+        .unwrap_or_else(|error| panic!("tool payload is not JSON ({error}): {text}"))
+}
+
+/// The agent-facing promise over the real wire: an MCP client lists and fetches
+/// a proxied exchange, and never receives the provider credential -- including
+/// one that a query-auth provider writes into the URL instead of a header.
+#[test]
+fn mcp_capture_serves_redacted_traffic_without_a_query_credential() {
+    let upstream_port = free_port();
+    let proxy_port = free_port();
+    let mcp_port = free_port();
+    let _seen = spawn_mock(upstream_port, vec![200]);
+
+    const SECRET: &str = "sk-query-SECRET-VALUE";
+    let mut config = base_config(
+        proxy_port,
+        vec![query_auth_provider(
+            "primary",
+            format!("http://127.0.0.1:{upstream_port}"),
+            &[("key-a", SECRET)],
+        )],
+        vec![RouteConfig {
+            model: "test-model".into(),
+            providers: vec!["primary".into()],
+            strategy: None,
+            rewrite: false,
+        }],
+    );
+    config.mcp = aibroker::config::McpConfig {
+        enabled: true,
+        port: mcp_port,
+        token: Some("mcp-test-token".into()),
+        capture_capacity: 8,
+        capture_max_bytes: 64 * 1024,
+        ..Default::default()
+    };
+    spawn_broker_with_dump(
+        config,
+        proxy_port,
+        aibroker::proxy::dump::DumpConfig::default(),
+    );
+    wait_for_port(mcp_port);
+
+    let response = post_with_model(
+        proxy_port,
+        "/v1/chat/completions",
+        CHAT_BODY,
+        Some("test-model"),
+    );
+    assert_eq!(
+        response.status, 200,
+        "{} | {}",
+        response.status_line, response.body
+    );
+
+    // The ring is filled from the logging phase, which can land just after the
+    // response reaches the client: poll instead of racing it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let id = loop {
+        let listed = mcp_rpc(
+            mcp_port,
+            "mcp-test-token",
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "capture_list",
+                "arguments": { "limit": 5 },
+            }),
+        );
+        let payload = tool_payload(&listed);
+        if let Some(id) = payload["exchanges"][0]["id"].as_u64() {
+            break id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "MCP captured nothing: {payload}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let fetched = mcp_rpc(
+        mcp_port,
+        "mcp-test-token",
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "capture_get",
+            "arguments": { "id": id },
+        }),
+    );
+    let exchange = tool_payload(&fetched);
+    let json = serde_json::to_string_pretty(&exchange).unwrap();
+
+    assert!(
+        !json.contains(SECRET),
+        "the MCP payload leaked the query credential: {json}"
+    );
+    // The parameter name survives, so the agent can still see why it was
+    // masked rather than thinking the URL had no credential at all.
+    assert!(
+        json.contains("key=<redacted>"),
+        "the redacted query parameter is missing: {json}"
+    );
+    assert!(json.contains("\"key_id\": \"key-a\""), "{json}");
+    assert!(json.contains("\"model\": \"test-model\""), "{json}");
+}
+
+/// The MCP wire details a Streamable-HTTP client depends on, driven over a real
+/// socket rather than asserted against a unit-test helper.
+#[test]
+fn mcp_handshake_matches_what_a_streamable_http_client_expects() {
+    let proxy_port = free_port();
+    let mcp_port = free_port();
+    let unused = free_port();
+    let mut config = base_config(
+        proxy_port,
+        vec![provider(
+            "unused",
+            format!("http://127.0.0.1:{unused}"),
+            &[("k1", "sk-unused")],
+        )],
+        vec![],
+    );
+    config.mcp = aibroker::config::McpConfig {
+        enabled: true,
+        port: mcp_port,
+        token: Some("mcp-test-token".into()),
+        ..Default::default()
+    };
+    spawn_broker(config, proxy_port);
+    wait_for_port(mcp_port);
+
+    // Fails closed without the credential, and says how to present it.
+    let refused = mcp_post(
+        mcp_port,
+        None,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+    );
+    assert_eq!(refused.status, 401, "{}", refused.status_line);
+    assert_eq!(
+        refused.headers.get("www-authenticate").map(String::as_str),
+        Some("Bearer realm=\"MCP Server\"")
+    );
+
+    // ...and accepts the credential only with the scheme spelled out.
+    let initialized = mcp_rpc(
+        mcp_port,
+        "mcp-test-token",
+        2,
+        "initialize",
+        serde_json::json!({}),
+    );
+    assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(
+        initialized["result"]["serverInfo"]["name"],
+        "llm-broker-mcp"
+    );
+
+    // A notification has no id: 202 with no body. Answering with a JSON-RPC
+    // error here fails the handshake even though authentication succeeded.
+    let notification = mcp_post(
+        mcp_port,
+        Some("mcp-test-token"),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+    assert_eq!(notification.status, 202, "{}", notification.status_line);
+    assert!(
+        notification.body.is_empty(),
+        "notification body: {}",
+        notification.body
+    );
+
+    // ping is part of the protocol; -32601 reads as a broken server.
+    let ping = mcp_rpc(mcp_port, "mcp-test-token", 3, "ping", serde_json::json!({}));
+    assert_eq!(ping["result"], serde_json::json!({}));
+
+    // The capture tools must carry the spec's camelCase inputSchema.
+    let listed = mcp_rpc(
+        mcp_port,
+        "mcp-test-token",
+        4,
+        "tools/list",
+        serde_json::json!({}),
+    );
+    let names = listed["result"]["tools"]
+        .as_array()
+        .expect("tools is an array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"capture_list"), "{listed}");
+    assert!(names.contains(&"capture_get"), "{listed}");
+    assert!(
+        listed["result"]["tools"][0].get("inputSchema").is_some(),
+        "{listed}"
+    );
+    assert!(
+        listed["result"]["tools"][0].get("input_schema").is_none(),
+        "{listed}"
+    );
+
+    // A body larger than one read buffer must still parse. Leading whitespace
+    // is legal JSON, and the old single-chunk read failed on exactly this.
+    let padded = format!(
+        "{}{}",
+        " ".repeat(256 * 1024),
+        r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#
+    );
+    let response = post_as_client(mcp_port, "/", &padded, None, Some("mcp-test-token"));
+    assert_eq!(response.status, 200, "{}", response.status_line);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&response.body).expect("multi-chunk response is JSON");
+    assert_eq!(parsed["result"], serde_json::json!({}));
+}
+
+/// Block until the capture ring has a row, then return its id.
+fn wait_for_capture(store: &aibroker::proxy::capture::CaptureStore) -> u64 {
+    for _ in 0..200 {
+        if let Some(summary) = store.list(1).first() {
+            return summary.id;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("nothing was captured in the ring");
 }
 
 /// Read `(provider, key, status)` for every upstream attempt of every captured

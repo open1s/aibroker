@@ -20,6 +20,14 @@ pub const DEFAULT_PROXY_PORT: u16 = 11436;
 /// [`ServerConfig::graceful_shutdown_secs`]).
 pub const DEFAULT_GRACE_PERIOD_SECS: u64 = 30;
 pub const DEFAULT_ADMIN_PORT: u16 = 11437;
+/// Default port for the MCP endpoint.
+pub const DEFAULT_MCP_PORT: u16 = 8080;
+/// Default host for the MCP endpoint. Loopback: it serves prompt bodies.
+pub const DEFAULT_MCP_HOST: &str = "127.0.0.1";
+/// Default number of recent exchanges retained for MCP readers.
+pub const DEFAULT_MCP_CAPTURE_CAPACITY: usize = 50;
+/// Default per-body cap for the in-memory ring.
+pub const DEFAULT_MCP_CAPTURE_BYTES: usize = 64 * 1024;
 
 /// Root configuration document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +64,11 @@ pub struct Config {
 
     #[serde(default)]
     pub admin: AdminConfig,
+
+    /// MCP endpoint. Off by default: it gives an agent a read-only view of
+    /// recent proxied request/response bodies.
+    #[serde(default)]
+    pub mcp: McpConfig,
 
     /// Callers allowed to use the proxy. Empty means "no client
     /// authentication", which is the single-user default.
@@ -565,6 +578,65 @@ pub enum AdminMode {
     Off,
 }
 
+/// `[mcp]` — the Model Context Protocol endpoint.
+///
+/// It exposes a bounded, read-only ring of recent proxied exchanges so an agent
+/// can answer "what did the broker actually send, and what came back?" without
+/// shell access to the parquet capture. Credential headers are redacted by name
+/// before an exchange ever reaches the ring, and body redaction follows the
+/// same `[dump] redact` patterns.
+///
+/// Off by default, loops back by default, and fails closed without a token:
+/// the bodies it serves are prompt content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mcp_host")]
+    pub host: String,
+    #[serde(default = "default_mcp_port")]
+    pub port: u16,
+    /// Bearer token. `env:NAME` and `file:/path` work as elsewhere. When unset
+    /// the endpoint refuses every request unless `allow_insecure` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Explicitly allow an unauthenticated MCP endpoint. It serves prompt
+    /// bodies, so this is only sensible on a trusted, loopback-only host.
+    #[serde(default)]
+    pub allow_insecure: bool,
+    /// How many recent exchanges are retained. 0 disables retention.
+    #[serde(default = "default_mcp_capture_capacity")]
+    pub capture_capacity: usize,
+    /// Per-body cap for the in-memory ring. Independent of the parquet
+    /// capture's `capture_max_bytes`, because this one exists to bound heap.
+    #[serde(default = "default_mcp_capture_bytes")]
+    pub capture_max_bytes: usize,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_mcp_host(),
+            port: default_mcp_port(),
+            token: None,
+            allow_insecure: false,
+            capture_capacity: default_mcp_capture_capacity(),
+            capture_max_bytes: default_mcp_capture_bytes(),
+        }
+    }
+}
+
+impl McpConfig {
+    /// Effective bearer token, if any.
+    pub fn resolved_token(&self) -> Result<Option<String>> {
+        match self.token.as_deref() {
+            None | Some("") => Ok(None),
+            Some(value) => resolve_secret(value).map(Some),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -631,6 +703,18 @@ fn default_usage_scan_limit() -> usize {
 }
 fn default_admin_path() -> String {
     "/admin".to_string()
+}
+fn default_mcp_host() -> String {
+    DEFAULT_MCP_HOST.to_string()
+}
+fn default_mcp_port() -> u16 {
+    DEFAULT_MCP_PORT
+}
+fn default_mcp_capture_capacity() -> usize {
+    DEFAULT_MCP_CAPTURE_CAPACITY
+}
+fn default_mcp_capture_bytes() -> usize {
+    DEFAULT_MCP_CAPTURE_BYTES
 }
 
 impl Default for LoadBalancingConfig {
@@ -972,6 +1056,12 @@ impl Config {
             }
         }
 
+        if self.mcp.enabled && !self.mcp.allow_insecure && self.mcp.resolved_token()?.is_none() {
+            return Err(LlmBrokerError::InvalidConfig(
+                "mcp.enabled requires mcp.token (or mcp.allow_insecure = true)".to_string(),
+            ));
+        }
+
         if self.observability.metrics_enabled && !self.observability.metrics_path.starts_with('/') {
             return Err(LlmBrokerError::InvalidConfig(
                 "observability.metrics_path must start with `/`".to_string(),
@@ -1089,6 +1179,7 @@ mod tests {
             health: HealthConfig::default(),
             observability: ObservabilityConfig::default(),
             admin: AdminConfig::default(),
+            mcp: McpConfig::default(),
             clients: Vec::new(),
             policy: PolicyConfig::default(),
             dump: DumpSection::default(),
@@ -1130,6 +1221,7 @@ mod tests {
             .providers
             .push(provider_with_key("nvapi-super-secret-value"));
         config.admin.token = Some("admin-super-secret".into());
+        config.mcp.token = Some("mcp-super-secret".into());
         config.clients.push(ClientConfig {
             name: "laptop".into(),
             token: "client-super-secret".into(),
@@ -1145,6 +1237,7 @@ mod tests {
         for secret in [
             "nvapi-super-secret-value",
             "admin-super-secret",
+            "mcp-super-secret",
             "client-super-secret",
         ] {
             assert!(!shown.contains(secret), "leaked {secret}:\n{shown}");
@@ -1166,6 +1259,31 @@ mod tests {
         let written = config.to_toml_with_secrets(true).expect("serialize");
         assert!(written.contains("nvapi-super-secret-value"), "{written}");
         assert!(!written.contains(REDACTED_SECRET), "{written}");
+    }
+
+    #[test]
+    fn mcp_fails_closed_without_a_token() {
+        let mut config = base_config();
+        config
+            .providers
+            .push(provider_with_key("sk-test-not-a-real-key"));
+        config.mcp.enabled = true;
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("mcp.enabled requires mcp.token"),
+            "{error}"
+        );
+
+        // Either an explicit insecure opt-in or a token satisfies validation;
+        // silence is not an option, because this endpoint serves prompt bodies.
+        config.mcp.allow_insecure = true;
+        config
+            .validate()
+            .expect("an explicit allow_insecure is accepted");
+
+        config.mcp.allow_insecure = false;
+        config.mcp.token = Some("mcp-secret".into());
+        config.validate().expect("a token is enough");
     }
 
     #[test]

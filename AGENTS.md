@@ -170,6 +170,28 @@ uploaded, and the client's in-flight slot is released in `logging`.
   regression test asserts both halves -- requests served, and the counter moved
   -- since asserting only the status would pass even if the shadow engine were
   never called.
+- **The MCP endpoint serves redacted traffic, never credentials.** `[mcp]`
+  starts a JSON-RPC service whose `capture_list`/`capture_get` tools read a
+  bounded in-memory ring (`proxy/capture.rs`) of recent exchanges. The ring is
+  fed by `Dump::finish`, the *same* value the parquet capture writes, so
+  credential headers are redacted by name before anything is buffered and the
+  `[dump] redact` patterns apply to bodies. A URI is not exempt: a provider with
+  `auth = "query"` puts its key in the URL, so `render_uri` masks query values
+  whose *name* is a credential (`key`, `api_key`, `access_token`, ...) as well.
+  `McpService` never formats headers itself; an integration test drives a real
+  proxy request, calls `capture_list`/`capture_get` over the real MCP endpoint,
+  and asserts the provider key is absent from the JSON an agent receives. The
+  endpoint fails closed without `mcp.token` (constant-time comparison), binds to
+  loopback by default, and is off unless `mcp.enabled` is set. The ring is a
+  fixed-slot buffer with a write cursor: a push never reallocates, and capacity
+  is clamped at `MAX_CAPTURE_CAPACITY`. Wire details that broke a real client
+  (OpenCode) or would break the next one: the credential is
+  `Authorization: Bearer <token>` **including the scheme** (a bare token is a
+  401); a JSON-RPC *notification* such as `notifications/initialized` has no
+  `id` and must be answered `202` with no body; tool definitions must spell
+  `inputSchema`, because serde's snake_case default produced a schema a strict
+  client reads as absent; and the body has to be read chunk by chunk, since
+  `read_request_body` returns one chunk per call.
 - **Content inspection is opt-in per pattern, and `report` is the default.**
   There is no attempt to guess what "sensitive" means; an operator lists the
   shapes they care about, and watches them in `report` mode before switching to

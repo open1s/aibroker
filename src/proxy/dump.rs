@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::proxy::capture::CaptureStore;
 use crate::proxy::parquet::{
     CaptureWriter, CapturedAttempt, CapturedExchange, DEFAULT_MAX_CAPTURE_BYTES, append_capped,
     now_ms,
@@ -37,6 +38,28 @@ const SECRET_HEADERS: [&str; 7] = [
     "cookie",
     // A session cookie is a bearer credential just as much as a token is.
     "set-cookie",
+];
+
+/// Query parameters whose value must never reach the log.
+///
+/// A credential does not always travel in a header: `auth = "query"` providers
+/// get the key appended to the URL (see `AuthScheme::decorate_query`), and a
+/// client may put its own key in a query string. Redacting by *name* keeps that
+/// path from becoming the one place a dump or the MCP ring leaks.
+const SECRET_QUERY_PARAMS: [&str; 13] = [
+    "key",
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_token",
+    "auth_token",
+    "auth",
+    "token",
+    "subscription-key",
+    "sig",
+    "signature",
+    "x-amz-signature",
+    "password",
 ];
 
 /// The value written in place of a credential.
@@ -56,6 +79,10 @@ pub struct DumpConfig {
     /// When set (`-w FILE`), complete exchanges are also written to this
     /// parquet file, with the same redaction applied.
     pub capture: Option<CaptureWriter>,
+    /// When set (`[mcp] enabled`), the same finished exchanges are kept in a
+    /// bounded in-memory ring so an agent can read them back over MCP. The
+    /// redaction is identical: this path never sees a raw credential.
+    pub capture_store: Option<CaptureStore>,
     /// Per-body byte cap for the parquet capture. Independent of
     /// `max_body_bytes`, which only bounds a single log line.
     pub capture_max_bytes: usize,
@@ -69,6 +96,7 @@ impl Default for DumpConfig {
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
             redactor: Redactor::default(),
             capture: None,
+            capture_store: None,
             capture_max_bytes: DEFAULT_MAX_CAPTURE_BYTES,
         }
     }
@@ -76,12 +104,13 @@ impl Default for DumpConfig {
 
 impl DumpConfig {
     pub fn enabled(&self) -> bool {
-        self.dump_request || self.dump_response || self.capture.is_some()
+        self.dump_request || self.dump_response || self.capturing()
     }
 
-    /// Whether complete exchanges are being written to a parquet file.
+    /// Whether complete exchanges are being retained for later reading, either
+    /// on disk (`-w`) or in memory (MCP).
     pub fn capturing(&self) -> bool {
-        self.capture.is_some()
+        self.capture.is_some() || self.capture_store.is_some()
     }
 
     /// The default body cap.
@@ -201,9 +230,12 @@ impl Dump {
         }
         self.request_headers_done = true;
         let rendered = self.redact(&render_headers(headers.headers.iter()));
+        // The client may put a credential in the query string too, so the URI
+        // is redacted here rather than trusted because it is only a path.
+        let uri = self.redact(&render_uri(uri));
         if let Some(capture) = self.capture.as_mut() {
             capture.method = method.to_string();
-            capture.uri = uri.to_string();
+            capture.uri = uri.clone();
             capture.request_headers = rendered.clone();
         }
         if self.config.dump_request {
@@ -231,6 +263,9 @@ impl Dump {
         self.attempts_started = self.attempts_started.saturating_add(1);
         self.replay_logged = false;
         let rendered = self.redact(&render_headers(req.headers.iter()));
+        // This is the URI that actually goes upstream, so it is where a
+        // query-scheme provider's key appears. Mask it before it is recorded.
+        let url = self.redact(&render_uri(&req.uri.to_string()));
         if let Some(capture) = self.capture.as_mut() {
             // A new attempt starts here: `upstream_peer` re-runs on every key
             // rotation, so each try gets its own record. The provider and key
@@ -240,7 +275,7 @@ impl Dump {
                 provider: provider.map(str::to_string),
                 key: key.map(str::to_string),
                 method: req.method.to_string(),
-                url: req.uri.to_string(),
+                url: url.clone(),
                 headers: rendered.clone(),
                 ..CapturedAttempt::default()
             });
@@ -248,7 +283,7 @@ impl Dump {
         if self.config.dump_request {
             self.emit(
                 "upstream req",
-                &format!("{} {} {:?}", req.method, req.uri, req.version),
+                &format!("{} {url} {:?}", req.method, req.version),
             );
             self.emit("upstream req headers", &rendered);
         }
@@ -393,10 +428,12 @@ impl Dump {
         self.config.redactor.apply(text)
     }
 
-    /// Write the finished exchange to the parquet capture file, if `-w` is on.
+    /// Hand the finished exchange to whichever sinks are attached.
     ///
     /// Called once per request from the proxy's `logging` phase, so a request
-    /// refused at the edge (no upstream attempt at all) is captured too.
+    /// refused at the edge (no upstream attempt at all) is captured too. Both
+    /// sinks receive the *same* redacted value: the parquet file and the MCP
+    /// ring must never disagree about what a credential looks like.
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
         &mut self,
@@ -407,66 +444,89 @@ impl Dump {
         model: Option<&str>,
         client: Option<&str>,
     ) {
-        let Some(writer) = self.config.capture.as_ref() else {
+        if !self.config.capturing() {
             return;
-        };
-        // Redaction only needs the config; taking it out of the borrow lets
-        // the capture below be moved out field by field.
+        }
+        // Redaction and the body caps only need the config; taking a clone
+        // keeps `self.config` available to the sinks below.
         let config = self.config.clone();
         let duration_ms = self.at();
         let request_bytes = self.request_bytes as u64;
         let response_bytes = self.response_bytes as u64;
-        let Some(capture) = self.capture.as_mut() else {
+        // Take the per-request capture so `finish` is idempotent: a second
+        // call (a re-entered logging phase, a future caller) must not record a
+        // duplicate or an already-drained exchange.
+        let Some(capture) = self.capture.take() else {
             return;
         };
         // The log path redacts each chunk before printing; the capture keeps
         // whole bodies, so the rules run once over the assembled text — a
         // pattern spanning a chunk boundary is caught here, not missed.
-        let redact_captured = |text: &str| {
+        //
+        // A replacement can be longer than what it replaces, so the cap is
+        // applied *after* redaction and the truncation flag has to be raised
+        // here as well. Without that, an agent saw a body cut mid-token with
+        // `request_truncated: false` and had no way to know it was incomplete.
+        let redact_captured = |text: &str| -> (String, bool) {
             let redacted = config.redactor.apply(text);
             if redacted.len() <= config.capture_max_bytes {
-                return redacted;
+                return (redacted, false);
             }
             let mut out = String::new();
             append_capped(&mut out, redacted.as_bytes(), config.capture_max_bytes);
-            out
+            (out, true)
         };
+        // Work out the bodies before moving the rest of `capture` into the row.
+        let (request_body, request_redaction_truncated) = redact_captured(&capture.request_body);
+        let (response_body, response_redaction_truncated) = redact_captured(&capture.response_body);
         let exchange = CapturedExchange {
             id: self.id,
             timestamp_ms: capture.timestamp_ms,
             duration_ms,
-            method: std::mem::take(&mut capture.method),
-            uri: std::mem::take(&mut capture.uri),
-            request_headers: std::mem::take(&mut capture.request_headers),
-            request_body: redact_captured(&capture.request_body),
+            method: capture.method,
+            uri: capture.uri,
+            request_headers: capture.request_headers,
+            request_body,
             request_bytes,
-            request_truncated: capture.request_truncated,
+            request_truncated: capture.request_truncated || request_redaction_truncated,
             model: model.map(str::to_string),
             provider: provider.map(str::to_string),
             key: key.map(str::to_string),
             client: client.map(str::to_string),
             attempts,
             status,
-            response_headers: std::mem::take(&mut capture.response_headers),
-            response_body: redact_captured(&capture.response_body),
+            response_headers: capture.response_headers,
+            response_body,
             response_bytes,
-            response_truncated: capture.response_truncated,
+            response_truncated: capture.response_truncated || response_redaction_truncated,
             upstream_attempts: capture
                 .attempts
-                .iter_mut()
+                .into_iter()
                 .map(|attempt| CapturedAttempt {
-                    provider: attempt.provider.take(),
-                    key: attempt.key.take(),
-                    method: std::mem::take(&mut attempt.method),
-                    url: std::mem::take(&mut attempt.url),
+                    provider: attempt.provider,
+                    key: attempt.key,
+                    method: attempt.method,
+                    url: attempt.url,
                     status: attempt.status,
-                    headers: std::mem::take(&mut attempt.headers),
-                    response_headers: std::mem::take(&mut attempt.response_headers),
-                    response_body: redact_captured(&attempt.response_body),
+                    headers: attempt.headers,
+                    response_headers: attempt.response_headers,
+                    // Per-attempt bodies have no truncation flag of their own;
+                    // the field exists to describe the *client-visible* body.
+                    response_body: redact_captured(&attempt.response_body).0,
                 })
                 .collect(),
         };
-        writer.record(exchange);
+        // The parquet writer consumes the row; only a second sink needs a
+        // clone. An MCP-only broker (no `-w`) therefore never copies a body.
+        match (config.capture_store.as_ref(), config.capture.as_ref()) {
+            (Some(store), Some(writer)) => {
+                store.push(exchange.clone());
+                writer.record(exchange);
+            }
+            (Some(store), None) => store.push(exchange),
+            (None, Some(writer)) => writer.record(exchange),
+            (None, None) => {}
+        }
     }
 
     /// Report the outcome once the request is finished.
@@ -492,6 +552,32 @@ impl Dump {
             ),
         );
     }
+}
+
+/// Mask credential values in a URI's query string.
+///
+/// The query is kept intact — parameter names and the order of parameters are
+/// often what is being debugged — but a value whose name says "credential" is
+/// replaced before the URI reaches the log, the parquet capture or the MCP
+/// ring. Matching is case-insensitive because `key=`, `Key=` and `API_KEY=`
+/// all occur in the wild.
+fn render_uri(uri: &str) -> String {
+    let Some((path, query)) = uri.split_once('?') else {
+        return uri.to_string();
+    };
+    let pairs: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) if is_secret_query_param(name) => format!("{name}={REDACTED}"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{path}?{}", pairs.join("&"))
+}
+
+fn is_secret_query_param(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    SECRET_QUERY_PARAMS.contains(&normalized.as_str())
 }
 
 /// Render headers, redacting credentials.
@@ -703,6 +789,128 @@ mod tests {
         assert!(dump.config.enabled());
         assert!(dump.capture.is_some());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_in_memory_store_alone_receives_a_redacted_exchange() {
+        // The MCP path passes no parquet writer, so `finish` must not be gated
+        // on `capture` alone -- that gate silently retained nothing for the
+        // agent while the config said capture was on.
+        let store = crate::proxy::capture::CaptureStore::new(2);
+        let mut dump = Dump::new(DumpConfig {
+            capture_store: Some(store.clone()),
+            ..DumpConfig::default()
+        });
+        assert!(dump.config.enabled(), "the store alone enables capture");
+
+        let req = headers(&[("Authorization", "Bearer sk-client-secret")]);
+        dump.request_headers("POST", "/v1/chat/completions", "HTTP/1.1", &req);
+        dump.request_body(br#"{"model":"m","messages":[]}"#);
+        dump.finish(Some(200), 0, None, None, Some("m"), None);
+
+        let exchange = store.get(dump.id()).expect("the ring must receive it");
+        assert!(!exchange.request_headers.contains("sk-client-secret"));
+        assert!(exchange.request_headers.contains("<redacted>"));
+        assert_eq!(exchange.request_body, r#"{"model":"m","messages":[]}"#);
+    }
+
+    #[test]
+    fn a_credential_in_a_query_string_is_masked_before_it_is_recorded() {
+        // `auth = "query"` providers get their key appended to the URL, not a
+        // header, and a client may put its own key there too. Both the client
+        // URI and the upstream URL are what the MCP ring serves, so both are
+        // masked by parameter name; the configured redactor still applies to
+        // the rest of the URL.
+        let store = crate::proxy::capture::CaptureStore::new(2);
+        let redactor =
+            Redactor::new(&[("sk-[A-Za-z-]+".to_string(), "<key>".to_string())]).unwrap();
+        let mut dump = Dump::new(DumpConfig {
+            capture_store: Some(store.clone()),
+            redactor,
+            ..DumpConfig::default()
+        });
+
+        let req = headers(&[]);
+        dump.request_headers(
+            "POST",
+            "/v1/chat/completions?key=sk-client&foo=sk-visible&model=m",
+            "HTTP/1.1",
+            &req,
+        );
+        let mut upstream = RequestHeader::build(
+            "POST",
+            b"/v1/chat/completions?key=sk-provider&foo=sk-visible&model=m",
+            None,
+        )
+        .unwrap();
+        upstream.insert_header("Host", "upstream.test").unwrap();
+        dump.upstream_request(&upstream, Some("gemini"), Some("g1"));
+        dump.finish(Some(200), 1, Some("gemini"), Some("g1"), Some("m"), None);
+
+        let exchange = store.get(dump.id()).expect("the ring holds the exchange");
+        assert_eq!(
+            exchange.uri,
+            "/v1/chat/completions?key=<redacted>&foo=<key>&model=m"
+        );
+        let attempt = exchange
+            .upstream_attempts
+            .first()
+            .expect("the upstream attempt is recorded");
+        assert_eq!(
+            attempt.url,
+            "/v1/chat/completions?key=<redacted>&foo=<key>&model=m"
+        );
+        let json = serde_json::to_string(&exchange).unwrap();
+        for secret in ["sk-client", "sk-provider", "sk-visible"] {
+            assert!(!json.contains(secret), "leaked {secret}: {json}");
+        }
+    }
+
+    #[test]
+    fn redaction_that_grows_a_body_marks_it_as_truncated() {
+        // A replacement can be longer than the match. When that pushes a body
+        // past the capture cap, the flag must say so -- otherwise an agent
+        // reads a body cut mid-token and believes it is complete.
+        let store = crate::proxy::capture::CaptureStore::new(2);
+        let mut dump = Dump::new(DumpConfig {
+            capture_store: Some(store.clone()),
+            // 8 bytes per body, and every `x` becomes 10 bytes.
+            capture_max_bytes: 8,
+            redactor: Redactor::new(&[("x".to_string(), "0123456789".to_string())]).unwrap(),
+            ..DumpConfig::default()
+        });
+
+        let req = headers(&[]);
+        dump.request_headers("POST", "/v1/chat/completions", "HTTP/1.1", &req);
+        dump.request_body(b"xxxx");
+        dump.response_body(b"xxxx", true);
+        dump.finish(Some(200), 1, None, None, None, None);
+
+        let exchange = store.get(dump.id()).expect("the ring holds the exchange");
+        assert!(exchange.request_truncated, "{exchange:?}");
+        assert!(exchange.response_truncated, "{exchange:?}");
+        assert!(exchange.request_body.len() <= 8);
+        assert!(exchange.response_body.len() <= 8);
+    }
+
+    #[test]
+    fn finishing_twice_records_one_exchange() {
+        // The capture is drained on the first `finish`; a second call must not
+        // push an empty duplicate with the same id into the MCP ring.
+        let store = crate::proxy::capture::CaptureStore::new(4);
+        let mut dump = Dump::new(DumpConfig {
+            capture_store: Some(store.clone()),
+            ..DumpConfig::default()
+        });
+
+        let req = headers(&[]);
+        dump.request_headers("POST", "/v1/chat/completions", "HTTP/1.1", &req);
+        dump.request_body(br#"{"model":"m"}"#);
+        dump.finish(Some(200), 0, None, None, Some("m"), None);
+        dump.finish(Some(200), 0, None, None, Some("m"), None);
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.dropped(), 0);
     }
 
     #[test]

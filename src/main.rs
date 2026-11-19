@@ -218,6 +218,7 @@ fn main() {
         max_body_bytes: args.dump_max_bytes,
         redactor,
         capture,
+        capture_store: None,
         capture_max_bytes: args.capture_max_bytes.max(64),
     };
 

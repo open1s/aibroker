@@ -473,6 +473,54 @@ answers frame by frame. Credentials are always redacted
 `set-cookie`) — but bodies are printed as they are, including a provider that
 echoes something secret inside its *content*, so treat dump output as sensitive.
 
+### Inspect live traffic over MCP
+
+`[mcp]` starts a second listener that speaks the Model Context Protocol over
+HTTP, so an agent can read the traffic it just sent without shell access to the
+parquet file. It is off by default, binds to loopback, and refuses every
+request without a token:
+
+```toml
+[mcp]
+enabled = true
+host = "127.0.0.1"
+port = 8080
+token = "env:LLM_BROKER_MCP_TOKEN"
+capture_capacity = 50      # exchanges kept in memory
+capture_max_bytes = 65_536 # per body, before truncation
+```
+
+```bash
+# what tools exist (capture_list and capture_get)
+curl -s localhost:8080/ \
+  -H "Authorization: Bearer $LLM_BROKER_MCP_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# the newest exchanges, newest first; bodies are omitted here
+curl -s localhost:8080/ \
+  -H "Authorization: Bearer $LLM_BROKER_MCP_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"capture_list","arguments":{"limit":5}}}'
+
+# one exchange: headers, bodies, model/provider/key-id, status, each attempt
+curl -s localhost:8080/ \
+  -H "Authorization: Bearer $LLM_BROKER_MCP_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"capture_get","arguments":{"id":42}}}'
+```
+
+The credential is the whole `Bearer <token>` value, not the bare token. The ring
+holds `capture_capacity` exchanges (default 50) and `capture_list` reports
+`retained`, `capacity` and `dropped`, so an evicted id is explainable rather
+than a mystery. Each body is capped at `capture_max_bytes` (default 64 KiB) and
+`request_truncated`/`response_truncated` says when it was cut.
+
+Redaction is the dump one: credential headers are masked by name, query
+parameters whose name is a credential (`key`, `api_key`, `access_token`, ...)
+are masked in the URL, and `[dump] redact` applies to bodies. It still serves
+prompt content, so keep it on loopback and do not reuse the admin token for it.
+
 ### Symptom → cause
 
 | Symptom | Likely cause | Check |

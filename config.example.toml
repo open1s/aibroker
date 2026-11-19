@@ -258,6 +258,30 @@ persist = true
 # allow_insecure = true    # only for a loopback-only, trusted machine
 
 # ---------------------------------------------------------------------------
+# MCP endpoint: what an agent can read back
+# ---------------------------------------------------------------------------
+# A Model Context Protocol endpoint over HTTP (JSON-RPC) that an agent uses to
+# inspect the traffic it just sent: `capture_list` returns recent exchanges,
+# `capture_get` returns one with headers and bodies.
+#
+# Credential headers (Authorization, x-api-key, ...) are redacted by *name*
+# before an exchange is buffered, and body redaction follows `[dump] redact`.
+# The provider key is therefore never readable here — only its id.
+#
+# Off by default. It serves prompt content, so it binds to loopback and fails
+# closed: without `token` every request is refused.
+#
+# [mcp]
+# enabled = true
+# host = "127.0.0.1"
+# port = 8080
+# token = "env:LLM_BROKER_MCP_TOKEN"
+# allow_insecure = false      # never on a shared machine
+# # How many recent exchanges are retained (each body capped below).
+# capture_capacity = 50
+# capture_max_bytes = 65_536
+
+# ---------------------------------------------------------------------------
 # Client access control
 # ---------------------------------------------------------------------------
 # Who may use the proxy. Without any [[clients]] the proxy is open: anything
